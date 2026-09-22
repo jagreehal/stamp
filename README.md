@@ -15,14 +15,13 @@ Bring those over when a repository needs them.
 ## What a PR author sees
 
 A repository either reviews every PR or waits for its trigger label, depending on its review mode.
-The engine returns one of five verdicts, and `--post` puts it on the PR.
+The engine returns one of four verdicts, and `--post` puts it on the PR.
 
 | Verdict  | Where it lands                              | Trigger label in label mode |
 | -------- | ------------------------------------------- | --------------------------- |
 | APPROVED | A real GitHub review by the stamp login     | Kept                        |
 | REFUSED  | A GitHub comment review by the stamp login  | Removed                     |
 | ESCALATE | A GitHub comment review by the stamp login  | Removed                     |
-| WAIT     | A GitHub comment review by the stamp login  | Kept, retries               |
 | ERROR    | A GitHub comment review by the stamp login  | Kept, retries               |
 | Gated    | A GitHub comment review by the stamp login  | Removed                     |
 
@@ -40,8 +39,6 @@ The trigger label only exists in label-triggered mode, and only a substantive no
 So the label can be re-applied once the feedback is addressed.
 
 A verdict that says nothing about the PR keeps the label, and the next push retries.
-
-`WAIT` means a reviewer bot still had a review in flight.
 
 `ERROR` means the run failed before it could judge the PR, because the model backend was unreachable or the reviewer returned something that was not a verdict.
 
@@ -248,6 +245,8 @@ It needs an APPROVED or substantive COMMENTED review from a human or a different
 
 List your other reviewer bots under `reviewer_bots` in `policy.yml` so stamp waits for their 👀 rather than approving over them.
 
+The wait is capped at five minutes, because nothing re-triggers the workflow when a bot finishes: a run that waited indefinitely would never post a verdict at all.
+
 The `github-actions[bot]` approval counts toward required approving reviews once the Actions setting above is on.
 
 It does not satisfy "require review from Code Owners", and it should not: that rule exists so a person on the owning team looks, which is what stamp escalates to.
@@ -307,7 +306,8 @@ Tier classification
   │
   ▼
 Wait for in-flight bot reviews
-  - A 👀 from a listed reviewer bot younger than 45 minutes → WAIT
+  - A 👀 from a listed reviewer bot younger than 45 minutes → hold, up to 5 minutes
+  - Their comments join the prompt when they post; after 5 minutes stamp reviews without them
   - Older than that is a crashed reviewer, not an in-flight one: ignored
   │
   ▼
