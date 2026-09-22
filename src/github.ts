@@ -139,7 +139,7 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
   };
 }
 
-export type Verdict = "APPROVED" | "REFUSED" | "ESCALATE" | "WAIT" | "ERROR";
+export type Verdict = "APPROVED" | "REFUSED" | "ESCALATE" | "ERROR";
 
 /** True when the live PR still has the head, base ref and base sha that were reviewed. */
 function unchanged(pr: PR, repo: string, cwd: string): boolean {
@@ -193,7 +193,7 @@ export function postVerdict(pr: PR, verdict: Verdict, body: string, opts: PostOp
     opts.cwd,
   );
 
-  // Substantive non-approvals strip the trigger label so a human takes over; WAIT/ERROR keep it so the next push retries.
+  // Substantive non-approvals strip the trigger label so a human takes over; ERROR keeps it so the next push retries.
   if (opts.triggerLabel && (verdict === "REFUSED" || verdict === "ESCALATE") && pr.labels.includes(opts.triggerLabel)) {
     execFileSync("gh", ["pr", "edit", String(pr.number), "--remove-label", opts.triggerLabel], { cwd: opts.cwd, stdio: "inherit" });
   }

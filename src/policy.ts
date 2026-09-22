@@ -156,6 +156,15 @@ const PKG_RISKY_KEYS = ["scripts", "husky", "lint-staged", "pnpm", "simple-git-h
 
 const RISKY_LINE_RE = /^[+-]\s*(\[?(tool\.)?scripts|entry[-_]points|build\s*=|replace\s|"?(pre|post)?(install|prepare|publish|pack)"?\s*[:=])/;
 
+/**
+ * Reviewer bots that are still working: a 👀 from a bot on the policy's list, young enough to be a
+ * live review rather than a crashed one. Logins come from the REST API, so they carry the `[bot]`
+ * suffix the policy list is written with.
+ */
+export function inFlightBots(reactions: { user: string; content: string; created: string }[], bots: string[], staleMs: number, now = Date.now()): string[] {
+  return reactions.flatMap((r) => (r.content === "eyes" && bots.includes(r.user) && now - Date.parse(r.created) < staleMs ? [r.user] : []));
+}
+
 export function manifestScriptEdits(repoRoot: string, baseSha: string, headSha: string, manifests: string[]): string[] {
   const show = (ref: string, file: string) => {
     try {

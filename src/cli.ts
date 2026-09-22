@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { dismissOwnApprovals, fetchPR, postVerdict, reconcilePosted, runMarker, type PR, type Verdict } from "./github.ts";
-import { DEFAULTS_DIR, detectOwnership, loadGuidance, loadPolicy, manifestScriptEdits, manifestsWithoutLockfile, parseCodeowners, readTrusted, runGates, scrutinyFlags, titleFlags, type Gate } from "./policy.ts";
+import { DEFAULTS_DIR, detectOwnership, inFlightBots, loadGuidance, loadPolicy, manifestScriptEdits, manifestsWithoutLockfile, parseCodeowners, readTrusted, runGates, scrutinyFlags, titleFlags, type Gate } from "./policy.ts";
 import { BACKENDS, combine, review, secondOpinionNeeded, type LLMVerdict, type Opinion } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
 
@@ -21,6 +21,8 @@ const STARTED = new Date().toISOString(); // stamped into every posted review so
 const VERDICT_OF: Record<LLMVerdict["verdict"], Verdict> = { APPROVE: "APPROVED", REFUSE: "REFUSED", ESCALATE: "ESCALATE" };
 
 const STALE_EYES_MS = 45 * 60_000; // a bot 👀 older than this is a crashed reviewer, not an in-flight one
+
+const REVIEWER_WAIT_MS = 5 * 60_000; // how long to hold for an in-flight reviewer bot before reviewing without it
 
 const { values: opts, positionals } = parseArgs({
   allowPositionals: true,
@@ -75,7 +77,7 @@ const me = process.env.STAMP_BOT_LOGIN || whoami(); // the login our verdicts po
 // voided the previous one.
 if (opts.post) dismissOwnApprovals(prNumber, me, repoRoot);
 
-const pr = fetchPR(prNumber, repoRoot, [me]);
+let pr = fetchPR(prNumber, repoRoot, [me]);
 
 const skip = (why: string) => {
   console.log(`${why}; nothing to review`);
@@ -103,11 +105,31 @@ try {
   if (opts.post) throw new Error(`could not fetch the PR head and trusted refs; refusing to post: ${e instanceof Error ? e.message : e}`);
 }
 
-const exploreRoot = checkoutAtHead(pr.headSha);
-
 const trustedRef = `origin/${pr.defaultBranch}`;
 
 const policy = loadPolicy(repoRoot, trustedRef);
+
+// Reviewer bots leave 👀 while they work and swap it for a verdict when they post; their findings
+// belong in the prompt, so hold for them. Bounded, and never terminal: nothing re-triggers the
+// workflow when a bot finishes, so a run that stopped here would never come back. Greptile reacts
+// within seconds of a push, which is faster than this run reaches this line every time.
+const inFlight = () => inFlightBots(pr.reactions, policy.reviewer_bots, STALE_EYES_MS);
+
+const waitUntil = Date.now() + REVIEWER_WAIT_MS;
+
+while (inFlight().length && Date.now() < waitUntil) {
+  console.log(`waiting for ${inFlight().join(", ")} to finish reviewing`);
+  await Bun.sleep(20_000);
+  const fresh = fetchPR(prNumber, repoRoot, [me]);
+
+  if (fresh.headSha !== pr.headSha) break; // a new head: this run is superseded, and postVerdict will refuse to post
+
+  pr = fresh; // their comments are part of the review input, so take the refreshed PR, not just the reactions
+}
+
+if (inFlight().length) console.log(`reviewing without ${inFlight().join(", ")}: still going after ${REVIEWER_WAIT_MS / 60_000}m`);
+
+const exploreRoot = checkoutAtHead(pr.headSha);
 
 const codeowners = [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"].map((f) => readTrusted(repoRoot, f, trustedRef)).find((t) => t !== null) ?? null;
 
@@ -151,19 +173,12 @@ let opinion: Opinion | null = null;
 
 let body: string;
 
-const inFlight = pr.reactions.filter(
-  (r) => r.content === "eyes" && policy.reviewer_bots.includes(r.user) && Date.now() - Date.parse(r.created) < STALE_EYES_MS,
-);
-
 if (opts["dry-run"]) {
   console.log(`gate verdict: ${gateVerdict} (dry run, no LLM call)`);
   process.exit(gateVerdict === "PASSED" ? 0 : 1);
 } else if (gateVerdict === "DENIED") {
   verdict = "REFUSED";
   body = `Gates denied: ${gated.gates.filter((g) => !g.passed).map((g) => g.message).join("; ")}. A human reviewer has to take it from here.`;
-} else if (inFlight.length) {
-  verdict = "WAIT";
-  body = `Waiting for ${inFlight.map((r) => r.user).join(", ")} to finish reviewing.`;
 } else {
   const [primary, second] = BACKENDS;
   const input = { pr, gates: gated.gates, gateVerdict, tier: [gated.tier, gated.sub].filter(Boolean).join(" / "), titleFlags: flags, manifests, scrutiny, ownership, signals } as const;
@@ -243,7 +258,7 @@ function checkoutAtHead(sha: string): string {
 }
 
 function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict | null, opinion: Opinion | null, gates: Gate[]): string {
-  const icon = { APPROVED: "✅", REFUSED: "❌", ESCALATE: "🙋", WAIT: "⏳", ERROR: "⚠️" }[verdict];
+  const icon = { APPROVED: "✅", REFUSED: "❌", ESCALATE: "🙋", ERROR: "⚠️" }[verdict];
   const parts = [`## ${icon} stamp: ${verdict}`, "", reasoning];
 
   if (llm?.issues.length) parts.push("", "**Issues**", ...llm.issues.map((i) => `- ${i}`));

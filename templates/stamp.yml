@@ -25,11 +25,12 @@ jobs:
     # retracts its stale approval on every skip path. A job-level `if` would skip the retraction too.
     if: github.event.action != 'edited' || github.event.changes.base != null
     runs-on: ubuntu-latest
+    timeout-minutes: 20 # a hung model call must not burn a runner for six hours; a killed run is fail-closed (the approval is already retracted)
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0 # policy is read from origin/<default>, never from this checkout
+          fetch-depth: 1 # stamp fetches the base ref and origin/<default> itself; a full clone of the history buys nothing
       - uses: oven-sh/setup-bun@v2
       # Backend "claude": the review runs through Claude Code on a subscription instead of an API key.
       # Create the token once locally with `claude setup-token` and store it as CLAUDE_CODE_OAUTH_TOKEN.

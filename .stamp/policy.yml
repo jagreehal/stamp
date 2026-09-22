@@ -72,7 +72,7 @@ tiers:
 scrutiny:
   quality_gates:
     description: Lint, type-check, test and coverage configuration.
-    paths: ['\.oxlintrc', 'oxlint\.config', 'eslint\.config', '\.eslintrc', 'biome\.json', 'vitest\.config', 'jest\.config', 'playwright\.config', 'codecov', '\.nycrc', 'ruff\.toml', 'pytest\.ini', 'mypy\.ini', '\.pre-commit-config', 'lefthook', '\.husky/', 'tools/oxlint/']
+    paths: ['\.oxlintrc', 'oxlint\.config', 'eslint\.config', '\.eslintrc', 'biome\.json', 'vitest\.config', 'vitest\.workspace', 'vite\.config', 'jest\.config', 'playwright\.config', 'codecov', '\.nycrc', 'ruff\.toml', 'pytest\.ini', 'mypy\.ini', '\.pre-commit-config', 'lefthook', '\.husky/', 'tools/oxlint/']
     instruction: REFUSE if a rule was disabled or downgraded, an ignore pattern widened, a coverage threshold lowered, a strict flag turned off, a test made skip/only, or a hook removed. Tightening is fine.
 
 # Bots that leave 👀 while reviewing; stamp waits for them before judging.
