@@ -1,0 +1,79 @@
+# stamp merge-gate policy.
+#
+# Read from the repository's DEFAULT BRANCH, never from the PR head, so a PR
+# cannot rewrite the policy that gates it. Patterns are regexes matched
+# case-insensitively on word boundaries. Keep them single-quoted.
+version: 1
+
+# T2: never AI-approved. Any changed file matching a `paths` or `any` pattern
+# denies the PR before the LLM runs. `any` and `titles` patterns also scan the
+# PR title, but a title hit is only a scrutiny flag for the reviewer, never a
+# denial on its own (calibrated by PostHog against ~440 PRs: title-only hits
+# were dominated by incidental mentions humans approved unchanged).
+deny:
+  auth:
+    description: Authentication and authorization surfaces.
+    match:
+      any: ['auth', 'login', 'signup', 'oauth', 'saml', 'sso', 'oidc', 'credential', 'password', '2fa', 'mfa', 'two[_-]?factor']
+      titles: ['authenticated', 'authorized']
+      paths: ['session_auth', 'session_token', 'permission']
+  crypto_secrets:
+    description: Cryptography, secrets, and key material.
+    match:
+      any: ['crypto', 'encrypt', 'decrypt', 'vault']
+      paths: ['secret', 'api[_-]?key', 'private[_-]?key', 'signing[_-]?key', 'certificate', '\.env', '\.pem']
+  migrations:
+    description: Database and schema migrations.
+    match:
+      paths: ['migrations/', 'schema_change', 'drizzle/', 'prisma/migrations']
+  infra_cicd:
+    description: Infrastructure, CI, and deployment artifacts.
+    match:
+      any: ['terraform', 'kubernetes', 'helm']
+      paths: ['k8s', 'dockerfile', 'docker-compose', '\.github/workflows', 'iam', 'cloudflare', '(?:^|/)bin/deploy', 'deploy\.sh', 'vercel\.json', 'fly\.toml']
+  billing:
+    description: Payments and billing.
+    match:
+      any: ['billing', 'payment', 'stripe', 'invoice', 'pricing']
+  public_api:
+    description: Public API contracts and schemas.
+    match:
+      any: ['openapi', 'api_schema', 'swagger', 'public_api']
+  deps_toolchain:
+    description: Lockfiles and toolchain/build files. Manifests (package.json) without a lockfile change are flagged for the reviewer instead.
+    match:
+      paths: ['pnpm-lock\.yaml', 'package-lock\.json', 'yarn\.lock', 'bun\.lock', 'uv\.lock', 'poetry\.lock', 'Cargo\.lock', 'go\.sum', 'requirements[-\w]*\.(txt|in)', 'Makefile', '\.tool-versions', '\.nvmrc']
+  stamp_policy:
+    description: stamp's own policy, engine, and gate inputs. The gate cannot approve edits to itself.
+    match:
+      paths: ['\.stamp/', 'stamp/src/', 'CODEOWNERS']
+
+# T0: docs/tests/config only. Still LLM-reviewed, lighter bar.
+allow:
+  path_patterns: ['docs/', 'README', 'CHANGELOG', 'LICENSE', 'CONTRIBUTING', '.gitignore', '.editorconfig', '__snapshots__/']
+  extensions_only: ['.md', '.mdx', '.txt', '.rst', '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.csv', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.snap']
+
+# Substantive lines/files (docs, tests, snapshots, lockfiles, images excluded).
+# PostHog's backtest: denied-yet-merged-unchanged PRs cluster at 500-750 lines;
+# past ~800 the merged-unchanged rate collapses, so escalation is right there.
+size_gate:
+  max_lines: 800
+  max_files: 30
+
+tiers:
+  T1a-trivial: { max_lines: 20, max_files: 3 }
+  T1b-small: { max_lines: 100, max_files: 5 }
+  T1c-medium: { max_lines: 300, max_files: 15 }
+
+# Scrutiny paths: never deny on their own, but the reviewer is told these files changed and what
+# would make the change a refusal. Deterministic detection, LLM judgment. This is how "CI is the
+# wall that does not move" gets enforced: an agent will weaken a gate to reach green, and a linter
+# cannot see its own config being loosened.
+scrutiny:
+  quality_gates:
+    description: Lint, type-check, test and coverage configuration.
+    paths: ['\.oxlintrc', 'oxlint\.config', 'eslint\.config', '\.eslintrc', 'biome\.json', 'vitest\.config', 'jest\.config', 'playwright\.config', 'codecov', '\.nycrc', 'ruff\.toml', 'pytest\.ini', 'mypy\.ini', '\.pre-commit-config', 'lefthook', '\.husky/', 'tools/oxlint/']
+    instruction: REFUSE if a rule was disabled or downgraded, an ignore pattern widened, a coverage threshold lowered, a strict flag turned off, a test made skip/only, or a hook removed. Tightening is fine.
+
+# Bots that leave 👀 while reviewing; stamp waits for them before judging.
+reviewer_bots: ['greptile-apps[bot]', 'coderabbitai[bot]', 'chatgpt-codex-connector[bot]', 'claude[bot]']

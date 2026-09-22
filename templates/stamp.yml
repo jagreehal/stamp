@@ -1,0 +1,58 @@
+# stamp: approve-first PR review. Installed by `bunx @jagreehal/stamp init`.
+#
+# One-time repo settings:
+#   - secret ANTHROPIC_API_KEY (plus ANTHROPIC_BASE_URL / STAMP_MODEL vars if not Anthropic direct)
+#   - Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"
+#     (without it the approval posts but does not satisfy a required-reviews rule)
+name: stamp
+on:
+  pull_request:
+    # `edited` covers base retargets: the diff changes without the head moving. Title/body edits
+    # are filtered out below so they don't spend a review.
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
+
+concurrency:
+  group: stamp-${{ github.event.pull_request.number }}
+  cancel-in-progress: true # a newer head supersedes the run in flight
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    # No draft/bot/label filter here on purpose: stamp itself decides whether to review, and it
+    # retracts its stale approval on every skip path. A job-level `if` would skip the retraction too.
+    if: github.event.action != 'edited' || github.event.changes.base != null
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0 # policy is read from origin/<default>, never from this checkout
+      - uses: oven-sh/setup-bun@v2
+      # Backend "claude": the review runs through Claude Code on a subscription instead of an API key.
+      # Create the token once locally with `claude setup-token` and store it as CLAUDE_CODE_OAUTH_TOKEN.
+      # - run: npm install -g @anthropic-ai/claude-code
+      # Pin the version: the engine decides what gets auto-approved, so bumps are deliberate.
+      - run: bunx @jagreehal/stamp@0.1.0 "$PR" --post --json "$RUNNER_TEMP/stamp.json"
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          STAMP_BOT_LOGIN: github-actions[bot]
+          STAMP_BACKEND: ${{ vars.STAMP_BACKEND }}           # empty = api; "claude" for Claude Code
+          STAMP_BACKENDS: ${{ vars.STAMP_BACKENDS }}         # e.g. "claude,codex": a second opinion on non-trivial approvals (needs both auths)
+          # api backend
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }} # empty = Anthropic direct; https://opencode.ai/zen/go for OpenCode Go
+          STAMP_MODEL: ${{ vars.STAMP_MODEL }}               # empty = claude-opus-5; qwen3.8-max on Go
+          # claude backend
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          STAMP_CLAUDE_MODEL: ${{ vars.STAMP_CLAUDE_MODEL }} # empty = Claude Code's default
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }} # optional: Jev risk signals before the review
+          # STAMP_LABEL: stamp                               # label mode: review only PRs carrying the label
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stamp-evidence-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/stamp.json

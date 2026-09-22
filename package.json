@@ -1,0 +1,43 @@
+{
+  "name": "@jagreehal/stamp",
+  "version": "0.1.0",
+  "description": "Approve-first PR reviewer: deterministic gates, then a scoped LLM review, then a real GitHub approval. PostHog's stamphog for one repo.",
+  "license": "MIT",
+  "repository": "github:jagreehal/stamp",
+  "type": "module",
+  "bin": {
+    "stamp": "./src/cli.ts"
+  },
+  "files": [
+    "src",
+    "!src/*.test.ts",
+    ".stamp",
+    "templates",
+    "AGENTS.md"
+  ],
+  "engines": {
+    "bun": ">=1.2",
+    "node": ">=22.18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "review": "bun run src/cli.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run lint && bun run typecheck && bun test",
+    "lint": "oxlint src"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "yaml": "^2.6.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "1.78.0",
+    "@types/bun": "^1.2.0",
+    "oxlint": "1.78.0",
+    "typescript": "^5.7.0"
+  }
+}
