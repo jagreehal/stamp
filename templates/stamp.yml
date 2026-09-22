@@ -15,7 +15,10 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
 
 concurrency:
-  group: stamp-${{ github.event.pull_request.number || github.event.issue.number }}
+  # Keyed by event too, because any comment on the PR creates an issue_comment run: sharing one group
+  # let a passing bot comment cancel the review in flight, which leaves the PR with its approval
+  # already retracted and no verdict coming. Two runs that do overlap order themselves by run marker.
+  group: stamp-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
   cancel-in-progress: true # a newer head supersedes the run in flight
 
 permissions:
