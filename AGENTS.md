@@ -7,17 +7,23 @@ This file is the contract: the invariants below were each earned through a real 
 
 **No stamp approval may remain standing over commits it didn't review.** GitHub never auto-dismisses approvals, so every path that skips, supersedes, or abandons a review after a head-changing event must retract standing approvals itself:
 
-- A `--post` run dismisses EVERY standing approval of ours FIRST, with nothing but the PR number, before the fetch that can fail and ahead of every skip path. Fail-closed: if any later step crashes or is cancelled, the prior approval is already gone. This is `dismissOwnApprovals` with no options in `cli.ts`.
+- A `--post` run dismisses EVERY standing approval of ours FIRST, with nothing but the PR number, before any fallible fetch and ahead of every skip path — **except approval retention** (below). Fail-closed: if any later step crashes or is cancelled, the prior approval is already gone. This is `dismissOwnApprovals` with no options in `cli.ts`.
 - Every skip path (trigger label absent, draft) runs after that retraction. The workflow template has no job-level `if` that could skip the run before the retraction, because a bot push to an approved PR or a draft flip is still a head change.
 - `postVerdict` guards before ANY GitHub write: the live head SHA, base ref and base SHA against the reviewed ones (a retarget rewrites the diff with the head unchanged, so the workflow subscribes to `edited` filtered to `changes.base`), and whether a run that started later has already posted a verdict of ours on this head. Either fails and nothing is posted.
 - The review is submitted through the API with `commit_id: pr.headSha`, so GitHub records it against the reviewed commit, never against whatever head is live at the instant of the call.
-- Every posted review carries `<!-- stamp-run:<ISO start> -->`. Concurrent runs order themselves from that marker with no shared state: the run that started later owns the verdict.
+- Every posted review carries `<!-- stamp-run:<ISO start> -->` and `<!-- stamp-reviewed:head=…;base=… -->`. Concurrent runs order themselves from the run marker with no shared state: the run that started later owns the verdict. Retention reads the reviewed marker for full SHAs.
 - A run that posted re-runs the sweep at its own end (`dismissOwnApprovals` with `keep` and `olderThan`): every approval of ours off the live head goes, and every approval on the live head from a run that started before this one goes. A later-started run's approval is kept, because its verdict is the newer one. This closes the supersession race: an older, slower run can neither leave its approval standing over a newer refusal nor dismiss a newer run's approval.
 - `reconcilePosted` then re-checks head, base and newer-verdict once more. An orphaned APPROVAL must come down, so a failed dismissal propagates and fails the run loudly; a silent 503 here would leave an approval standing over code nobody reviewed. A stale COMMENT stays: GitHub cannot dismiss one and it grants nothing.
 - Reviews and comments authored by our own login are excluded from the prompt. A previous APPROVED must never be read as independent assurance.
 
+### Approval retention (the one dismiss-first exception)
+
+A push that leaves the PR's own unified diff **byte-identical** to the diff that was approved (typical case: merging the base branch) keeps the standing approval and skips re-review. Comparison uses `compare/{approved_base}...{approved_head}` vs live base…head on immutable SHAs — never the live files list. Empty diffs, binary markers (`Binary files … differ`), compare errors, a dismissed approval, or a missing reviewed marker all fail closed to dismiss-and-review. There is deliberately no "harmless file" allowlist.
+
+A byte-identical diff is necessary, not sufficient. Retention also withdraws on everything a fresh run would: a missing trigger label or a draft, and any gate failing against today's trusted policy (tightened deny list, a new `CHANGES_REQUESTED`, a conflict) — the same `gatesFor` the review path runs. A `/stamp` comment always re-reviews. `retentionHolds` runs last and re-reads live head, base and the approval's state, because every earlier check read state a push, retarget or manual dismissal can change; a push after it triggers its own run. The workflow subscribes to `converted_to_draft` and `unlabeled` so those withdrawals happen when they occur, not at the next push.
+
 There is deliberately no "this file is harmless" rule.
-PostHog's successive review passes found every candidate wrong: lockfiles select the code that gets installed, tests run in CI with CI's credentials, generated files can be hand-edited, Markdown ships when a tool compiles it into prompts.
+Successive review passes ruled out every candidate: lockfiles select the code that gets installed, tests run in CI with CI's credentials, generated files can be hand-edited, Markdown ships when a tool compiles it into prompts.
 The nearest thing stamp has is the size exemption, and it changes only how much counts toward the ceiling, never whether a file is reviewed.
 
 ## Prerequisites and trust
@@ -31,10 +37,11 @@ The nearest thing stamp has is the size exemption, and it changes only how much 
 
 ## Trust boundaries
 
-- Review policy, guidance, steering and `CODEOWNERS` are read from the repo's **default branch**, or from the bundled default when the default branch carries no such file. The working tree is NEVER consulted: it is the PR head, and a PR must not be able to supply the policy that gates it. A posting run fetches the default branch into its remote-tracking ref explicitly first, because a stacked PR's base is another feature branch and a local `origin/main` can be weeks behind a tightened deny list. A posting run that cannot fetch stops rather than reviewing against stale local state.
+- Review policy, guidance, steering, `CODEOWNERS`, and per-folder `AGENT_APPROVALS.md` size grants are read from the repo's **default branch**, or from the bundled default when the default branch carries no such file. The working tree is NEVER consulted: it is the PR head, and a PR must not be able to supply the policy that gates it (including raising its own size ceiling). A posting run fetches the default branch into its remote-tracking ref explicitly first, because a stacked PR's base is another feature branch and a local `origin/main` can be weeks behind a tightened deny list. A posting run that cannot fetch stops rather than reviewing against stale local state.
 - The reviewer reads the reviewed head, in isolation. If the checkout is not exactly the PR head, or is dirty, the review runs from a detached worktree at that commit.
 - PR content — title, body, diff, file names, comments, reactions — is untrusted input everywhere. It sits inside an untrusted-content fence in the prompt, control characters are stripped, and a forged end-of-untrusted sentinel is neutralized before the prompt is built.
 - Ownership is advisory, never a gate. Team handles cannot be resolved without an org read the Actions token lacks, so membership is reported as unknown; a teammate's review on the head is the assurance path.
+- Author familiarity (git blame + prior merged PRs) is advisory, never a gate, and cannot loosen one. Absence or band NONE must not tighten judgment (one-way ratchet: omit negative facts). A failure loses the signal, not the review. Every history query is anchored to the default branch, never the checkout, and blamed commits not yet on the default branch (a stacked base) earn no credit: a PR's own commit subjects could otherwise claim the author's merged PR numbers. A shallow checkout (CI's depth 1) is unshallowed on demand before familiarity runs; if history is still shallow the signal is absent, never computed: a missing merge-base reads as NONE / 0%, and blame pins old lines on the boundary commit.
 - Jev risk signals are advisory, never a gate, and cannot loosen one. A failure loses the signal, not the review. A low probability is never assurance.
 - Every GitHub response is parsed against a schema at the boundary (`github.ts`). A shape change fails there with a message, not three functions later as an undefined property. Assertions past that parse carry a `SAFETY:` comment naming the invariant; the lint (anti-slop) enforces it.
 
@@ -63,6 +70,6 @@ Scrutiny paths and title flags tell the model where to look; they never change a
 ## Tests
 
 `bun run check` runs lint (Oxlint with vendored anti-slop), typecheck and `bun test`.
-Gate logic, the manifest scan, CODEOWNERS resolution, the trusted-policy rule, the second-opinion combine and the signal parsing are covered in `src/policy.test.ts`; prefer adding a case to an existing test over a new function.
+Gate logic, the manifest scan, CODEOWNERS resolution, the trusted-policy rule, the second-opinion combine, the signal parsing, familiarity (bands, default-branch anchoring, shallow checkouts), folder size overrides and retention (predicate and check order) are covered in `src/policy.test.ts`; prefer adding a case to an existing test over a new function.
 `bun run src/smoke-live.ts` makes one live model call against a fake PR through whichever backend is configured.
 GitHub write paths are reasoned through and reviewed but exercised only by `--post` on a real PR; run one on a scratch repository after touching `github.ts`.

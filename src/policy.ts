@@ -5,12 +5,15 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { FamiliarityPolicySchema } from "./familiarity.ts";
 
 const Match = z.object({
   any: z.array(z.string()).default([]),
   titles: z.array(z.string()).default([]),
   paths: z.array(z.string()).default([]),
 });
+
+const OverrideCeiling = z.object({ ceiling: z.number().int().positive() });
 
 export const PolicySchema = z
   .object({
@@ -19,11 +22,24 @@ export const PolicySchema = z
     allow: z.object({ path_patterns: z.array(z.string()), extensions_only: z.array(z.string()) }),
     size_gate: z.object({ max_lines: z.number().int().positive(), max_files: z.number().int().positive() }),
     tiers: z.record(z.string(), z.object({ max_lines: z.number().int(), max_files: z.number().int() })),
+    // Contract ceilings for AGENT_APPROVALS.md grants. Absent = no folder delegation.
+    overrides: z
+      .object({
+        "size_gate.max_lines": OverrideCeiling,
+        "size_gate.max_files": OverrideCeiling,
+      })
+      .strict()
+      .optional(),
+    // Judgment-layer only; never a gate. Absent = no familiarity signal computed.
+    familiarity: FamiliarityPolicySchema.optional(),
     scrutiny: z.record(z.string(), z.object({ description: z.string().optional(), paths: z.array(z.string()), instruction: z.string() })).default({}),
     reviewer_bots: z.array(z.string()).default([]),
   })
   .strict()
-  .refine((p) => "stamp_policy" in p.deny, { message: "deny.stamp_policy is required: the gate cannot approve edits to itself" });
+  .refine((p) => "stamp_policy" in p.deny, { message: "deny.stamp_policy is required: the gate cannot approve edits to itself" })
+  .refine((p) => !p.overrides || (p.overrides["size_gate.max_lines"].ceiling >= p.size_gate.max_lines && p.overrides["size_gate.max_files"].ceiling >= p.size_gate.max_files), {
+    message: "overrides ceilings must cover the global size_gate limits",
+  });
 
 export type Policy = z.infer<typeof PolicySchema>;
 
@@ -231,6 +247,147 @@ export function substantiveSize(files: PRFile[]): Size {
   return { lines: s.reduce((n, f) => n + f.additions + f.deletions, 0), files: s.length };
 }
 
+// ── Per-folder size overrides (AGENT_APPROVALS.md, trusted ref only) ─────────
+//
+// Size grants are gate inputs, so they are read from the default branch via
+// readTrusted — never from the PR head. Frontmatter under `stamp:` may raise
+// max_files / max_lines within the policy's overrides ceilings. Invalid
+// frontmatter = no grant from that file.
+
+const FOLDER_POLICY_FILENAME = "AGENT_APPROVALS.md";
+
+export type ScopeBudget = { path: string | null; ceiling: number; files: string[] };
+
+export type EffectiveSize = { file_scopes: ScopeBudget[]; line_scopes: ScopeBudget[]; invalid_folder_files: string[] };
+
+type SizeKey = "max_files" | "max_lines";
+
+type FolderGrant = { [K in SizeKey]?: number } & { invalid?: true };
+
+const INVALID: FolderGrant = { invalid: true };
+
+const FRONTMATTER_RE = /^---\n([\s\S]*?)\n---/;
+
+const FolderFrontmatter = z
+  .object({
+    stamp: z
+      .object({ size_gate: z.object({ max_files: z.number().int().positive().optional(), max_lines: z.number().int().positive().optional() }).strict() })
+      .strict()
+      .optional(),
+  })
+  .passthrough();
+
+function parseFolderGrant(text: string, contract: NonNullable<Policy["overrides"]>): FolderGrant {
+  const yaml = FRONTMATTER_RE.exec(text)?.[1];
+
+  if (yaml === undefined) return INVALID;
+  let front: unknown;
+
+  try {
+    front = parseYaml(yaml);
+  } catch {
+    return INVALID;
+  }
+
+  const parsed = FolderFrontmatter.safeParse(front);
+
+  if (!parsed.success) return INVALID;
+  const grant = parsed.data.stamp?.size_gate;
+
+  if (!grant) return {}; // prose-only / advisory
+
+  if (grant.max_files === undefined && grant.max_lines === undefined) return INVALID;
+
+  if ((grant.max_files ?? 0) > contract["size_gate.max_files"].ceiling || (grant.max_lines ?? 0) > contract["size_gate.max_lines"].ceiling) return INVALID;
+
+  return grant;
+}
+
+/** Directories at or above the file, nearest first; "" is the repo root. */
+function scopeChain(filePath: string): string[] {
+  const dirs: string[] = [];
+
+  for (let dir = path.posix.dirname(filePath); dir !== "." && dir !== "/"; dir = path.posix.dirname(dir)) dirs.push(dir);
+
+  return [...dirs, ""];
+}
+
+/** Buckets each file under its nearest grant for `key`; files with none share the global pool, listed last. */
+function nearestScopes(changedFiles: string[], key: SizeKey, globalCeiling: number, grantAt: (rel: string) => FolderGrant): ScopeBudget[] {
+  const folders = new Map<string, ScopeBudget>();
+  const pool: ScopeBudget = { path: null, ceiling: globalCeiling, files: [] };
+
+  for (const file of changedFiles) {
+    let scope = pool;
+
+    for (const dir of scopeChain(file)) {
+      const rel = dir ? `${dir}/${FOLDER_POLICY_FILENAME}` : FOLDER_POLICY_FILENAME;
+      const ceiling = grantAt(rel)[key];
+
+      if (ceiling === undefined) continue;
+      scope = folders.get(rel) ?? { path: rel, ceiling, files: [] };
+      folders.set(rel, scope);
+      break;
+    }
+
+    scope.files.push(file);
+  }
+
+  return [...folders.values(), pool];
+}
+
+/**
+ * Resolve per-scope size budgets from AGENT_APPROVALS.md files on the trusted ref.
+ * When policy.overrides is absent, nothing is read and every file shares the global pool.
+ */
+export function resolveSizeOverrides(policy: Policy, changedFiles: string[], readFile: (rel: string) => string | null): EffectiveSize {
+  const contract = policy.overrides;
+  const cache = new Map<string, FolderGrant>();
+
+  const grantAt = (rel: string): FolderGrant => {
+    if (!contract) return {};
+    let grant = cache.get(rel);
+
+    if (!grant) {
+      const text = readFile(rel);
+      grant = text === null ? {} : parseFolderGrant(text, contract);
+      cache.set(rel, grant);
+    }
+
+    return grant;
+  };
+
+  return {
+    file_scopes: nearestScopes(changedFiles, "max_files", policy.size_gate.max_files, grantAt),
+    line_scopes: nearestScopes(changedFiles, "max_lines", policy.size_gate.max_lines, grantAt),
+    invalid_folder_files: [...cache].flatMap(([rel, grant]) => (grant.invalid ? [rel] : [])).sort(),
+  };
+}
+
+const roofOf = (scopes: ScopeBudget[]) => Math.max(...scopes.map((s) => s.ceiling));
+
+/** Whether the PR fits every per-scope budget and the whole-PR roof (the most generous ceiling in play). */
+export function sizeWithinBudgets(files: PRFile[], budgets: EffectiveSize) {
+  const byName = new Map(files.map((f) => [f.filename, f]));
+  const total = substantiveSize(files);
+
+  for (const [unit, scopes] of [["lines", budgets.line_scopes], ["files", budgets.file_scopes]] as const) {
+    for (const scope of scopes) {
+      const n = substantiveSize(scope.files.flatMap((name) => byName.get(name) ?? []))[unit];
+
+      if (n > scope.ceiling) {
+        return { ok: false, message: `${n} substantive ${unit} in ${scope.path ?? "global"} (ceiling ${scope.ceiling}; ${total.lines}L/${total.files}F total)` };
+      }
+    }
+
+    const roof = roofOf(scopes);
+
+    if (total[unit] > roof) return { ok: false, message: `${total[unit]} substantive ${unit} across the PR (roof ${roof})` };
+  }
+
+  return { ok: true, message: `${total.lines} substantive lines / ${total.files} files (limit ${roofOf(budgets.line_scopes)}/${roofOf(budgets.file_scopes)})` };
+}
+
 export type Tier = { tier: string; sub?: string };
 
 export function tier(policy: Policy, files: PRFile[], denied: string[]): Tier {
@@ -359,6 +516,8 @@ export type PRMeta = {
   reviews: { user: string; state: string }[];
   files: PRFile[];
   manifestScriptEdits?: string[];
+  /** Resolved folder size budgets; when absent, the global size_gate alone applies. */
+  sizeBudgets?: EffectiveSize;
 };
 
 const BOT_RE = /\[bot\]$|^(dependabot|renovate)/i;
@@ -399,13 +558,9 @@ export function runGates(policy: Policy, pr: PRMeta): GateRun {
     message: [denied.length ? `touches ${denied.join(", ")}` : "", scripts.length ? `scripts/hooks changed in ${scripts.join(", ")}` : ""].filter(Boolean).join("; ") || "no sensitive paths",
   });
 
-  const size = substantiveSize(pr.files);
-  const tooBig = size.lines > policy.size_gate.max_lines || size.files > policy.size_gate.max_files;
-  gates.push({
-    gate: "size",
-    passed: !tooBig,
-    message: `${size.lines} substantive lines / ${size.files} files (limit ${policy.size_gate.max_lines}/${policy.size_gate.max_files})`,
-  });
+  const budgets = pr.sizeBudgets ?? resolveSizeOverrides(policy, pr.files.map((f) => f.filename), () => null);
+  const sizeCheck = sizeWithinBudgets(pr.files, budgets);
+  gates.push({ gate: "size", passed: sizeCheck.ok, message: sizeCheck.message });
 
   // A committed credential is never auto-approvable, whatever tier the change is: this runs before
   // the model and denies on its own. It reads the diff, not the checkout, so a key that was already

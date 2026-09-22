@@ -3,9 +3,29 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { scrub } from "./github.ts";
-import { addedSecrets, denyCategories, detectOwnership, inFlightBots, loadPolicy, manifestScriptEdits, manifestsWithoutLockfile, parseCodeowners, runGates, scrutinyFlags, substantiveSize, tier, titleFlags, type PRFile, type PRMeta } from "./policy.ts";
-import { combine, sanitize, secondOpinionNeeded, type LLMVerdict } from "./reviewer.ts";
+import { band, computeFamiliarity, ensureFullHistory, formatFamiliarity, parseDiff, type AuthorFamiliarity, type FamiliarityPolicy } from "./familiarity.ts";
+import { scrub, type PR } from "./github.ts";
+import {
+  addedSecrets,
+  denyCategories,
+  detectOwnership,
+  inFlightBots,
+  loadPolicy,
+  manifestScriptEdits,
+  manifestsWithoutLockfile,
+  parseCodeowners,
+  resolveSizeOverrides,
+  runGates,
+  scrutinyFlags,
+  sizeWithinBudgets,
+  substantiveSize,
+  tier,
+  titleFlags,
+  type PRFile,
+  type PRMeta,
+} from "./policy.ts";
+import { approvedDiffUnchanged, tryRetainApproval } from "./retention.ts";
+import { buildPrompt, combine, sanitize, secondOpinionNeeded, type LLMVerdict } from "./reviewer.ts";
 import { SIGNAL_IDS, SIGNAL_THRESHOLD, flagged, formatSignals, requestBody, type Signals } from "./signals.ts";
 
 const policy = loadPolicy(path.resolve(import.meta.dir, ".."), "no-such-ref"); // no such ref → bundled defaults
@@ -223,4 +243,386 @@ test("addedSecrets flags credentials on added lines only", () => {
   ].join("\n");
 
   expect(addedSecrets(diff)).toEqual(["src/config.ts: Anthropic key"]);
+});
+
+const thresholds: FamiliarityPolicy = {
+  strong: { min_blame_overlap_pct: 70 },
+  moderate: { min_prior_prs: 5, max_days_since_touch: 180 },
+};
+
+describe("familiarity bands", () => {
+  test("STRONG from blame overlap", () => {
+    expect(band(70, 0, null, thresholds)).toBe("STRONG");
+    expect(band(69, 10, 1, thresholds)).toBe("MODERATE");
+  });
+  test("MODERATE needs prior PRs and recent touch", () => {
+    expect(band(0, 5, 180, thresholds)).toBe("MODERATE");
+    expect(band(0, 5, 181, thresholds)).toBe("NONE");
+    expect(band(0, 4, 1, thresholds)).toBe("NONE");
+    expect(band(0, 5, null, thresholds)).toBe("NONE");
+  });
+});
+
+describe("familiarity prompt ratchet", () => {
+  const baseInput = {
+    pr: {
+      number: 1,
+      title: "t",
+      body: "",
+      author: "a",
+      authorAssociation: "OWNER",
+      isFork: false,
+      isDraft: false,
+      mergeable: "MERGEABLE",
+      baseRef: "main",
+      defaultBranch: "main",
+      headSha: "h".repeat(40),
+      baseSha: "b".repeat(40),
+      labels: [],
+      files: [f("src/a.ts")],
+      reviews: [],
+      inline: [],
+      discussion: [],
+      reactions: [],
+      diff: "diff --git a/src/a.ts b/src/a.ts\n",
+    } satisfies PR,
+    gates: [{ gate: "tier", passed: true, message: "T1" }],
+    gateVerdict: "PASSED",
+    tier: "T1-agent / T1a-trivial",
+    titleFlags: [],
+    manifests: [],
+    scrutiny: [],
+  } satisfies Parameters<typeof buildPrompt>[0];
+
+  test("absent familiarity keeps prompt without familiarity facts", () => {
+    const withNone = buildPrompt({ ...baseInput, familiarity: null });
+    const without = buildPrompt(baseInput);
+    expect(withNone).toBe(without);
+    expect(withNone).not.toContain("Author familiarity");
+  });
+
+  test("NONE without prior authors emits nothing", () => {
+    const fam: AuthorFamiliarity = {
+      band: "NONE",
+      blame_overlap_pct: 0,
+      modified_lines_owned: 0,
+      modified_lines_total: 10,
+      prior_prs_in_paths: 0,
+      days_since_last_touch: null,
+      files_prev_count: 0,
+      files_total: 1,
+      capped: false,
+      blame_incomplete_files: 0,
+      top_prior_authors: [],
+    };
+
+    expect(formatFamiliarity(fam)).toBe("");
+    expect(formatFamiliarity(null)).toBe("");
+    // NONE with prior authors: reviewer hint only, never the negative facts.
+    const hint = formatFamiliarity({ ...fam, top_prior_authors: ["Bob"] });
+    expect(hint).toContain("Bob");
+    expect(hint).not.toContain("band");
+  });
+
+  test("STRONG appears as TRUSTED facts", () => {
+    const fam: AuthorFamiliarity = {
+      band: "STRONG",
+      blame_overlap_pct: 80,
+      modified_lines_owned: 8,
+      modified_lines_total: 10,
+      prior_prs_in_paths: 3,
+      days_since_last_touch: 10,
+      files_prev_count: 1,
+      files_total: 1,
+      capped: false,
+      blame_incomplete_files: 0,
+      top_prior_authors: ["Alice"],
+    };
+
+    const block = formatFamiliarity(fam);
+    expect(block).toContain("band STRONG");
+    expect(block).toContain("80%");
+    expect(sanitize(block, 500)).toContain("Alice");
+  });
+});
+
+describe("parseDiff base-side lines", () => {
+  test("counts deleted/replaced base lines only", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,3 +1,3 @@",
+      " keep",
+      "-old",
+      "+new",
+      " keep2",
+    ].join("\n");
+
+    const files = parseDiff(diff);
+    expect(files).toHaveLength(1);
+    expect(files[0]!.base_modified_lines).toEqual([2]);
+    expect(files[0]!.changed_lines).toBe(2);
+  });
+});
+
+describe("approval retention predicate", () => {
+  test("identical non-empty diffs retain", () => {
+    expect(approvedDiffUnchanged("diff --git a\n", "diff --git a\n")).toBe(true);
+  });
+  test("empty or blank refuses", () => {
+    expect(approvedDiffUnchanged("", "")).toBe(false);
+    expect(approvedDiffUnchanged("  ", "diff")).toBe(false);
+    expect(approvedDiffUnchanged("diff", "")).toBe(false);
+  });
+  test("binary marker refuses", () => {
+    const bin = "diff --git a/x b/x\nBinary files a/x and b/x differ\n";
+    expect(approvedDiffUnchanged(bin, bin)).toBe(false);
+  });
+  test("changed content refuses", () => {
+    expect(approvedDiffUnchanged("diff a\n", "diff b\n")).toBe(false);
+  });
+});
+
+describe("approval retention flow", () => {
+  // SAFETY: tryRetainApproval only hands `pr` to the injected deps, which read number and SHAs alone.
+  const livePr = { number: 7, headSha: "h2", baseSha: "b2" } as PR;
+  const standing = { reviewId: 1, approvedHead: "h1", approvedBase: "b1" };
+
+  const run = (opts: { gates: boolean; holds: boolean; diffs?: [string, string] }) => {
+    const calls: string[] = [];
+    const [approved, current] = opts.diffs ?? ["diff a\n", "diff a\n"];
+
+    const result = tryRetainApproval(
+      livePr,
+      "bot",
+      ".",
+      () => (calls.push("gates"), opts.gates),
+      {
+        findStandingApproval: () => standing,
+        compareDiff: (base) => (calls.push("compare"), base === "b1" ? approved : current),
+        retentionHolds: () => (calls.push("holds"), opts.holds),
+      },
+    );
+
+    return { result, calls };
+  };
+
+  test("keeps only when diff, gates and the final live check all pass, in that order", () => {
+    const { result, calls } = run({ gates: true, holds: true });
+    expect(result).toEqual({ kept: true, approval: standing });
+    expect(calls).toEqual(["compare", "compare", "gates", "holds"]);
+  });
+  test("a failed gate dismisses", () => {
+    expect(run({ gates: false, holds: true }).result).toEqual({ kept: false, reason: "gates_failed" });
+  });
+  test("a PR that moved during the checks dismisses", () => {
+    expect(run({ gates: true, holds: false }).result).toEqual({ kept: false, reason: "pr_moved" });
+  });
+  test("a changed diff dismisses before gates run", () => {
+    const { result, calls } = run({ gates: true, holds: true, diffs: ["diff a\n", "diff b\n"] });
+    expect(result).toEqual({ kept: false, reason: "diff_changed" });
+    expect(calls).not.toContain("gates");
+  });
+});
+
+describe("familiarity reads only default-branch history", () => {
+  test("a PR's own commit subjects and an unmerged stacked base earn no credit", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "stamp-fam-"));
+    const git = (...args: string[]) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { encoding: "utf8" }).trim();
+
+    const commit = (lines: string[], subject: string) => {
+      writeFileSync(path.join(dir, "a.ts"), lines.join("\n") + "\n");
+      git("add", "a.ts");
+      git("commit", "-q", "-m", subject);
+
+      return git("rev-parse", "HEAD");
+    };
+
+    git("init", "-q", "-b", "main");
+    commit(["one", "two", "three"], "init (#1)");
+    git("checkout", "-q", "-b", "stack");
+
+    const base = commit(["one", "forged", "three"], "stacked base claims (#5)"); // unmerged, PR-authored
+    git("checkout", "-q", "-b", "pr");
+
+    const head = commit(["one", "changed", "three"], "PR commit also claims (#5)"); // the checkout is the PR head
+
+    const fam = computeFamiliarity(
+      { authorLogin: "a", diff: git("diff", `${base}...${head}`), baseSha: base, headSha: head, repo: "o/r", repoRoot: dir, trustedRef: "main", thresholds, now: Date.now() },
+      { fetchAuthorPrNumbers: () => new Set([5]) },
+    );
+
+    expect(fam?.modified_lines_total).toBe(1);
+    expect(fam?.modified_lines_owned).toBe(0);
+    expect(fam?.prior_prs_in_paths).toBe(0);
+    expect(fam?.files_prev_count).toBe(0);
+    expect(fam?.band).toBe("NONE");
+  });
+
+  test("a shallow checkout gives no signal until its history is fetched, then the real one", () => {
+    const origin = mkdtempSync(path.join(tmpdir(), "stamp-origin-"));
+    const git = (dir: string, ...args: string[]) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { encoding: "utf8" }).trim();
+
+    const commit = (lines: string[], subject: string) => {
+      writeFileSync(path.join(origin, "a.ts"), lines.join("\n") + "\n");
+      git(origin, "add", "a.ts");
+      git(origin, "commit", "-q", "-m", subject);
+
+      return git(origin, "rev-parse", "HEAD");
+    };
+
+    git(origin, "init", "-q", "-b", "main");
+    commit(["one", "two", "three"], "init (#1)");
+
+    const base = commit(["one", "mine", "three"], "author's merged work (#5)");
+    git(origin, "checkout", "-q", "-b", "pr");
+
+    const head = commit(["one", "changed", "three"], "PR change");
+    // What actions/checkout does: depth 1, over a transport that honours it.
+    const clone = mkdtempSync(path.join(tmpdir(), "stamp-shallow-"));
+    execFileSync("git", ["clone", "-q", "--depth", "1", "--no-single-branch", `file://${origin}`, clone]);
+
+    const familiarity = () =>
+      computeFamiliarity(
+        { authorLogin: "a", diff: git(origin, "diff", `${base}...${head}`), baseSha: base, headSha: head, repo: "o/r", repoRoot: clone, trustedRef: "origin/main", thresholds, now: Date.now() },
+        { fetchAuthorPrNumbers: () => new Set([5]) },
+      );
+
+    expect(familiarity()).toBeNull();
+
+    expect(ensureFullHistory(clone)).toBe(true);
+    const fam = familiarity();
+    expect(fam?.band).toBe("STRONG");
+    expect(fam?.modified_lines_owned).toBe(1);
+    expect(fam?.prior_prs_in_paths).toBe(1);
+  });
+});
+
+describe("folder size overrides", () => {
+  test("global only when no AGENT_APPROVALS", () => {
+    const eff = resolveSizeOverrides(policy, ["src/a.ts", "src/b.ts"], () => null);
+    expect(eff.file_scopes).toEqual([{ path: null, ceiling: 30, files: ["src/a.ts", "src/b.ts"] }]);
+    expect(eff.line_scopes).toEqual([{ path: null, ceiling: 800, files: ["src/a.ts", "src/b.ts"] }]);
+    // A root grant covers top-level and nested files alike.
+    const root = resolveSizeOverrides(policy, ["a.ts", "src/b.ts"], (rel) => (rel === "AGENT_APPROVALS.md" ? "---\nstamp:\n  size_gate:\n    max_lines: 900\n---\n" : null));
+    expect(root.line_scopes).toEqual([
+      { path: "AGENT_APPROVALS.md", ceiling: 900, files: ["a.ts", "src/b.ts"] },
+      { path: null, ceiling: 800, files: [] },
+    ]);
+  });
+
+  test("nearest grant raises ceiling within contract; invalid ignored", () => {
+    const read = (rel: string) => {
+      if (rel === "products/foo/AGENT_APPROVALS.md") {
+        return `---
+stamp:
+  size_gate:
+    max_files: 40
+    max_lines: 900
+---
+`;
+      }
+
+      if (rel === "products/foo/bad/AGENT_APPROVALS.md") {
+        return `---
+stamp:
+  size_gate:
+    max_files: 9999
+---
+`;
+      }
+
+      return null;
+    };
+
+    const changed = ["products/foo/a.ts", "products/foo/bad/b.ts", "src/c.ts"];
+    const eff = resolveSizeOverrides(policy, changed, read);
+    expect(eff.invalid_folder_files).toEqual(["products/foo/bad/AGENT_APPROVALS.md"]);
+    const fooFiles = eff.file_scopes.find((s) => s.path === "products/foo/AGENT_APPROVALS.md");
+    expect(fooFiles?.ceiling).toBe(40);
+    expect(fooFiles?.files.sort()).toEqual(["products/foo/a.ts", "products/foo/bad/b.ts"].sort());
+    expect(eff.file_scopes.find((s) => s.path === null)?.files).toEqual(["src/c.ts"]);
+    expect(eff.line_scopes.find((s) => s.path === "products/foo/AGENT_APPROVALS.md")?.ceiling).toBe(900);
+  });
+
+  test("size gate uses budgets and roof", () => {
+    const budgets = resolveSizeOverrides(policy, ["products/foo/a.ts"], (rel) =>
+      rel === "products/foo/AGENT_APPROVALS.md"
+        ? `---
+stamp:
+  size_gate:
+    max_files: 40
+    max_lines: 900
+---
+`
+        : null,
+    );
+
+    // 35 files under folder ceiling 40, lines under 900
+    const many = Array.from({ length: 35 }, (_, i) => f(`products/foo/f${i}.ts`, 10));
+    expect(sizeWithinBudgets(many, budgets).ok).toBe(true);
+    const tooMany = Array.from({ length: 41 }, (_, i) => f(`products/foo/f${i}.ts`, 1));
+    expect(sizeWithinBudgets(tooMany, budgets).ok).toBe(false);
+
+    // Roof: mix that fits scopes but exceeds roof
+    const roof = resolveSizeOverrides(policy, ["products/foo/a.ts", "src/b.ts"], (rel) =>
+      rel === "products/foo/AGENT_APPROVALS.md"
+        ? `---
+stamp:
+  size_gate:
+    max_lines: 900
+---
+`
+        : null,
+    );
+
+    const big = [...Array.from({ length: 20 }, (_, i) => f(`products/foo/f${i}.ts`, 40)), ...Array.from({ length: 20 }, (_, i) => f(`src/g${i}.ts`, 10))];
+    // folder lines = 800, global = 200, total = 1000 > roof 900
+    const check = sizeWithinBudgets(big, roof);
+    expect(check.ok).toBe(false);
+    expect(check.message).toContain("roof");
+  });
+
+  test("runGates accepts raised folder ceiling", () => {
+    const budgets = resolveSizeOverrides(policy, ["products/foo/a.ts"], () => `---
+stamp:
+  size_gate:
+    max_lines: 900
+---
+`);
+
+    const files = [f("products/foo/a.ts", 850)];
+
+    const denied = runGates(policy, {
+      title: "x",
+      author: "jag",
+      authorAssociation: "OWNER",
+      isFork: false,
+      isDraft: false,
+      mergeable: "MERGEABLE",
+      reviews: [],
+      files,
+    });
+
+    expect(denied.gates.find((g) => g.gate === "size")?.passed).toBe(false); // global only
+
+    const allowed = runGates(policy, {
+      title: "x",
+      author: "jag",
+      authorAssociation: "OWNER",
+      isFork: false,
+      isDraft: false,
+      mergeable: "MERGEABLE",
+      reviews: [],
+      files,
+      sizeBudgets: budgets,
+    });
+
+    expect(allowed.gates.find((g) => g.gate === "size")?.passed).toBe(true);
+  });
+
+  test("AGENT_APPROVALS.md is deny-listed", () => {
+    expect(denyCategories(policy, ["products/foo/AGENT_APPROVALS.md"])).toEqual(["stamp_policy"]);
+  });
 });

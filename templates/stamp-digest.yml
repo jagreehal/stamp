@@ -1,0 +1,29 @@
+# stamp digest: daily Slack summary of stamp-approved merges.
+# Optional. Installed by `bunx @jagreehal/stamp init` alongside the review workflow.
+#
+# Off until the STAMP_SLACK_WEBHOOK secret (a Slack Incoming Webhook URL) is set;
+# the webhook decides the channel. Delete this file to remove the digest.
+name: stamp-digest
+on:
+  schedule:
+    - cron: "0 14 * * 1-5" # weekdays 14:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: oven-sh/setup-bun@v2
+      - run: bunx @jagreehal/stamp@0.1.0 digest --since 24
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAMP_BOT_LOGIN: github-actions[bot]
+          STAMP_SLACK_WEBHOOK: ${{ secrets.STAMP_SLACK_WEBHOOK }}

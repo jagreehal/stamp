@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import type { PR } from "./github.ts";
+import { formatFamiliarity, type AuthorFamiliarity } from "./familiarity.ts";
 import type { Gate, Ownership, ScrutinyFlag } from "./policy.ts";
 import { formatSignals, type Signals } from "./signals.ts";
 
@@ -138,6 +139,7 @@ export type ReviewInput = {
   scrutiny: ScrutinyFlag[];
   ownership?: Ownership;
   signals?: Signals | null;
+  familiarity?: AuthorFamiliarity | null;
 };
 
 export function buildPrompt(input: ReviewInput): string {
@@ -203,6 +205,7 @@ export function buildPrompt(input: ReviewInput): string {
     "",
     ownership,
     ...(input.signals ? ["", formatSignals(input.signals)] : []),
+    formatFamiliarity(input.familiarity),
     ...constraints.map((c) => "\n" + c),
     "",
     "--- BEGIN UNTRUSTED CONTENT ---",

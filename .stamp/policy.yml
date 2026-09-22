@@ -8,8 +8,8 @@ version: 1
 # T2: never AI-approved. Any changed file matching a `paths` or `any` pattern
 # denies the PR before the LLM runs. `any` and `titles` patterns also scan the
 # PR title, but a title hit is only a scrutiny flag for the reviewer, never a
-# denial on its own (calibrated by PostHog against ~440 PRs: title-only hits
-# were dominated by incidental mentions humans approved unchanged).
+# denial on its own (calibrated against ~440 PRs: most title-only hits were
+# incidental mentions humans approved unchanged).
 deny:
   auth:
     description: Authentication and authorization surfaces.
@@ -46,7 +46,7 @@ deny:
   stamp_policy:
     description: stamp's own policy, engine, and gate inputs. The gate cannot approve edits to itself.
     match:
-      paths: ['\.stamp/', 'stamp/src/', 'CODEOWNERS']
+      paths: ['\.stamp/', 'stamp/src/', 'CODEOWNERS', 'AGENT_APPROVALS\.md']
 
 # T0: docs/tests/config only. Still LLM-reviewed, lighter bar.
 allow:
@@ -54,11 +54,25 @@ allow:
   extensions_only: ['.md', '.mdx', '.txt', '.rst', '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.csv', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.snap']
 
 # Substantive lines/files (docs, tests, snapshots, lockfiles, images excluded).
-# PostHog's backtest: denied-yet-merged-unchanged PRs cluster at 500-750 lines;
+# Backtest: denied PRs that merged unchanged cluster at 500-750 lines;
 # past ~800 the merged-unchanged rate collapses, so escalation is right there.
 size_gate:
   max_lines: 800
   max_files: 30
+
+# Contract ceilings for per-folder AGENT_APPROVALS.md grants. A folder may raise
+# size_gate within these ceilings; grants are read from the default branch only.
+overrides:
+  size_gate.max_lines: { ceiling: 1000 }
+  size_gate.max_files: { ceiling: 50 }
+
+# Author familiarity: judgment layer only, never a gate.
+familiarity:
+  strong:
+    min_blame_overlap_pct: 70
+  moderate:
+    min_prior_prs: 5
+    max_days_since_touch: 180
 
 tiers:
   T1a-trivial: { max_lines: 20, max_files: 3 }
