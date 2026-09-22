@@ -32,7 +32,9 @@ Label mode: `gh pr edit <n> --add-label stamp`. All-PRs mode: it already ran; re
 | 🙋 ESCALATE | risky territory without independent assurance | request the named human/team reviewer; do not re-label to retry |
 | ⏳ WAIT / ⚠️ ERROR | no verdict yet | wait for the next run; ERROR twice in a row → tell the user |
 
-Never argue with a gate. A deny-list or size refusal is not a bug to work around: do not split the PR into pseudo-scopes, move files, or rename paths to dodge a pattern. Say what was denied and let the human decide.
+An approval survives a base-branch merge that leaves the PR's diff byte-identical, so you need no re-review after updating the branch. Comment `/stamp` to force a fresh review.
+
+Never argue with a gate. A deny-list or size refusal is not a bug to work around: do not split the PR into pseudo-scopes, move files, rename paths, or add an `AGENT_APPROVALS.md` to dodge a pattern or raise a ceiling. Say what was denied and let the human decide.
 
 ## 3. Merge
 

@@ -1,16 +1,37 @@
 #!/usr/bin/env bun
 // stamp <pr-number> [--dry-run] [--post] [--label <name>] [--json <path>] [-v]
 // stamp init   copies .stamp/ and the workflow into the current repo
+// stamp digest [--since <hours>]   posts a Slack summary of recent stamp-approved merges
 //
-// Pipeline: retract stale approvals → fetch → gates → (wait for in-flight reviewer bots) → LLM review → verdict → post → sweep.
+// Pipeline: (retention?) → retract stale approvals → fetch → gates → (wait for
+// in-flight reviewer bots) → familiarity → LLM review → verdict → post → sweep.
 // The verdict is the output; --post puts it on GitHub as a real approval or a comment.
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { dismissOwnApprovals, fetchPR, postVerdict, reconcilePosted, runMarker, type PR, type Verdict } from "./github.ts";
-import { DEFAULTS_DIR, detectOwnership, inFlightBots, loadGuidance, loadPolicy, manifestScriptEdits, manifestsWithoutLockfile, parseCodeowners, readTrusted, runGates, scrutinyFlags, titleFlags, type Gate } from "./policy.ts";
+import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
+import { dismissOwnApprovals, fetchPR, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, type PR, type Verdict } from "./github.ts";
+import {
+  DEFAULTS_DIR,
+  detectOwnership,
+  inFlightBots,
+  loadGuidance,
+  loadPolicy,
+  manifestScriptEdits,
+  manifestsWithoutLockfile,
+  parseCodeowners,
+  readTrusted,
+  resolveSizeOverrides,
+  runGates,
+  scrutinyFlags,
+  titleFlags,
+  type Gate,
+  type Policy,
+  type ScopeBudget,
+} from "./policy.ts";
+import { tryRetainApproval, type RetentionResult } from "./retention.ts";
 import { BACKENDS, combine, review, secondOpinionNeeded, type LLMVerdict, type Opinion } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
 
@@ -32,6 +53,7 @@ const { values: opts, positionals } = parseArgs({
     label: { type: "string" },
     json: { type: "string" },
     verbose: { type: "boolean", short: "v", default: false },
+    since: { type: "string" }, // digest: lookback in hours, default 24
   },
 });
 
@@ -41,9 +63,9 @@ const git = (...args: string[]) => execFileSync("git", ["-C", repoRoot, ...args]
 
 if (positionals[0] === "init") {
   // Existing files are never overwritten: the repo's policy is the repo's.
-  for (const rel of [".stamp/policy.yml", ".stamp/review-guidance.md", ".github/workflows/stamp.yml"]) {
+  for (const rel of [".stamp/policy.yml", ".stamp/review-guidance.md", ".github/workflows/stamp.yml", ".github/workflows/stamp-digest.yml"]) {
     const dest = path.join(repoRoot, rel);
-    const src = path.join(DEFAULTS_DIR, rel.startsWith(".github") ? "templates/stamp.yml" : rel);
+    const src = path.join(DEFAULTS_DIR, rel.startsWith(".github") ? `templates/${path.basename(rel)}` : rel);
 
     if (existsSync(dest)) {
       console.log(`kept    ${rel}`);
@@ -56,6 +78,12 @@ if (positionals[0] === "init") {
   }
 
   console.log("\nNext: add the ANTHROPIC_API_KEY secret, enable 'Allow GitHub Actions to create and approve pull requests', merge.");
+  console.log("Optional digest: add the STAMP_SLACK_WEBHOOK secret; the digest stays off without it.");
+  process.exit(0);
+}
+
+if (positionals[0] === "digest") {
+  await runDigest();
   process.exit(0);
 }
 
@@ -65,17 +93,66 @@ if (opts["dry-run"]) opts.post = false;
 const prNumber = Number(positionals[0]);
 
 if (!prNumber) {
-  console.error("usage: stamp <pr-number> [--dry-run] [--post] [--label <name>] [--json <path>] [-v]\n       stamp init");
+  console.error("usage: stamp <pr-number> [--dry-run] [--post] [--label <name>] [--json <path>] [-v]\n       stamp init\n       stamp digest [--since <hours>]");
   process.exit(2);
 }
 
 const me = process.env.STAMP_BOT_LOGIN || whoami(); // the login our verdicts post under; excluded from the prompt and swept for stale approvals
 
-// The stale-approval invariant: no stamp approval may stand over commits it didn't review. Retract
-// FIRST, needing only the PR number, before any fetch that can fail and ahead of every skip path
-// below. GitHub never auto-dismisses approvals, so a run that reaches the next line has already
-// voided the previous one.
-if (opts.post) dismissOwnApprovals(prNumber, me, repoRoot);
+opts.label ||= process.env.STAMP_LABEL || undefined;
+
+let retention: RetentionResult = { kept: false, reason: "not_posting" };
+
+// Retention is the deliberate exception to dismiss-first. It keeps a standing approval, and skips the
+// review, only when everything a fresh run would check still holds: the trigger label, not a draft, a
+// byte-identical PR diff, every gate against today's trusted policy, and finally a PR that has not
+// moved since. Anything ambiguous or failing falls through to dismiss (fail closed). A `/stamp`
+// comment is an explicit request for a fresh review, so it never retains.
+if (opts.post) {
+  try {
+    const early = fetchPR(prNumber, repoRoot, [me]);
+
+    if (process.env.GITHUB_EVENT_NAME === "issue_comment") retention = { kept: false, reason: "rereview_requested" };
+    else if ((opts.label && !early.labels.includes(opts.label)) || early.isDraft) retention = { kept: false, reason: "withdrawn" };
+    else {
+      retention = tryRetainApproval(early, me, repoRoot, () => {
+        fetchRefs(early);
+        const trustedRef = `origin/${early.defaultBranch}`;
+
+        return gatesFor(early, loadPolicy(repoRoot, trustedRef), trustedRef).gated.gates.every((g) => g.passed);
+      });
+    }
+
+    if (retention.kept) {
+      console.log(`retention: keeping approval #${retention.approval.reviewId}; PR diff unchanged`);
+
+      const evidence = {
+        stamp: VERSION,
+        pr: early.number,
+        head: early.headSha,
+        base: `${early.baseRef}@${early.baseSha}`,
+        author: early.author,
+        title: early.title,
+        retention: { status: "kept" as const, reviewId: retention.approval.reviewId },
+        verdict: "APPROVED" as const,
+        duration_ms: Date.now() - Date.parse(STARTED),
+        at: new Date().toISOString(),
+      };
+
+      if (opts.json) writeFileSync(opts.json, JSON.stringify(evidence, null, 2));
+      process.exit(0);
+    }
+
+    console.log(`retention: ${retention.reason}; dismissing and reviewing`);
+  } catch (e) {
+    console.log(`retention check failed (${e instanceof Error ? e.message : e}); dismissing`);
+    retention = { kept: false, reason: "check_failed" };
+  }
+
+  // The stale-approval invariant: no stamp approval may stand over commits it didn't review.
+  // Fail-closed: if any later step crashes, the prior approval is already gone.
+  dismissOwnApprovals(prNumber, me, repoRoot);
+}
 
 let pr = fetchPR(prNumber, repoRoot, [me]);
 
@@ -83,8 +160,6 @@ const skip = (why: string) => {
   console.log(`${why}; nothing to review`);
   process.exit(0);
 };
-
-opts.label ||= process.env.STAMP_LABEL || undefined;
 
 if (opts.label && !pr.labels.includes(opts.label)) skip(`label "${opts.label}" not present`);
 
@@ -98,7 +173,7 @@ if (pr.isDraft) skip("PR is a draft");
 // from there: a stacked PR's base is another feature branch, and a local clone's origin/main can be
 // weeks behind a tightened deny list.
 try {
-  git("fetch", "-q", "origin", `refs/pull/${pr.number}/head`, pr.baseRef, `+refs/heads/${pr.defaultBranch}:refs/remotes/origin/${pr.defaultBranch}`);
+  fetchRefs(pr);
 } catch (e) {
   // Offline local runs can go on with what is already here. A posting run cannot: stale policy or a
   // stale head would make the verdict wrong, and the startup sweep has already retracted the old one.
@@ -135,9 +210,7 @@ const codeowners = [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"].map((
 
 const ownership = codeowners !== null ? detectOwnership(parseCodeowners(codeowners), pr.files.map((f) => f.filename), pr.author) : undefined;
 
-const manifests = manifestsWithoutLockfile(pr.files.map((f) => f.filename));
-
-const gated = runGates(policy, { ...pr, manifestScriptEdits: manifestScriptEdits(repoRoot, pr.baseSha, pr.headSha, manifests) });
+const { manifests, sizeBudgets, gated } = gatesFor(pr, policy, trustedRef);
 
 const gateVerdict = gated.gates.every((g) => g.passed) ? "PASSED" : "DENIED";
 
@@ -157,13 +230,39 @@ try {
 
 const signalFlags = signals ? flagged(signals) : [];
 
+// Familiarity: judgment only. Absence (gh failure / no policy) leaves the prompt unchanged.
+let familiarity: AuthorFamiliarity | null = null;
+
+if (gateVerdict === "PASSED" && policy.familiarity) {
+  try {
+    if (!ensureFullHistory(repoRoot)) console.error("familiarity unavailable: could not fetch full history into the shallow checkout");
+
+    familiarity = computeFamiliarity({
+      authorLogin: pr.author,
+      diff: pr.diff,
+      baseSha: pr.baseSha,
+      headSha: pr.headSha,
+      repo: repoSlug(repoRoot),
+      repoRoot: exploreRoot,
+      trustedRef,
+      thresholds: policy.familiarity,
+    });
+  } catch (e) {
+    console.error(`familiarity unavailable: ${e instanceof Error ? e.message : e}`);
+  }
+}
+
 for (const g of gated.gates) console.log(`${g.passed ? "✓" : "✗"} ${g.gate}: ${g.message}`);
 
 if (signals) console.log(`  risk signals: ${signalFlags.length ? signalFlags.map((f) => `${f} ${signals[f].toFixed(2)}`).join(", ") : "none flagged"}`);
 
+if (familiarity) console.log(`  familiarity: ${familiarity.band} (${familiarity.blame_overlap_pct.toFixed(0)}% blame, ${familiarity.prior_prs_in_paths} prior PRs)`);
+
 if (flags.length) console.log(`  title scrutiny flags: ${flags.join(", ")}`);
 
 for (const f of scrutiny) console.log(`  scrutiny ${f.name}: ${f.files.join(", ")}`);
+
+if (sizeBudgets.invalid_folder_files.length) console.log(`  invalid AGENT_APPROVALS.md (ignored): ${sizeBudgets.invalid_folder_files.join(", ")}`);
 
 let verdict: Verdict;
 
@@ -181,7 +280,20 @@ if (opts["dry-run"]) {
   body = `Gates denied: ${gated.gates.filter((g) => !g.passed).map((g) => g.message).join("; ")}. A human reviewer has to take it from here.`;
 } else {
   const [primary, second] = BACKENDS;
-  const input = { pr, gates: gated.gates, gateVerdict, tier: [gated.tier, gated.sub].filter(Boolean).join(" / "), titleFlags: flags, manifests, scrutiny, ownership, signals } as const;
+
+  const input = {
+    pr,
+    gates: gated.gates,
+    gateVerdict,
+    tier: [gated.tier, gated.sub].filter(Boolean).join(" / "),
+    titleFlags: flags,
+    manifests,
+    scrutiny,
+    ownership,
+    signals,
+    familiarity,
+  } as const;
+
   const guidance = loadGuidance(repoRoot, trustedRef);
 
   try {
@@ -213,7 +325,35 @@ if (llm?.next_steps) console.log(`next: ${llm.next_steps}`);
 
 if (opinion) console.log(`second opinion (${opinion.backend}): ${opinion.verdict} — ${opinion.reasoning}`);
 
-const evidence = { stamp: VERSION, pr: pr.number, head: pr.headSha, base: `${pr.baseRef}@${pr.baseSha}`, author: pr.author, title: pr.title, tier: gated.tier, sub: gated.sub, denied: gated.denied, titleFlags: flags, scrutiny, gates: gated.gates, ownership: ownership && { ...ownership, owners: [...ownership.owners] }, signals, signalFlags, backends: BACKENDS, llm, opinion, verdict, at: new Date().toISOString() };
+const folderGrants = (kind: "max_files" | "max_lines", scopes: ScopeBudget[]) =>
+  scopes.flatMap((s) => (s.path === null ? [] : [{ path: s.path, kind, ceiling: s.ceiling, files: s.files.length }]));
+
+const evidence = {
+  stamp: VERSION,
+  pr: pr.number,
+  head: pr.headSha,
+  base: `${pr.baseRef}@${pr.baseSha}`,
+  author: pr.author,
+  title: pr.title,
+  tier: gated.tier,
+  sub: gated.sub,
+  denied: gated.denied,
+  titleFlags: flags,
+  scrutiny,
+  gates: gated.gates,
+  ownership: ownership && { ...ownership, owners: [...ownership.owners] },
+  signals,
+  signalFlags,
+  familiarity: familiarityEvidence(familiarity),
+  size_overrides: [...folderGrants("max_files", sizeBudgets.file_scopes), ...folderGrants("max_lines", sizeBudgets.line_scopes)],
+  retention: { status: "dismissed" as const, reason: retention.reason },
+  backends: BACKENDS,
+  llm,
+  opinion,
+  verdict,
+  duration_ms: Date.now() - Date.parse(STARTED),
+  at: new Date().toISOString(),
+};
 
 if (opts.json) writeFileSync(opts.json, JSON.stringify(evidence, null, 2));
 
@@ -309,7 +449,65 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict
     `stamp ${VERSION} · head \`${pr.headSha.slice(0, 7)}\` · base \`${pr.baseRef}@${pr.baseSha.slice(0, 7)}\` · risk ${llm?.risk ?? "n/a"}`,
     "</details>",
     runMarker(STARTED),
+    reviewedMarker(pr.headSha, pr.baseSha),
   );
 
   return parts.join("\n").replace(/!\[([^\]]*)\]\(/g, "[image: $1]("); // no auto-fetched images: a markdown image is an exfil channel
+}
+
+/** Fetch the PR head, its base and the default branch, so both diff ends and trusted policy are local. */
+function fetchRefs(pr: PR): void {
+  git("fetch", "-q", "origin", `refs/pull/${pr.number}/head`, pr.baseRef, `+refs/heads/${pr.defaultBranch}:refs/remotes/origin/${pr.defaultBranch}`);
+}
+
+/** Every deterministic gate for `pr`, with policy and folder size grants read from the default branch. */
+function gatesFor(pr: PR, policy: Policy, trustedRef: string) {
+  const manifests = manifestsWithoutLockfile(pr.files.map((f) => f.filename));
+  const sizeBudgets = resolveSizeOverrides(policy, pr.files.map((f) => f.filename), (rel) => readTrusted(repoRoot, rel, trustedRef));
+  const gated = runGates(policy, { ...pr, manifestScriptEdits: manifestScriptEdits(repoRoot, pr.baseSha, pr.headSha, manifests), sizeBudgets });
+
+  return { manifests, sizeBudgets, gated };
+}
+
+/** Slack digest of stamp-approved merges. Off until the STAMP_SLACK_WEBHOOK secret is set. */
+async function runDigest(): Promise<void> {
+  const webhook = process.env.STAMP_SLACK_WEBHOOK;
+
+  if (!webhook) {
+    console.log("STAMP_SLACK_WEBHOOK not set; digest is off");
+
+    return;
+  }
+
+  const hours = Number(opts.since ?? 24);
+
+  if (!(hours > 0)) {
+    console.error("--since takes a positive number of hours");
+    process.exit(2);
+  }
+
+  const since = new Date(Date.now() - hours * 3600_000).toISOString();
+  const bot = process.env.STAMP_BOT_LOGIN || whoami();
+  const repo = repoSlug(repoRoot);
+  // Titles and summaries are PR-authored; Slack reads <...> as links and mentions (<!channel>).
+  const esc = (t: string) => t.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  const items: string[] = [];
+
+  for (const pr of mergedPRs(repoRoot)) {
+    if (!pr.mergedAt || pr.mergedAt < since) continue;
+
+    const approval = listReviews(repo, pr.number, repoRoot)
+      .filter((r) => r.user.login === bot && r.state === "APPROVED")
+      .at(-1);
+
+    if (!approval) continue;
+    const summary = /\*\*What changed:\*\* (.+)/.exec(approval.body)?.[1] ?? pr.title;
+    items.push(`• <${pr.url}|#${pr.number} ${esc(pr.title)}> — ${esc(summary.slice(0, 200))}`);
+  }
+
+  const header = `*stamp digest* for ${repo}: ${items.length || "no"} stamp-approved merge(s) since ${since.slice(0, 16)}Z`;
+  const res = await fetch(webhook, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: [header, ...items].join("\n") }) });
+
+  if (!res.ok) throw new Error(`Slack webhook returned ${res.status}`);
+  console.log(`posted digest (${items.length} PRs)`);
 }

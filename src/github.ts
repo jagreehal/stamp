@@ -158,6 +158,47 @@ const RUN_MARKER = /<!-- stamp-run:(\S+) -->/;
 
 export const runMarker = (started: string) => `<!-- stamp-run:${started} -->`;
 
+// The full SHAs a review covered. Approval retention compares diffs on exactly these.
+const REVIEWED_MARKER = /<!-- stamp-reviewed:head=([0-9a-f]+);base=([0-9a-f]+) -->/;
+
+export const reviewedMarker = (headSha: string, baseSha: string) => `<!-- stamp-reviewed:head=${headSha};base=${baseSha} -->`;
+
+export const listReviews = (repo: string, prNumber: number, cwd: string) => paginated(ReviewRow, `repos/${repo}/pulls/${prNumber}/reviews`, cwd);
+
+export type StandingApproval = { reviewId: number; approvedHead: string; approvedBase: string };
+
+/** Our still-active approval on a head other than the live one, carrying a reviewed marker. A dismissed one lists as DISMISSED. */
+export function findStandingApproval(pr: PR, botLogin: string, cwd: string): StandingApproval | null {
+  for (const r of listReviews(repoSlug(cwd), pr.number, cwd)) {
+    if (r.user.login !== botLogin || r.state !== "APPROVED" || r.commit_id === pr.headSha) continue; // on the live head: re-review, not retention
+    const m = REVIEWED_MARKER.exec(r.body);
+
+    // SAFETY: both capture groups in REVIEWED_MARKER are mandatory, so a match fills them.
+    if (m) return { reviewId: r.id, approvedHead: m[1]!, approvedBase: m[2]! };
+  }
+
+  return null;
+}
+
+/**
+ * Retention's last word, called after everything else passed: the PR still has the head and base it
+ * was checked at, and the approval being kept is still active. A push after this triggers its own run.
+ */
+export function retentionHolds(pr: PR, reviewId: number, cwd: string): boolean {
+  const repo = repoSlug(cwd);
+
+  return unchanged(pr, repo, cwd) && listReviews(repo, pr.number, cwd).some((r) => r.id === reviewId && r.state === "APPROVED");
+}
+
+/** Unified diff of base...head on immutable SHAs, via the compare API. Throws on any gh failure. */
+export const compareDiff = (baseSha: string, headSha: string, cwd: string) =>
+  gh(["api", "-H", "Accept: application/vnd.github.diff", `repos/${repoSlug(cwd)}/compare/${baseSha}...${headSha}`], cwd);
+
+const MergedRow = z.object({ number: z.number(), title: z.string(), url: z.string(), mergedAt: z.string().nullable() });
+
+/** Up to 100 of the most recently merged PRs of the repository at `cwd`. */
+export const mergedPRs = (cwd: string) => call(z.array(MergedRow), ["pr", "list", "--state", "merged", "--limit", "100", "--json", "number,title,url,mergedAt"], cwd);
+
 export type PostOptions = { cwd: string; botLogin: string; started: string; triggerLabel?: string };
 
 /** True when a run that started after `started` has already posted a verdict of ours on this head. */

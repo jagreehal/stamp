@@ -12,7 +12,8 @@ on:
   pull_request:
     # `edited` covers base retargets: the diff changes without the head moving. Title/body edits
     # are filtered out below so they don't spend a review.
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
+    # `converted_to_draft` and `unlabeled` withdraw a standing approval: the draft/label skip paths retract it.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled, edited]
 
 concurrency:
   # Keyed by event too, because any comment on the PR creates an issue_comment run: sharing one group
@@ -42,7 +43,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }} # on a comment event stamp fetches the head itself
-          fetch-depth: 1 # stamp fetches the base ref and origin/<default> itself; a full clone of the history buys nothing
+          fetch-depth: 1 # stamp fetches the base ref and origin/<default> itself, and unshallows only when a run reaches the familiarity signal
       - uses: oven-sh/setup-bun@v2
       # Backend "claude": the review runs through Claude Code on a subscription instead of an API key.
       # Create the token once locally with `claude setup-token` and store it as CLAUDE_CODE_OAUTH_TOKEN.

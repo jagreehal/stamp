@@ -6,11 +6,7 @@ It runs deterministic gates and a scoped LLM review over a PR and, when the poli
 
 Repositories opt in one at a time, and nothing else is touched.
 
-It is PostHog's [stamphog](https://github.com/PostHog/posthog/tree/master/products/stamphog) reduced to what one repository needs: the same gates, the same verdicts, the same security model, and none of the platform.
-
-stamphog also has per-folder size overrides, git-blame familiarity, `owners.yaml` routing, a Slack digest, Temporal workflows and a Modal sandbox.
-
-Bring those over when a repository needs them.
+Beyond the gates and the review, stamp reports git-blame familiarity, honours per-folder size grants (`AGENT_APPROVALS.md` on the default branch), keeps an approval across pushes that leave the diff byte-identical, and can post a daily Slack digest.
 
 ## What a PR author sees
 
@@ -54,7 +50,7 @@ Each run can write an evidence bundle (`--json`), and the workflow uploads it as
 
 ## Connect a repository
 
-1. From the repository you want reviewed, run `bunx @jagreehal/stamp init`. It writes `.stamp/policy.yml`, `.stamp/review-guidance.md` and `.github/workflows/stamp.yml`, and never overwrites a file that exists.
+1. From the repository you want reviewed, run `bunx @jagreehal/stamp init`. It writes `.stamp/policy.yml`, `.stamp/review-guidance.md`, `.github/workflows/stamp.yml` and `.github/workflows/stamp-digest.yml`, and never overwrites a file that exists.
 2. Add the secret for your backend. `ANTHROPIC_API_KEY` for the API, or `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) with the repository variable `STAMP_BACKEND` set to `claude`.
 3. Settings → Actions → General → turn on **Allow GitHub Actions to create and approve pull requests**. Without it the approval is posted but does not satisfy a required-reviews rule.
 4. Pick a **review mode**. Leave `STAMP_LABEL` unset and every pull request is reviewed. Set `STAMP_LABEL: stamp` in the workflow env and only PRs carrying that label are reviewed.
@@ -79,6 +75,8 @@ When the default branch carries no such file, the bundled default is used, howev
 | `policy.yml`         | No       | The bundled policy       | Replaces the bundled policy wholesale            |
 | `review-guidance.md` | No       | The bundled norms        | Replaces the bundled prose wholesale             |
 | `steering.md`        | No       | Nothing is added         | Appended under "Repository-specific steering"    |
+
+Folder `AGENT_APPROVALS.md` files (any directory) raise size ceilings within `overrides:`; they are not under `.stamp/` but are still deny-listed and read from the default branch only.
 
 Every edit to these files is deny-listed (`stamp_policy`), so the gate cannot approve changes to itself.
 
@@ -121,7 +119,7 @@ PR-title keywords never deny on their own.
 
 They surface as scrutiny flags the reviewer must verify against the diff: REFUSE if the change behaviorally touches the flagged domain, judge normally if incidental.
 
-PostHog calibrated that split against ~440 deny-listed PRs, where title-only hits were dominated by incidental mentions humans approved unchanged.
+A calibration against ~440 deny-listed PRs set that split: most title-only hits were incidental mentions that humans approved unchanged.
 
 Word patterns match on boundaries that also break on `_` and `-`, so `secret` matches `secret_key.ts` and not `nosecrets.ts`, and `auth` does not match `author.ts`.
 
@@ -155,7 +153,32 @@ Over 800 substantive lines or 30 substantive files is too large for auto-review.
 
 Docs, snapshots, images, lockfiles and tests don't count toward the ceiling, because they inflate diffs without adding review surface; they still count toward tier classification and still appear in the diff the reviewer reads.
 
-PostHog derived the limits from 90 days of denial outcomes: the friction cluster of denied-yet-merged-unchanged PRs sits at 500–750 substantive lines, and past ~800 the merged-unchanged rate collapses, so escalation is genuinely right.
+90 days of denial outcomes set the limits: denied PRs that merged unchanged cluster at 500–750 substantive lines, and past ~800 the merged-unchanged rate collapses, so escalation fits there.
+
+Per-folder grants can raise those limits within the `overrides:` ceilings in `policy.yml` (defaults 1000 lines / 50 files). Put an `AGENT_APPROVALS.md` on an ancestor of the changed files:
+
+```yaml
+---
+stamp:
+  size_gate:
+    max_files: 40
+    max_lines: 900
+---
+```
+
+Grants are read from the **default branch** only (same trust boundary as policy). Invalid frontmatter is ignored for that file; nearest valid grant wins per key; the whole PR is still bounded by a roof (the most generous ceiling in play). Edits to `AGENT_APPROVALS.md` are deny-listed.
+
+### Author familiarity
+
+When policy sets `familiarity:` (the bundled policy does), stamp measures how well the author knows the changed code from git blame and their merged PRs in those paths, reading default-branch history only. STRONG and MODERATE bands reach the reviewer as trusted facts and never touch a gate. A missing signal or band NONE leaves the review exactly as strict as before.
+
+### Approval retention
+
+A push that leaves the PR's own unified diff byte-identical to the approved one (usually a base-branch merge) keeps the standing stamp approval and skips re-review. stamp keeps it only while the trigger label stays on, the PR stays out of draft, every gate passes against today's policy, and the PR still matches what stamp checked. Empty diffs, binaries or compare errors send the PR through the normal dismiss-and-review path. A `/stamp` comment always starts a fresh review.
+
+### Slack digest
+
+`stamp init` also writes `.github/workflows/stamp-digest.yml`. It stays off until the `STAMP_SLACK_WEBHOOK` secret is set; then the weekday cron posts stamp-approved merges from the last 24 hours to that webhook's channel. PR titles and summaries are escaped so they cannot mention or link in Slack.
 
 ## Backends
 
@@ -176,7 +199,7 @@ STAMP_BACKEND=claude                                                            
 STAMP_BACKEND=codex                                                                 # a ChatGPT login, no key
 ```
 
-The agent backends run the way stamphog runs the Claude Agent SDK: nothing the PR ships is loaded as configuration.
+The agent backends load nothing the PR ships as configuration.
 
 How each one is isolated, and what was tested, is in [AGENTS.md](AGENTS.md).
 
@@ -259,7 +282,7 @@ Copy `.agents/skills/` (`writing-pr-descriptions`, `merging-prs`) into repositor
 
 The reviewer checks the diff against the intent, the ruled-out alternatives and the pasted test output in the body.
 
-With the [Codex plugin for Claude Code](https://github.com/openai/codex-plugin-cc) installed, the skill has the agent run `/codex:review` before opening the PR and list the findings under Evidence.
+With the Codex plugin for Claude Code installed, the skill has the agent run `/codex:review` before opening the PR and list the findings under Evidence.
 
 ## Local review
 
@@ -275,6 +298,9 @@ bunx @jagreehal/stamp 42 --post
 
 # save the full result as JSON, show tool calls
 bunx @jagreehal/stamp 42 --json /tmp/review.json -v
+
+# post the Slack digest of stamp-approved merges from the last 48 hours
+STAMP_SLACK_WEBHOOK=https://hooks.slack.com/... bunx @jagreehal/stamp digest --since 48
 ```
 
 Requires [bun](https://bun.sh) and the `gh` CLI authenticated.
