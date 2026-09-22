@@ -44,6 +44,10 @@ A verdict that says nothing about the PR keeps the label, and the next push retr
 
 In CI the stamp login is `github-actions[bot]`.
 
+Every non-approval carries a collapsed **Fix with a coding agent** block: the verdict, the issues and the requested next step as one copyable prompt, with the rule that weakening a test or a lint rule to clear the review is itself a refusal. Most PRs stamp reviews were written by an agent, and that is where the fix loop starts.
+
+Commenting `/stamp` on a PR re-runs the review, so a fix does not need an empty commit to be re-checked. Only OWNER, MEMBER and COLLABORATOR comments trigger it.
+
 A local `--post` uses the account `gh` is logged in as.
 
 Each run can write an evidence bundle (`--json`), and the workflow uploads it as an artifact.
@@ -297,6 +301,10 @@ Prerequisites (hard gate)
 Deny-list (hard gate)
   - Checks file paths, both ends of a rename, against the categories above
   - Manifest scripts scan
+  │
+  ▼
+Credential scan (hard gate)
+  - Unambiguous key shapes on ADDED diff lines only
   │
   ▼
 Size ceiling (hard gate)

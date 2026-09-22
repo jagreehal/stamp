@@ -26,6 +26,7 @@ The nearest thing stamp has is the size exemption, and it changes only how much 
 - The hold for an in-flight reviewer bot (a fresh 👀 from `reviewer_bots`) is bounded and never terminal. Nothing re-triggers the workflow when a bot finishes, so a run that stopped to wait never came back: Greptile reacts within seconds of a push, so every run posted "waiting" and no verdict was ever reached. Hold for their findings, refresh the PR so their comments reach the prompt, then review without them.
 - Fork heads and authors below COLLABORATOR fail the prerequisites gate. Only people who could merge anyway get auto-approved.
 - Bot authors (dependabot, renovate, anything `[bot]`) are refused. There is no carve-out.
+- A credential shape on an added diff line denies the PR before the model runs. Only unambiguous shapes are listed: a generic high-entropy matcher would make a gate that denies outright into a noise generator. Deleted and context lines are ignored — a key already in the tree is a rotation problem, not this PR's.
 - A rename is checked on both paths. Moving a file out of `auth/` is a change to `auth/`.
 
 ## Trust boundaries

@@ -257,6 +257,34 @@ function checkoutAtHead(sha: string): string {
   return dir;
 }
 
+/**
+ * The findings as a prompt the author can hand straight to whatever agent wrote the PR. Most PRs
+ * stamp reviews are agent-written, and the fix loop is where a reviewer either saves time or wastes
+ * it. Five backticks so the block survives fences inside the reasoning, and the rules line is here
+ * because an agent told only "make the reviewer happy" will reach for the test file first.
+ */
+function agentPrompt(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict): string[] {
+  return [
+    "<details><summary>🤖 Fix with a coding agent</summary>",
+    "",
+    "`````markdown",
+    `Address this review of PR #${pr.number}, on head ${pr.headSha.slice(0, 7)}.`,
+    "",
+    `Verdict: ${verdict} — ${reasoning}`,
+    "",
+    "Issues to fix:",
+    ...llm.issues.map((i, n) => `${n + 1}. ${i}`),
+    ...(llm.next_steps ? ["", `Next step the reviewer asked for: ${llm.next_steps}`] : []),
+    "",
+    "Fix the cause, not the symptom. Do not skip or weaken a test, loosen a lint rule, widen an",
+    "ignore pattern or relax a type check to get past this review: that is itself a refusal.",
+    "Push to the PR branch when done and stamp reviews the new head.",
+    "`````",
+    "",
+    "</details>",
+  ];
+}
+
 function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict | null, opinion: Opinion | null, gates: Gate[]): string {
   const icon = { APPROVED: "✅", REFUSED: "❌", ESCALATE: "🙋", ERROR: "⚠️" }[verdict];
   const parts = [`## ${icon} stamp: ${verdict}`, "", reasoning];
@@ -266,6 +294,8 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict
   if (llm?.next_steps) parts.push("", `**Next:** ${llm.next_steps}`);
 
   if (llm?.change_summary) parts.push("", `**What changed:** ${llm.change_summary}`);
+
+  if (verdict !== "APPROVED" && llm?.issues.length) parts.push("", ...agentPrompt(pr, verdict, reasoning, llm));
   parts.push(
     "",
     "<details><summary>mechanics</summary>",

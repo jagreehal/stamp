@@ -314,8 +314,43 @@ export function detectOwnership(rules: { re: RegExp; owners: string[] }[], files
 
 export type Gate = { gate: string; passed: boolean; message: string };
 
+// Credential shapes that are unambiguous enough to deny on: a match is a key, not a variable named
+// like one. Generic high-entropy strings are deliberately absent — they are how a secret scanner
+// earns a reputation for noise, and this one denies the PR outright.
+const CREDENTIAL_PATTERNS: [string, RegExp][] = [
+  ["private key block", /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----/],
+  ["Anthropic key", /\bsk-ant-[\w-]{20,}/],
+  ["OpenAI key", /\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}/],
+  ["GitHub token", /\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}/],
+  ["AWS access key", /\bAKIA[0-9A-Z]{16}\b/],
+  ["Google API key", /\bAIza[0-9A-Za-z_-]{35}\b/],
+  ["Slack token", /\bxox[abprs]-[A-Za-z0-9-]{10,}/],
+  ["Stripe live key", /\b[sr]k_live_[0-9a-zA-Z]{16,}/],
+];
+
+/**
+ * Credentials added by the diff, as "path: what it looks like". Added lines only: a key being
+ * deleted is a key being removed, and context lines are already in the base.
+ */
+export function addedSecrets(diff: string): string[] {
+  const found: string[] = [];
+  let file = "";
+
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+++ ")) file = line.slice(6).trim(); // "+++ b/path"
+    else if (line.startsWith("+") && !line.startsWith("+++")) {
+      const hit = CREDENTIAL_PATTERNS.find(([, re]) => re.test(line));
+
+      if (hit && !found.some((f) => f === `${file}: ${hit[0]}`)) found.push(`${file}: ${hit[0]}`);
+    }
+  }
+
+  return found;
+}
+
 export type PRMeta = {
   title: string;
+  diff?: string;
   author: string;
   authorAssociation: string;
   isFork: boolean;
@@ -371,6 +406,13 @@ export function runGates(policy: Policy, pr: PRMeta): GateRun {
     passed: !tooBig,
     message: `${size.lines} substantive lines / ${size.files} files (limit ${policy.size_gate.max_lines}/${policy.size_gate.max_files})`,
   });
+
+  // A committed credential is never auto-approvable, whatever tier the change is: this runs before
+  // the model and denies on its own. It reads the diff, not the checkout, so a key that was already
+  // in the tree is someone else's problem to rotate, not this PR's gate.
+  const secrets = pr.diff ? addedSecrets(pr.diff) : [];
+
+  gates.push({ gate: "secrets", passed: secrets.length === 0, message: secrets.length ? `credential added in ${secrets.join("; ")}` : "no credentials in the diff" });
 
   const t = tier(policy, pr.files, denied);
   gates.push({ gate: "tier", passed: t.tier !== "T2-never", message: [t.tier, t.sub].filter(Boolean).join(" / ") });

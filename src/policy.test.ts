@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { scrub } from "./github.ts";
-import { denyCategories, detectOwnership, inFlightBots, loadPolicy, manifestScriptEdits, manifestsWithoutLockfile, parseCodeowners, runGates, scrutinyFlags, substantiveSize, tier, titleFlags, type PRFile, type PRMeta } from "./policy.ts";
+import { addedSecrets, denyCategories, detectOwnership, inFlightBots, loadPolicy, manifestScriptEdits, manifestsWithoutLockfile, parseCodeowners, runGates, scrutinyFlags, substantiveSize, tier, titleFlags, type PRFile, type PRMeta } from "./policy.ts";
 import { combine, sanitize, secondOpinionNeeded, type LLMVerdict } from "./reviewer.ts";
 import { SIGNAL_IDS, SIGNAL_THRESHOLD, flagged, formatSignals, requestBody, type Signals } from "./signals.ts";
 
@@ -208,4 +208,19 @@ test("inFlightBots counts only fresh eyes from listed bots", () => {
   ];
 
   expect(inFlightBots(reactions, bots, 45 * 60_000, now)).toEqual(["greptile-apps[bot]"]);
+});
+
+test("addedSecrets flags credentials on added lines only", () => {
+  const diff = [
+    "diff --git a/src/config.ts b/src/config.ts",
+    "+++ b/src/config.ts",
+    '+const key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123";',
+    "+++ b/src/old.ts",
+    '-const gone = "AKIAIOSFODNN7EXAMPLE";', // removing a key is not adding one
+    ' const ctx = "AKIAIOSFODNN7EXAMPLE";', // already in the base
+    "+++ b/docs/setup.md",
+    "+Set ANTHROPIC_API_KEY to your key before running.", // a name is not a key
+  ].join("\n");
+
+  expect(addedSecrets(diff)).toEqual(["src/config.ts: Anthropic key"]);
 });

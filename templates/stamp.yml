@@ -6,13 +6,16 @@
 #     (without it the approval posts but does not satisfy a required-reviews rule)
 name: stamp
 on:
+  # `/stamp` in a PR comment re-runs the review: the fix loop otherwise needs an empty commit.
+  issue_comment:
+    types: [created]
   pull_request:
     # `edited` covers base retargets: the diff changes without the head moving. Title/body edits
     # are filtered out below so they don't spend a review.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
 
 concurrency:
-  group: stamp-${{ github.event.pull_request.number }}
+  group: stamp-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true # a newer head supersedes the run in flight
 
 permissions:
@@ -23,13 +26,19 @@ jobs:
   review:
     # No draft/bot/label filter here on purpose: stamp itself decides whether to review, and it
     # retracts its stale approval on every skip path. A job-level `if` would skip the retraction too.
-    if: github.event.action != 'edited' || github.event.changes.base != null
+    # A comment never changes the head, so skipping one strands no approval. Only people who could
+    # merge anyway may spend a run this way.
+    if: >-
+      (github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null))
+      || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null
+          && startsWith(github.event.comment.body, '/stamp')
+          && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     timeout-minutes: 20 # a hung model call must not burn a runner for six hours; a killed run is fail-closed (the approval is already retracted)
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }} # on a comment event stamp fetches the head itself
           fetch-depth: 1 # stamp fetches the base ref and origin/<default> itself; a full clone of the history buys nothing
       - uses: oven-sh/setup-bun@v2
       # Backend "claude": the review runs through Claude Code on a subscription instead of an API key.
@@ -38,7 +47,7 @@ jobs:
       # Pin the version: the engine decides what gets auto-approved, so bumps are deliberate.
       - run: bunx @jagreehal/stamp@0.1.0 "$PR" --post --json "$RUNNER_TEMP/stamp.json"
         env:
-          PR: ${{ github.event.pull_request.number }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
           GH_TOKEN: ${{ github.token }}
           STAMP_BOT_LOGIN: github-actions[bot]
           STAMP_BACKEND: ${{ vars.STAMP_BACKEND }}           # empty = api; "claude" for Claude Code
@@ -55,5 +64,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: stamp-evidence-${{ github.event.pull_request.number }}
+          name: stamp-evidence-${{ github.event.pull_request.number || github.event.issue.number }}
           path: ${{ runner.temp }}/stamp.json
