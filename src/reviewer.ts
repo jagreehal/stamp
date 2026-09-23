@@ -142,21 +142,34 @@ export type ReviewInput = {
   familiarity?: AuthorFamiliarity | null;
 };
 
+// Review agents that post through the PR author's own account (shepherd's swarm, for one) open
+// every comment with this header. Neither the author nor such a comment is independent of the change.
+const AUTOMATED_RE = /🤖 Automated comment by/;
+
+const isAutomated = (body: string) => AUTOMATED_RE.test(body.slice(0, 300));
+
+/** Current-head reviewers who can count as independent assurance: not the author, not an agent posting for them. */
+export const independentReviewers = (pr: PR) =>
+  [...new Set(pr.reviews.flatMap((r) => (r.isCurrentHead && (r.state === "APPROVED" || r.state === "COMMENTED") && r.user !== pr.author && !isAutomated(r.body) ? [r.user] : [])))].sort();
+
 export function buildPrompt(input: ReviewInput): string {
   const { pr } = input;
   const line = (s: string) => `  - ${s}`;
+  const who = (user: string, body: string) => `@${sanitize(user, 50)}${user === pr.author ? " (author)" : ""}${isAutomated(body) ? " (automated)" : ""}`;
 
   const reviews = pr.reviews
     .filter((r) => r.state !== "COMMENTED" || r.body)
-    .map((r) => line(`@${sanitize(r.user, 50)} [${r.state}, ${r.isCurrentHead ? "current head" : "older commit"}]${r.body ? ": " + sanitize(r.body, 2500) : ""}`));
+    .map((r) => line(`${who(r.user, r.body)} [${r.state}, ${r.isCurrentHead ? "current head" : "older commit"}]${r.body ? ": " + sanitize(r.body, 2500) : ""}`));
 
   const inline = pr.inline
     .slice(0, 60)
-    .map((c) => line(`@${sanitize(c.user, 50)}${c.outdated ? " [outdated]" : ""} on ${sanitize(c.path, 200)}: ${sanitize(c.body, 1500)}`));
+    .map((c) => line(`${who(c.user, c.body)}${c.outdated ? " [outdated]" : ""} on ${sanitize(c.path, 200)}: ${sanitize(c.body, 1500)}`));
 
   const discussion = pr.discussion
     .slice(-40)
-    .map((c) => line(`@${sanitize(c.user, 50)}${c.user === pr.author ? " (author)" : ""}: ${sanitize(c.body, 1500)}${c.reactions.length ? ` [reactions: ${c.reactions.join(", ")}]` : ""}`));
+    .map((c) => line(`${who(c.user, c.body)}: ${sanitize(c.body, 1500)}${c.reactions.length ? ` [reactions: ${c.reactions.join(", ")}]` : ""}`));
+
+  const independent = independentReviewers(pr);
 
   const reactions = pr.reactions.filter((r) => r.user !== pr.author).map((r) => line(`${r.content} by @${sanitize(r.user, 50)}`));
   const files = pr.files.map((f) => line(`${f.filename} (+${f.additions}/-${f.deletions})${f.status === "added" ? " [NEW]" : ""}`));
@@ -198,6 +211,7 @@ export function buildPrompt(input: ReviewInput): string {
     `Tier: ${input.tier}`,
     `Size: ${pr.files.reduce((n, f) => n + f.additions + f.deletions, 0)} lines, ${pr.files.length} files`,
     `Reviews: ${pr.reviews.length} top-level, ${pr.inline.length} inline, ${pr.discussion.length} discussion`,
+    `Current-head reviewers who can count as independent assurance: ${independent.length ? independent.map((u) => "@" + sanitize(u, 50)).join(", ") : "none"}`,
     "",
     "Gate results:",
     ...input.gates.map((g) => `  ${g.gate}: ${g.passed ? "passed" : "FAILED"} — ${g.message}`),
