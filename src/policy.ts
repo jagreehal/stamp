@@ -527,8 +527,8 @@ export type PRMeta = {
   reviews: { user: string; state: string }[];
   files: PRFile[];
   manifestScriptEdits?: string[];
-  /** Resolved folder size budgets; when absent, the global size_gate alone applies. */
-  sizeBudgets?: EffectiveSize;
+  /** Folder size budgets from resolveSizeOverrides: the global size_gate alone when no folder grants apply. */
+  sizeBudgets: EffectiveSize;
 };
 
 const BOT_RE = /\[bot\]$|^(dependabot|renovate)/i;
@@ -569,8 +569,7 @@ export function runGates(policy: Policy, pr: PRMeta): GateRun {
     message: [denied.length ? `touches ${denied.join(", ")}` : "", scripts.length ? `scripts/hooks changed in ${scripts.join(", ")}` : ""].filter(Boolean).join("; ") || "no sensitive paths",
   });
 
-  const budgets = pr.sizeBudgets ?? resolveSizeOverrides(policy, pr.files.map((f) => f.filename), () => null);
-  const sizeCheck = sizeWithinBudgets(pr.files, budgets);
+  const sizeCheck = sizeWithinBudgets(pr.files, pr.sizeBudgets);
   gates.push({ gate: "size", passed: sizeCheck.ok, message: sizeCheck.message });
 
   // A committed credential is never auto-approvable, whatever tier the change is: this runs before

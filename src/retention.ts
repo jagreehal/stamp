@@ -4,7 +4,7 @@
 // The deliberate exception to dismiss-first. Fail closed on anything ambiguous:
 // empty diffs, binary markers, GitHub errors, missing reviewed marker, a failed
 // gate, or a PR that moved while it was being checked.
-import { compareDiff, findStandingApproval, retentionHolds, type PR, type StandingApproval } from "./github.ts";
+import { compareDiff, listReviews, reviewedShas, unchanged, type PR, type ReviewRecord } from "./github.ts";
 
 const BINARY_MARKER_RE = /^Binary files\b.*differ$/m;
 
@@ -16,6 +16,31 @@ export function approvedDiffUnchanged(approvedDiff: string, currentDiff: string)
 
   return approvedDiff === currentDiff;
 }
+
+export type StandingApproval = { reviewId: number; approvedHead: string; approvedBase: string };
+
+/** Our still-active approval of a head other than `headSha`, with the marker retention needs. A dismissed one lists as DISMISSED. */
+export function standingApproval(reviews: ReviewRecord[], headSha: string, botLogin: string): StandingApproval | null {
+  for (const r of reviews) {
+    if (r.user.login !== botLogin || r.state !== "APPROVED") continue;
+    const covered = reviewedShas(r);
+
+    if (!covered || covered.head === headSha) continue; // no marker: fail closed; the live head itself: nothing to retain
+
+    return { reviewId: r.id, approvedHead: covered.head, approvedBase: covered.base };
+  }
+
+  return null;
+}
+
+const findStandingApproval = (pr: PR, botLogin: string, cwd: string) => standingApproval(listReviews(pr.repo, pr.number, cwd), pr.headSha, botLogin);
+
+/**
+ * Retention's last word, called after everything else passed: the PR still has the head and base it
+ * was checked at, and the approval being kept is still active. A push after this triggers its own run.
+ */
+const retentionHolds = (pr: PR, reviewId: number, cwd: string) =>
+  unchanged(pr, cwd) && listReviews(pr.repo, pr.number, cwd).some((r) => r.id === reviewId && r.state === "APPROVED");
 
 export type RetentionResult =
   | { kept: true; approval: StandingApproval; pr: PR }
@@ -36,8 +61,8 @@ export function tryRetainApproval(pr: PR, botLogin: string, cwd: string, gatesPa
   let currentDiff: string;
 
   try {
-    approvedDiff = deps.compareDiff(standing.approvedBase, standing.approvedHead, cwd);
-    currentDiff = deps.compareDiff(pr.baseSha, pr.headSha, cwd);
+    approvedDiff = deps.compareDiff(pr.repo, standing.approvedBase, standing.approvedHead, cwd);
+    currentDiff = deps.compareDiff(pr.repo, pr.baseSha, pr.headSha, cwd);
   } catch {
     return { kept: false, reason: "compare_failed" };
   }

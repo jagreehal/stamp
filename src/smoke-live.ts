@@ -9,6 +9,7 @@ import type { PR } from "./github.ts";
 const root = path.resolve(import.meta.dir, "..");
 
 const pr: PR = {
+  repo: "example/smoke",
   number: 0,
   title: "fix: treat an empty tiers map as T1d instead of throwing",
   body: "## Why\ntier() should not depend on the map having entries.\n\n## What changed\n- comment only, no behaviour change\n\n## Evidence\n- tests: bun test → 9 pass",

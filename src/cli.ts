@@ -119,7 +119,7 @@ if (opts.post) {
       retention = withBudget(RETENTION_BUDGET_MS, () => {
         const early = fetchPR(prNumber, repoRoot, [me]);
 
-        if ((opts.label && !early.labels.includes(opts.label)) || early.isDraft) return { kept: false, reason: "withdrawn" } as const;
+        if (withdrawn(early)) return { kept: false, reason: "withdrawn" } as const;
 
         return tryRetainApproval(early, me, repoRoot, () => {
           fetchRefs(early);
@@ -131,20 +131,13 @@ if (opts.post) {
     }
 
     if (retention.kept) {
-      const early = retention.pr;
       console.log(`retention: keeping approval #${retention.approval.reviewId}; PR diff unchanged`);
 
       const evidence = {
-        stamp: VERSION,
-        pr: early.number,
-        head: early.headSha,
-        base: `${early.baseRef}@${early.baseSha}`,
-        author: early.author,
-        title: early.title,
+        ...baseEvidence(retention.pr),
         retention: { status: "kept" as const, reviewId: retention.approval.reviewId },
         verdict: "APPROVED" as const,
-        duration_ms: Date.now() - Date.parse(STARTED),
-        at: new Date().toISOString(),
+        ...finished(),
       };
 
       if (opts.json) writeFileSync(opts.json, JSON.stringify(evidence, null, 2));
@@ -169,9 +162,10 @@ const skip = (why: string) => {
   process.exit(0);
 };
 
-if (opts.label && !pr.labels.includes(opts.label)) skip(`label "${opts.label}" not present`);
+// The same test retention ran before the dismissal, run again on the fresh fetch: dismiss-first needs both.
+const withdrawal = withdrawn(pr);
 
-if (pr.isDraft) skip("PR is a draft");
+if (withdrawal) skip(withdrawal);
 
 // Make sure both ends of the diff exist locally, then review from a tree that IS the reviewed head.
 // The current checkout may be the default branch, a stale copy of the PR, or dirty: reading source
@@ -250,7 +244,7 @@ if (gateVerdict === "PASSED" && policy.familiarity) {
       diff: pr.diff,
       baseSha: pr.baseSha,
       headSha: pr.headSha,
-      repo: repoSlug(repoRoot),
+      repo: pr.repo,
       repoRoot: exploreRoot,
       trustedRef,
       thresholds: policy.familiarity,
@@ -337,12 +331,7 @@ const folderGrants = (kind: "max_files" | "max_lines", scopes: ScopeBudget[]) =>
   scopes.flatMap((s) => (s.path === null ? [] : [{ path: s.path, kind, ceiling: s.ceiling, files: s.files.length }]));
 
 const evidence = {
-  stamp: VERSION,
-  pr: pr.number,
-  head: pr.headSha,
-  base: `${pr.baseRef}@${pr.baseSha}`,
-  author: pr.author,
-  title: pr.title,
+  ...baseEvidence(pr),
   tier: gated.tier,
   sub: gated.sub,
   denied: gated.denied,
@@ -359,8 +348,7 @@ const evidence = {
   llm,
   opinion,
   verdict,
-  duration_ms: Date.now() - Date.parse(STARTED),
-  at: new Date().toISOString(),
+  ...finished(),
 };
 
 if (opts.json) writeFileSync(opts.json, JSON.stringify(evidence, null, 2));
@@ -461,6 +449,22 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict
   );
 
   return parts.join("\n").replace(/!\[([^\]]*)\]\(/g, "[image: $1]("); // no auto-fetched images: a markdown image is an exfil channel
+}
+
+/** Why the PR is out of scope for a review (trigger label missing, or a draft); null when it is in scope. */
+function withdrawn(pr: PR): string | null {
+  if (opts.label && !pr.labels.includes(opts.label)) return `label "${opts.label}" not present`;
+
+  return pr.isDraft ? "PR is a draft" : null;
+}
+
+/** The fields every evidence record starts with, on the kept-approval path and the review path alike. */
+function baseEvidence(pr: PR) {
+  return { stamp: VERSION, pr: pr.number, head: pr.headSha, base: `${pr.baseRef}@${pr.baseSha}`, author: pr.author, title: pr.title };
+}
+
+function finished() {
+  return { duration_ms: Date.now() - Date.parse(STARTED), at: new Date().toISOString() };
 }
 
 /** Fetch the PR head, its base and the default branch, so both diff ends and trusted policy are local. */
