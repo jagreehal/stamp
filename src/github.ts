@@ -194,18 +194,29 @@ export const listReviews = (repo: string, prNumber: number, cwd: string) => pagi
 
 export type StandingApproval = { reviewId: number; approvedHead: string; approvedBase: string };
 
-/** Our still-active approval on a head other than the live one, carrying a reviewed marker. A dismissed one lists as DISMISSED. */
-export function findStandingApproval(pr: PR, botLogin: string, cwd: string): StandingApproval | null {
-  for (const r of listReviews(repoSlug(cwd), pr.number, cwd)) {
-    if (r.user.login !== botLogin || r.state !== "APPROVED" || r.commit_id === pr.headSha) continue; // on the live head: re-review, not retention
+export type ReviewRecord = z.infer<typeof ReviewRow>;
+
+// Which head one of our reviews covered. GitHub moves a standing approval's `commit_id` forward when
+// the branch is updated from its base, so `commit_id` can name a head the review never saw. Our own
+// marker is the record; `commit_id` is the fallback only for reviews posted before the marker existed.
+const reviewedHead = (r: ReviewRecord) => REVIEWED_MARKER.exec(r.body)?.[1] ?? r.commit_id;
+
+/** Our still-active approval of a head other than `headSha`, with the marker retention needs. A dismissed one lists as DISMISSED. */
+export function standingApproval(reviews: ReviewRecord[], headSha: string, botLogin: string): StandingApproval | null {
+  for (const r of reviews) {
+    if (r.user.login !== botLogin || r.state !== "APPROVED") continue;
     const m = REVIEWED_MARKER.exec(r.body);
 
+    if (!m || m[1] === headSha) continue; // no marker: fail closed; the live head itself: nothing to retain
+
     // SAFETY: both capture groups in REVIEWED_MARKER are mandatory, so a match fills them.
-    if (m) return { reviewId: r.id, approvedHead: m[1]!, approvedBase: m[2]! };
+    return { reviewId: r.id, approvedHead: m[1]!, approvedBase: m[2]! };
   }
 
   return null;
 }
+
+export const findStandingApproval = (pr: PR, botLogin: string, cwd: string) => standingApproval(listReviews(repoSlug(cwd), pr.number, cwd), pr.headSha, botLogin);
 
 /**
  * Retention's last word, called after everything else passed: the PR still has the head and base it
@@ -231,7 +242,7 @@ export type PostOptions = { cwd: string; botLogin: string; started: string; trig
 /** True when a run that started after `started` has already posted a verdict of ours on this head. */
 function newerVerdictExists(pr: PR, repo: string, opts: PostOptions): boolean {
   for (const r of paginated(ReviewRow, `repos/${repo}/pulls/${pr.number}/reviews`, opts.cwd)) {
-    if (r.user.login !== opts.botLogin || r.commit_id !== pr.headSha || r.state === "DISMISSED") continue;
+    if (r.user.login !== opts.botLogin || reviewedHead(r) !== pr.headSha || r.state === "DISMISSED") continue;
     const started = RUN_MARKER.exec(r.body)?.[1];
 
     if (started && started > opts.started) {
@@ -301,7 +312,7 @@ export function dismissOwnApprovals(prNumber: number, botLogin: string, cwd: str
   for (const r of paginated(ReviewRow, `repos/${repo}/pulls/${prNumber}/reviews`, cwd)) {
     if (r.user.login !== botLogin || r.state !== "APPROVED" || r.id === sweep.keep) continue;
 
-    if (sweep.olderThan && r.commit_id === liveHead) {
+    if (sweep.olderThan && reviewedHead(r) === liveHead) {
       const started = RUN_MARKER.exec(r.body)?.[1];
 
       if (started && started > sweep.olderThan) continue; // a newer run's approval of this same head
