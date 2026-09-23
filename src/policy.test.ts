@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -16,6 +16,7 @@ import {
   manifestScriptEdits,
   manifestsWithoutLockfile,
   parseCodeowners,
+  readTrusted,
   resolveSizeOverrides,
   runGates,
   scrutinyFlags,
@@ -700,6 +701,23 @@ describe("call budget", () => {
 
     expect(spent).toThrow("time budget exhausted");
     expect(callTimeout()).toBe(5 * 60_000); // a throw inside the budget still clears it
+  });
+
+  test("a hung policy git call fails inside the budget instead of reading as a missing file", () => {
+    const bin = mkdtempSync(path.join(tmpdir(), "stamp-slowgit-"));
+    writeFileSync(path.join(bin, "git"), "#!/bin/sh\nsleep 5\n");
+    chmodSync(path.join(bin, "git"), 0o755);
+    const saved = process.env.PATH;
+    process.env.PATH = `${bin}:${saved}`;
+
+    try {
+      const started = Date.now();
+      expect(() => withBudget(50, () => readTrusted(bin, ".stamp/policy.yml"))).toThrow();
+      expect(() => withBudget(50, () => manifestScriptEdits(bin, "a", "b", ["package.json"]))).toThrow();
+      expect(Date.now() - started).toBeLessThan(2_000);
+    } finally {
+      process.env.PATH = saved;
+    }
   });
 });
 

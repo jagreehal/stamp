@@ -16,10 +16,13 @@ export function callTimeout(): number {
   if (deadline === null) return CALL_TIMEOUT_MS;
   const left = deadline - Date.now();
 
-  if (left <= 0) throw new Error("time budget exhausted");
+  if (left <= 0) throw Object.assign(new Error("time budget exhausted"), { code: "ETIMEDOUT" });
 
   return Math.min(left, CALL_TIMEOUT_MS);
 }
+
+/** A call killed by its timeout, or an exhausted budget. A catch that reads failure as "absent" must rethrow it. */
+export const TimedOut = z.object({ code: z.literal("ETIMEDOUT") });
 
 /** Run `fn` with every gh and git call inside it sharing one budget of `ms`. */
 export function withBudget<T>(ms: number, fn: () => T): T {
