@@ -6,6 +6,7 @@ import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { FamiliarityPolicySchema } from "./familiarity.ts";
+import { TimedOut, callTimeout } from "./github.ts";
 
 const Match = z.object({
   any: z.array(z.string()).default([]),
@@ -53,20 +54,22 @@ export const DEFAULTS_DIR = path.resolve(import.meta.dir, "..");
  * the bundled defaults, however many .stamp/ files the PR adds.
  */
 export function readTrusted(repoRoot: string, rel: string, ref = "origin/HEAD"): string | null {
-  const git = (args: string[]) => execFileSync("git", ["-C", repoRoot, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  const git = (args: string[]) => execFileSync("git", ["-C", repoRoot, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: callTimeout() });
   let refExists = false;
 
   try {
     git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
     refExists = true;
-  } catch {
+  } catch (e) {
+    if (TimedOut.safeParse(e).success) throw e;
     /* no such ref: local run with no remote */
   }
 
   if (refExists) {
     try {
       return git(["show", `${ref}:${rel}`]);
-    } catch {
+    } catch (e) {
+      if (TimedOut.safeParse(e).success) throw e;
       /* ref exists, file absent on it: bundled default below */
     }
   }
@@ -184,8 +187,10 @@ export function inFlightBots(reactions: { user: string; content: string; created
 export function manifestScriptEdits(repoRoot: string, baseSha: string, headSha: string, manifests: string[]): string[] {
   const show = (ref: string, file: string) => {
     try {
-      return execFileSync("git", ["-C", repoRoot, "show", `${ref}:${file}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    } catch {
+      return execFileSync("git", ["-C", repoRoot, "show", `${ref}:${file}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: callTimeout() });
+    } catch (e) {
+      if (TimedOut.safeParse(e).success) throw e;
+
       return ""; // absent on that side (added/deleted file)
     }
   };
@@ -215,8 +220,9 @@ export function manifestScriptEdits(repoRoot: string, baseSha: string, headSha: 
     let diff = "";
 
     try {
-      diff = execFileSync("git", ["-C", repoRoot, "diff", baseSha, headSha, "--", file], { encoding: "utf8" });
-    } catch {
+      diff = execFileSync("git", ["-C", repoRoot, "diff", baseSha, headSha, "--", file], { encoding: "utf8", timeout: callTimeout() });
+    } catch (e) {
+      if (TimedOut.safeParse(e).success) throw e;
       risky.push(file);
       continue;
     }
@@ -521,8 +527,8 @@ export type PRMeta = {
   reviews: { user: string; state: string }[];
   files: PRFile[];
   manifestScriptEdits?: string[];
-  /** Resolved folder size budgets; when absent, the global size_gate alone applies. */
-  sizeBudgets?: EffectiveSize;
+  /** Folder size budgets from resolveSizeOverrides: the global size_gate alone when no folder grants apply. */
+  sizeBudgets: EffectiveSize;
 };
 
 const BOT_RE = /\[bot\]$|^(dependabot|renovate)/i;
@@ -563,8 +569,7 @@ export function runGates(policy: Policy, pr: PRMeta): GateRun {
     message: [denied.length ? `touches ${denied.join(", ")}` : "", scripts.length ? `scripts/hooks changed in ${scripts.join(", ")}` : ""].filter(Boolean).join("; ") || "no sensitive paths",
   });
 
-  const budgets = pr.sizeBudgets ?? resolveSizeOverrides(policy, pr.files.map((f) => f.filename), () => null);
-  const sizeCheck = sizeWithinBudgets(pr.files, budgets);
+  const sizeCheck = sizeWithinBudgets(pr.files, pr.sizeBudgets);
   gates.push({ gate: "size", passed: sizeCheck.ok, message: sizeCheck.message });
 
   // A committed credential is never auto-approvable, whatever tier the change is: this runs before

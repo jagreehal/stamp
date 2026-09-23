@@ -10,6 +10,7 @@
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { z } from "zod";
+import { mergedPRNumbers } from "./github.ts";
 
 /** Author names are untrusted display hints; strip controls and cap length. */
 const scrubName = (s: string, max: number) => s.replace(/[^\P{C}\n\t]/gu, "").slice(0, max);
@@ -60,7 +61,6 @@ const SQUASH_PR_RE = /\(#(\d+)\)/g;
 
 const HUNK_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
 
-const AuthorPrList = z.array(z.object({ number: z.number() }));
 
 type FileDiff = {
   old_path: string | null;
@@ -87,19 +87,10 @@ function git(repoRoot: string, args: string[], timeout = TIMEOUT_MS): string | n
   }
 }
 
-function fetchAuthorPrNumbers(authorLogin: string, repo: string): Set<number> | null {
+/** The author's merged PR numbers, or null when GitHub cannot say: the signal is then absent, never wrong. */
+function fetchAuthorPrNumbers(authorLogin: string, repo: string, cwd: string): Set<number> | null {
   try {
-    const out = execFileSync(
-      "gh",
-      ["pr", "list", "--repo", repo, "--author", authorLogin, "--state", "merged", "--limit", "1000", "--json", "number"],
-      { encoding: "utf8", timeout: TIMEOUT_MS, stdio: ["ignore", "pipe", "ignore"] },
-    );
-
-    const parsed = AuthorPrList.safeParse(JSON.parse(out));
-
-    if (!parsed.success) return null;
-
-    return new Set(parsed.data.map((item) => item.number));
+    return mergedPRNumbers(repo, authorLogin, cwd);
   } catch {
     return null;
   }
@@ -382,7 +373,7 @@ export function computeFamiliarity(opts: {
   thresholds: FamiliarityPolicy;
   now?: number;
 }, deps = { fetchAuthorPrNumbers }): AuthorFamiliarity | null {
-  const authorPrs = deps.fetchAuthorPrNumbers(opts.authorLogin, opts.repo);
+  const authorPrs = deps.fetchAuthorPrNumbers(opts.authorLogin, opts.repo, opts.repoRoot);
 
   if (authorPrs === null || isShallow(opts.repoRoot)) return null;
   const now = opts.now ?? Date.now();

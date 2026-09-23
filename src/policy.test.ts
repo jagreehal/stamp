@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { band, computeFamiliarity, ensureFullHistory, formatFamiliarity, parseDiff, type AuthorFamiliarity, type FamiliarityPolicy } from "./familiarity.ts";
-import { callTimeout, scrub, standingApproval, withBudget, type PR, type ReviewRecord } from "./github.ts";
+import { callTimeout, scrub, withBudget, type PR, type ReviewRecord } from "./github.ts";
 import {
   addedSecrets,
   denyCategories,
@@ -16,6 +16,7 @@ import {
   manifestScriptEdits,
   manifestsWithoutLockfile,
   parseCodeowners,
+  readTrusted,
   resolveSizeOverrides,
   runGates,
   scrutinyFlags,
@@ -26,7 +27,7 @@ import {
   type PRFile,
   type PRMeta,
 } from "./policy.ts";
-import { approvedDiffUnchanged, tryRetainApproval } from "./retention.ts";
+import { approvedDiffUnchanged, standingApproval, tryRetainApproval } from "./retention.ts";
 import { buildPrompt, combine, independentReviewers, sanitize, secondOpinionNeeded, type LLMVerdict } from "./reviewer.ts";
 import { SIGNAL_IDS, SIGNAL_THRESHOLD, flagged, formatSignals, requestBody, type Signals } from "./signals.ts";
 
@@ -35,6 +36,9 @@ const policy = loadPolicy(path.resolve(import.meta.dir, ".."), "no-such-ref"); /
 const f = (filename: string, lines = 10): PRFile => ({ filename, additions: lines, deletions: 0 });
 
 const ready = { title: "fix: thing", author: "jag", authorAssociation: "OWNER", isFork: false, isDraft: false, mergeable: "MERGEABLE", reviews: [] };
+
+/** runGates with the global size limits only, as when no folder grants AGENT_APPROVALS.md. */
+const gates = (meta: Omit<PRMeta, "sizeBudgets">) => runGates(policy, { ...meta, sizeBudgets: resolveSizeOverrides(policy, meta.files.map((x) => x.filename), () => null) });
 
 describe("deny-list", () => {
   test("word-boundary match, not substring", () => {
@@ -70,7 +74,7 @@ describe("size + tiers", () => {
     expect(tier(policy, [f("package.json")], []).tier).toBe("T1-agent"); // manifest kept out of the fast path
   });
   test("over the ceiling fails the size gate", () => {
-    const r = runGates(policy, { ...ready, files: [f("src/big.ts", 801)] });
+    const r = gates({ ...ready, files: [f("src/big.ts", 801)] });
     expect(r.gates.find((g) => g.gate === "size")?.passed).toBe(false);
     expect(r.sub).toBe("T1d-complex");
   });
@@ -78,7 +82,7 @@ describe("size + tiers", () => {
 
 describe("prerequisites", () => {
   test("draft, conflicts, changes-requested, bot author, fork, untrusted author", () => {
-    const g = (over: Partial<PRMeta>) => runGates(policy, { ...ready, files: [f("src/a.ts")], ...over }).gates[0]!;
+    const g = (over: Partial<PRMeta>) => gates({ ...ready, files: [f("src/a.ts")], ...over }).gates[0]!;
     expect(g({}).passed).toBe(true);
     expect(g({ isDraft: true }).message).toContain("draft");
     expect(g({ mergeable: "CONFLICTING" }).message).toContain("conflicts");
@@ -93,7 +97,7 @@ describe("prerequisites", () => {
     expect(g({ reviews: [{ user: "x", state: "CHANGES_REQUESTED" }, { user: "x", state: "DISMISSED" }] }).passed).toBe(true);
   });
   test("renames are checked on both paths", () => {
-    const r = runGates(policy, { ...ready, files: [{ filename: "src/session.ts", previousFilename: "src/auth/session.ts", additions: 0, deletions: 0 }] });
+    const r = gates({ ...ready, files: [{ filename: "src/session.ts", previousFilename: "src/auth/session.ts", additions: 0, deletions: 0 }] });
     expect(r.denied).toEqual(["auth"]);
   });
   test("manifest scripts edits deny; version bumps don't", () => {
@@ -116,7 +120,7 @@ describe("prerequisites", () => {
     expect(manifestScriptEdits(repo, base, bump, ["package.json"])).toEqual([]);
     expect(manifestScriptEdits(repo, bump, edited, ["package.json"])).toEqual(["package.json"]); // changed line never says "scripts"
     expect(manifestScriptEdits(repo, edited, hook, ["package.json"])).toEqual(["package.json"]);
-    const r = runGates(policy, { ...ready, files: [f("package.json")], manifestScriptEdits: ["package.json"] });
+    const r = gates({ ...ready, files: [f("package.json")], manifestScriptEdits: ["package.json"] });
     expect(r.gates.find((g) => g.gate === "deny-list")?.passed).toBe(false);
   });
 });
@@ -272,6 +276,7 @@ describe("familiarity bands", () => {
 describe("familiarity prompt ratchet", () => {
   const baseInput = {
     pr: {
+      repo: "o/r",
       number: 1,
       title: "t",
       body: "",
@@ -419,8 +424,8 @@ describe("approval retention predicate", () => {
 });
 
 describe("approval retention flow", () => {
-  // SAFETY: tryRetainApproval only hands `pr` to the injected deps, which read number and SHAs alone.
-  const livePr = { number: 7, headSha: "h2", baseSha: "b2" } as PR;
+  // SAFETY: tryRetainApproval only hands `pr` to the injected deps, which read repo, number and SHAs alone.
+  const livePr = { repo: "o/r", number: 7, headSha: "h2", baseSha: "b2" } as PR;
   const standing = { reviewId: 1, approvedHead: "h1", approvedBase: "b1" };
 
   const run = (opts: { gates: boolean; holds: boolean; diffs?: [string, string] }) => {
@@ -434,7 +439,7 @@ describe("approval retention flow", () => {
       () => (calls.push("gates"), opts.gates),
       {
         findStandingApproval: () => standing,
-        compareDiff: (base) => (calls.push("compare"), base === "b1" ? approved : current),
+        compareDiff: (_repo, base) => (calls.push("compare"), base === "b1" ? approved : current),
         retentionHolds: () => (calls.push("holds"), opts.holds),
       },
     );
@@ -628,7 +633,7 @@ stamp:
 
     const files = [f("products/foo/a.ts", 850)];
 
-    const denied = runGates(policy, {
+    const denied = gates({
       title: "x",
       author: "jag",
       authorAssociation: "OWNER",
@@ -700,6 +705,23 @@ describe("call budget", () => {
 
     expect(spent).toThrow("time budget exhausted");
     expect(callTimeout()).toBe(5 * 60_000); // a throw inside the budget still clears it
+  });
+
+  test("a hung policy git call fails inside the budget instead of reading as a missing file", () => {
+    const bin = mkdtempSync(path.join(tmpdir(), "stamp-slowgit-"));
+    writeFileSync(path.join(bin, "git"), "#!/bin/sh\nsleep 5\n");
+    chmodSync(path.join(bin, "git"), 0o755);
+    const saved = process.env.PATH;
+    process.env.PATH = `${bin}:${saved}`;
+
+    try {
+      const started = Date.now();
+      expect(() => withBudget(50, () => readTrusted(bin, ".stamp/policy.yml"))).toThrow();
+      expect(() => withBudget(50, () => manifestScriptEdits(bin, "a", "b", ["package.json"]))).toThrow();
+      expect(Date.now() - started).toBeLessThan(2_000);
+    } finally {
+      process.env.PATH = saved;
+    }
   });
 });
 
