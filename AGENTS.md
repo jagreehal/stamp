@@ -15,6 +15,7 @@ This file is the contract: the invariants below were each earned through a real 
 - A run that posted re-runs the sweep at its own end (`dismissOwnApprovals` with `keep` and `olderThan`): every approval of ours off the live head goes, and every approval on the live head from a run that started before this one goes. A later-started run's approval is kept, because its verdict is the newer one. This closes the supersession race: an older, slower run can neither leave its approval standing over a newer refusal nor dismiss a newer run's approval.
 - `reconcilePosted` then re-checks head, base and newer-verdict once more. An orphaned APPROVAL must come down, so a failed dismissal propagates and fails the run loudly; a silent 503 here would leave an approval standing over code nobody reviewed. A stale COMMENT stays: GitHub cannot dismiss one and it grants nothing.
 - Reviews and comments authored by our own login are excluded from the prompt. A previous APPROVED must never be read as independent assurance.
+- The PR author's reviews and comments, and any carrying the `🤖 Automated comment by` header (review agents such as shepherd's swarm post through the author's account), are labelled `(author)` / `(automated)` in the prompt and never count as independent assurance. `independentReviewers` computes the reviewers who can, and the trusted context lists them. Their concerns still reach the model.
 
 ### Approval retention (the one dismiss-first exception)
 

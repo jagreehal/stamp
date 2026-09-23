@@ -25,7 +25,7 @@ import {
   type PRMeta,
 } from "./policy.ts";
 import { approvedDiffUnchanged, tryRetainApproval } from "./retention.ts";
-import { buildPrompt, combine, sanitize, secondOpinionNeeded, type LLMVerdict } from "./reviewer.ts";
+import { buildPrompt, combine, independentReviewers, sanitize, secondOpinionNeeded, type LLMVerdict } from "./reviewer.ts";
 import { SIGNAL_IDS, SIGNAL_THRESHOLD, flagged, formatSignals, requestBody, type Signals } from "./signals.ts";
 
 const policy = loadPolicy(path.resolve(import.meta.dir, ".."), "no-such-ref"); // no such ref → bundled defaults
@@ -293,6 +293,34 @@ describe("familiarity prompt ratchet", () => {
     manifests: [],
     scrutiny: [],
   } satisfies Parameters<typeof buildPrompt>[0];
+
+  test("the author and agents posting as them never count as independent assurance", () => {
+    const swarm = "> [!NOTE]\n> 🤖 Automated comment by **Shepherd swarm**, not written by a human\n\nLooks fine.";
+    const review = (user: string, state: string, body: string, isCurrentHead = true) => ({ user, state, body, commit: "h", isCurrentHead });
+
+    const pr = {
+      ...baseInput.pr,
+      reviews: [
+        review("a", "COMMENTED", "self-review: all good"),
+        review("someone", "COMMENTED", swarm),
+        review("greptile-apps[bot]", "COMMENTED", "no issues"),
+        review("teammate", "APPROVED", "lgtm"),
+        review("teammate", "APPROVED", "lgtm", true),
+        review("older", "APPROVED", "lgtm", false),
+        review("blocker", "CHANGES_REQUESTED", "fix this"),
+      ],
+      inline: [{ user: "a", path: "src/a.ts", body: swarm, outdated: false }],
+    };
+
+    expect(independentReviewers(pr)).toEqual(["greptile-apps[bot]", "teammate"]);
+
+    const prompt = buildPrompt({ ...baseInput, pr });
+    expect(prompt).toContain("Current-head reviewers who can count as independent assurance: @greptile-apps[bot], @teammate");
+    expect(prompt).toContain("@a (author) [COMMENTED, current head]");
+    expect(prompt).toContain("@someone (automated) [COMMENTED, current head]");
+    expect(prompt).toContain("@a (author) (automated) on src/a.ts");
+    expect(buildPrompt(baseInput)).toContain("independent assurance: none");
+  });
 
   test("absent familiarity keeps prompt without familiarity facts", () => {
     const withNone = buildPrompt({ ...baseInput, familiarity: null });
