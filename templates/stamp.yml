@@ -16,11 +16,13 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled, edited]
 
 concurrency:
-  # Keyed by event too, because any comment on the PR creates an issue_comment run: sharing one group
-  # let a passing bot comment cancel the review in flight, which leaves the PR with its approval
-  # already retracted and no verdict coming. Two runs that do overlap order themselves by run marker.
-  group: stamp-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
-  cancel-in-progress: true # a newer head supersedes the run in flight
+  # Only runs that review share the PR's group, so a newer review supersedes an older one. A run the
+  # job's `if` skips (an ordinary comment, or a bot rewriting the PR description after every push)
+  # gets a group of its own: in the shared group it cancelled the review in flight after that review
+  # had retracted the approval, leaving no verdict coming. The condition below is the job's `if`,
+  # verbatim; a test keeps them in step. Two runs that do overlap order themselves by run marker.
+  group: stamp-${{ github.event.pull_request.number || github.event.issue.number }}-${{ ((github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null)) || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && startsWith(github.event.comment.body, '/stamp') && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))) && 'review' || github.run_id }}
+  cancel-in-progress: true # a newer head supersedes the review in flight
 
 permissions:
   contents: read

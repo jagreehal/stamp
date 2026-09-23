@@ -3,6 +3,8 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { parse as parseYaml } from "yaml";
+import { z } from "zod";
 import { band, computeFamiliarity, ensureFullHistory, formatFamiliarity, parseDiff, type AuthorFamiliarity, type FamiliarityPolicy } from "./familiarity.ts";
 import { scrub, type PR } from "./github.ts";
 import {
@@ -624,5 +626,17 @@ stamp:
 
   test("AGENT_APPROVALS.md is deny-listed", () => {
     expect(denyCategories(policy, ["products/foo/AGENT_APPROVALS.md"])).toEqual(["stamp_policy"]);
+  });
+});
+
+describe("workflow template", () => {
+  test("only runs that review share the concurrency group, so a skipped run never cancels a review", () => {
+    const wf = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp.yml"), "utf8"));
+    const squash = (t: string) => t.replace(/\s+/g, " ").trim();
+    const reviews = squash(z.string().parse(wf.jobs.review.if));
+    const group = squash(z.string().parse(wf.concurrency.group));
+
+    expect(group).toContain(`\${{ (${reviews}) && 'review' || github.run_id }}`);
+    expect(wf.concurrency["cancel-in-progress"]).toBe(true);
   });
 });
