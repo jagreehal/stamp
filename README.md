@@ -178,7 +178,7 @@ A push that leaves the PR's own unified diff byte-identical to the approved one 
 
 ### Slack digest
 
-`stamp init` also writes `.github/workflows/stamp-digest.yml`. It stays off until the `STAMP_SLACK_WEBHOOK` secret is set; then the weekday cron posts stamp-approved merges from the last 24 hours to that webhook's channel. PR titles and summaries are escaped so they cannot mention or link in Slack.
+`stamp init` also writes `.github/workflows/stamp-digest.yml`. It stays off until the `STAMP_SLACK_WEBHOOK` secret is set; then a weekday cron posts stamp-approved merges to that webhook's channel: the last 24 hours, or 72 on Monday so the weekend is covered. PR titles and summaries are escaped so they cannot mention or link in Slack.
 
 ## Backends
 

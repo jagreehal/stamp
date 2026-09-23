@@ -18,7 +18,7 @@ export function approvedDiffUnchanged(approvedDiff: string, currentDiff: string)
 }
 
 export type RetentionResult =
-  | { kept: true; approval: StandingApproval }
+  | { kept: true; approval: StandingApproval; pr: PR }
   | { kept: false; reason: "not_posting" | "check_failed" | "rereview_requested" | "withdrawn" | "no_standing" | "compare_failed" | "diff_changed" | "gates_failed" | "pr_moved" };
 
 const github = { findStandingApproval, compareDiff, retentionHolds };
@@ -50,5 +50,5 @@ export function tryRetainApproval(pr: PR, botLogin: string, cwd: string, gatesPa
   // Last, because every check above read state that a push, retarget or manual dismissal can change.
   if (!deps.retentionHolds(pr, standing.reviewId, cwd)) return { kept: false, reason: "pr_moved" };
 
-  return { kept: true, approval: standing };
+  return { kept: true, approval: standing, pr };
 }
