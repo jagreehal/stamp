@@ -6,7 +6,7 @@ import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { band, computeFamiliarity, ensureFullHistory, formatFamiliarity, parseDiff, type AuthorFamiliarity, type FamiliarityPolicy } from "./familiarity.ts";
-import { callTimeout, scrub, withBudget, type PR } from "./github.ts";
+import { callTimeout, scrub, standingApproval, withBudget, type PR, type ReviewRecord } from "./github.ts";
 import {
   addedSecrets,
   denyCategories,
@@ -700,5 +700,35 @@ describe("call budget", () => {
 
     expect(spent).toThrow("time budget exhausted");
     expect(callTimeout()).toBe(5 * 60_000); // a throw inside the budget still clears it
+  });
+});
+
+describe("standing approval", () => {
+  const head = "c".repeat(40);
+  const older = "a".repeat(40);
+  const base = "b".repeat(40);
+  const marker = (h: string) => `## ✅ stamp: APPROVED\n<!-- stamp-reviewed:head=${h};base=${base} -->`;
+
+  const review = (over: Partial<ReviewRecord>): ReviewRecord => ({
+    id: 1,
+    user: { login: "github-actions[bot]" },
+    state: "APPROVED",
+    body: marker(older),
+    commit_id: older,
+    ...over,
+  });
+
+  test("reads the head from our marker, not commit_id, which GitHub moves forward on a base update", () => {
+    const carried = review({ commit_id: head }); // approved `older`; GitHub now reports the live head
+    expect(standingApproval([carried], head, "github-actions[bot]")).toEqual({ reviewId: 1, approvedHead: older, approvedBase: base });
+  });
+
+  test.each([
+    ["an approval of the live head itself", review({ body: marker(head), commit_id: head })],
+    ["an approval without our marker", review({ body: "## ✅ stamp: APPROVED" })],
+    ["a dismissed approval", review({ state: "DISMISSED" })],
+    ["someone else's approval", review({ user: { login: "teammate" } })],
+  ])("never retains %s", (_, r) => {
+    expect(standingApproval([r], head, "github-actions[bot]")).toBeNull();
   });
 });
