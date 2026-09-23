@@ -5,7 +5,34 @@ import { execFileSync } from "node:child_process";
 import { z } from "zod";
 import type { PRFile } from "./policy.ts";
 
-const gh = (args: string[], cwd: string) => execFileSync("gh", args, { cwd, encoding: "utf8", maxBuffer: 64 << 20 });
+// A hung call must fail rather than wait for the job to be killed: a killed run skips every catch,
+// including the one that falls through to dismissing a stale approval.
+const CALL_TIMEOUT_MS = 5 * 60_000;
+
+let deadline: number | null = null;
+
+/** Milliseconds the next gh or git call may take: the per-call cap, or what is left of an active budget. */
+export function callTimeout(): number {
+  if (deadline === null) return CALL_TIMEOUT_MS;
+  const left = deadline - Date.now();
+
+  if (left <= 0) throw new Error("time budget exhausted");
+
+  return Math.min(left, CALL_TIMEOUT_MS);
+}
+
+/** Run `fn` with every gh and git call inside it sharing one budget of `ms`. */
+export function withBudget<T>(ms: number, fn: () => T): T {
+  deadline = Date.now() + ms;
+
+  try {
+    return fn();
+  } finally {
+    deadline = null;
+  }
+}
+
+const gh = (args: string[], cwd: string) => execFileSync("gh", args, { cwd, encoding: "utf8", maxBuffer: 64 << 20, timeout: callTimeout() });
 
 const call = <T>(schema: z.ZodType<T>, args: string[], cwd: string): T => schema.parse(JSON.parse(gh(args, cwd)));
 
@@ -236,7 +263,7 @@ export function postVerdict(pr: PR, verdict: Verdict, body: string, opts: PostOp
 
   // Substantive non-approvals strip the trigger label so a human takes over; ERROR keeps it so the next push retries.
   if (opts.triggerLabel && (verdict === "REFUSED" || verdict === "ESCALATE") && pr.labels.includes(opts.triggerLabel)) {
-    execFileSync("gh", ["pr", "edit", String(pr.number), "--remove-label", opts.triggerLabel], { cwd: opts.cwd, stdio: "inherit" });
+    execFileSync("gh", ["pr", "edit", String(pr.number), "--remove-label", opts.triggerLabel], { cwd: opts.cwd, stdio: "inherit", timeout: callTimeout() });
   }
 
   return posted.id;

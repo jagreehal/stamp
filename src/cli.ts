@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
-import { dismissOwnApprovals, fetchPR, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, type PR, type Verdict } from "./github.ts";
+import { callTimeout, dismissOwnApprovals, fetchPR, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, withBudget, type PR, type Verdict } from "./github.ts";
 import {
   DEFAULTS_DIR,
   detectOwnership,
@@ -59,7 +59,7 @@ const { values: opts, positionals } = parseArgs({
 
 const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
 
-const git = (...args: string[]) => execFileSync("git", ["-C", repoRoot, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+const git = (...args: string[]) => execFileSync("git", ["-C", repoRoot, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: callTimeout() }).trim();
 
 if (positionals[0] === "init") {
   // Existing files are never overwritten: the repo's policy is the repo's.
@@ -107,23 +107,31 @@ let retention: RetentionResult = { kept: false, reason: "not_posting" };
 // review, only when everything a fresh run would check still holds: the trigger label, not a draft, a
 // byte-identical PR diff, every gate against today's trusted policy, and finally a PR that has not
 // moved since. Anything ambiguous or failing falls through to dismiss (fail closed). A `/stamp`
-// comment is an explicit request for a fresh review, so it never retains.
+// comment is an explicit request for a fresh review, so it goes straight to dismissal without a
+// fetch. The checks share one budget, well inside the job's timeout, so a hung call ends in the
+// catch below and the dismissal still runs.
+const RETENTION_BUDGET_MS = 2 * 60_000;
+
 if (opts.post) {
   try {
-    const early = fetchPR(prNumber, repoRoot, [me]);
-
     if (process.env.GITHUB_EVENT_NAME === "issue_comment") retention = { kept: false, reason: "rereview_requested" };
-    else if ((opts.label && !early.labels.includes(opts.label)) || early.isDraft) retention = { kept: false, reason: "withdrawn" };
     else {
-      retention = tryRetainApproval(early, me, repoRoot, () => {
-        fetchRefs(early);
-        const trustedRef = `origin/${early.defaultBranch}`;
+      retention = withBudget(RETENTION_BUDGET_MS, () => {
+        const early = fetchPR(prNumber, repoRoot, [me]);
 
-        return gatesFor(early, loadPolicy(repoRoot, trustedRef), trustedRef).gated.gates.every((g) => g.passed);
+        if ((opts.label && !early.labels.includes(opts.label)) || early.isDraft) return { kept: false, reason: "withdrawn" } as const;
+
+        return tryRetainApproval(early, me, repoRoot, () => {
+          fetchRefs(early);
+          const trustedRef = `origin/${early.defaultBranch}`;
+
+          return gatesFor(early, loadPolicy(repoRoot, trustedRef), trustedRef).gated.gates.every((g) => g.passed);
+        });
       });
     }
 
     if (retention.kept) {
+      const early = retention.pr;
       console.log(`retention: keeping approval #${retention.approval.reviewId}; PR diff unchanged`);
 
       const evidence = {
@@ -373,7 +381,7 @@ process.exit(verdict === "APPROVED" ? 0 : 1);
 
 function whoami(): string {
   try {
-    return JSON.parse(execFileSync("gh", ["api", "user"], { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })).login;
+    return JSON.parse(execFileSync("gh", ["api", "user"], { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: callTimeout() })).login;
   } catch {
     return "github-actions[bot]"; // GITHUB_TOKEN has no user endpoint; this is what its reviews post as
   }

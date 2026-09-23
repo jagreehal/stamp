@@ -6,7 +6,7 @@ import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { band, computeFamiliarity, ensureFullHistory, formatFamiliarity, parseDiff, type AuthorFamiliarity, type FamiliarityPolicy } from "./familiarity.ts";
-import { scrub, type PR } from "./github.ts";
+import { callTimeout, scrub, withBudget, type PR } from "./github.ts";
 import {
   addedSecrets,
   denyCategories,
@@ -232,19 +232,23 @@ test("inFlightBots counts only fresh eyes from listed bots", () => {
   expect(inFlightBots(reactions, bots, 45 * 60_000, now)).toEqual(["greptile-apps[bot]"]);
 });
 
+const fileDiff = (path: string, ...body: string[]) => [`diff --git a/${path} b/${path}`, `--- a/${path}`, `+++ b/${path}`, "@@ -1,3 +1,3 @@", ...body];
+
 test("addedSecrets flags credentials on added lines only", () => {
   const diff = [
-    "diff --git a/src/config.ts b/src/config.ts",
-    "+++ b/src/config.ts",
-    '+const key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123";',
-    "+++ b/src/old.ts",
-    '-const gone = "AKIAIOSFODNN7EXAMPLE";', // removing a key is not adding one
-    ' const ctx = "AKIAIOSFODNN7EXAMPLE";', // already in the base
-    "+++ b/docs/setup.md",
-    "+Set ANTHROPIC_API_KEY to your key before running.", // a name is not a key
+    ...fileDiff("src/config.ts", '+const key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123";'),
+    ...fileDiff("src/old.ts", '-const gone = "AKIAIOSFODNN7EXAMPLE";', ' const ctx = "AKIAIOSFODNN7EXAMPLE";'), // removed, or already in the base
+    ...fileDiff("docs/setup.md", "+Set ANTHROPIC_API_KEY to your key before running."), // a name is not a key
   ].join("\n");
 
   expect(addedSecrets(diff)).toEqual(["src/config.ts: Anthropic key"]);
+});
+
+test("addedSecrets scans an added line whose content starts with ++", () => {
+  // The added text `++ AKIA…` renders as `+++ AKIA…`, the same prefix as a file header.
+  const diff = fileDiff("notes/keys.txt", "+++ AKIAIOSFODNN7EXAMPLE", "+ordinary line").join("\n");
+
+  expect(addedSecrets(diff)).toEqual(["notes/keys.txt: AWS access key"]);
 });
 
 const thresholds: FamiliarityPolicy = {
@@ -440,7 +444,7 @@ describe("approval retention flow", () => {
 
   test("keeps only when diff, gates and the final live check all pass, in that order", () => {
     const { result, calls } = run({ gates: true, holds: true });
-    expect(result).toEqual({ kept: true, approval: standing });
+    expect(result).toEqual({ kept: true, approval: standing, pr: livePr });
     expect(calls).toEqual(["compare", "compare", "gates", "holds"]);
   });
   test("a failed gate dismisses", () => {
@@ -666,5 +670,35 @@ describe("workflow template", () => {
 
     expect(group).toContain(`\${{ (${reviews}) && 'review' || github.run_id }}`);
     expect(wf.concurrency["cancel-in-progress"]).toBe(true);
+  });
+
+  test("the digest covers every hour between weekday runs: Monday looks back over the weekend", () => {
+    const wf = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp-digest.yml"), "utf8"));
+    const crons = z.array(z.object({ cron: z.string() })).parse(wf.on.schedule).map((s) => s.cron);
+    const run = z.string().parse(wf.jobs.digest.steps.at(-1).run);
+
+    expect(crons).toEqual(["0 14 * * 1", "0 14 * * 2-5"]);
+    expect(run).toContain("--since ${{ github.event.schedule == '0 14 * * 1' && 72 || 24 }}");
+  });
+});
+
+describe("call budget", () => {
+  test("caps every call, fails once spent, and resets after the budgeted work", () => {
+    expect(callTimeout()).toBe(5 * 60_000);
+    expect(withBudget(1_000, () => callTimeout())).toBeLessThanOrEqual(1_000);
+
+    const spent = () =>
+      withBudget(1, () => {
+        const until = Date.now() + 5;
+
+        while (Date.now() < until) {
+          // spend the budget
+        }
+
+        return callTimeout();
+      });
+
+    expect(spent).toThrow("time budget exhausted");
+    expect(callTimeout()).toBe(5 * 60_000); // a throw inside the budget still clears it
   });
 });

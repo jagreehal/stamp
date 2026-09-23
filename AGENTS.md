@@ -22,6 +22,8 @@ This file is the contract: the invariants below were each earned through a real 
 
 A push that leaves the PR's own unified diff **byte-identical** to the diff that was approved (typical case: merging the base branch) keeps the standing approval and skips re-review. Comparison uses `compare/{approved_base}...{approved_head}` vs live base…head on immutable SHAs — never the live files list. Empty diffs, binary markers (`Binary files … differ`), compare errors, a dismissed approval, or a missing reviewed marker all fail closed to dismiss-and-review. There is deliberately no "harmless file" allowlist.
 
+Retention never delays dismissal for long. A `/stamp` re-review skips it without fetching anything. The retention checks share a 2-minute budget (`withBudget`), and every `gh` and `git` call carries a timeout (`callTimeout`): a killed job skips every `catch`, so a hung call must fail inside the job, where the catch falls through to dismissal.
+
 A byte-identical diff is necessary, not sufficient. Retention also withdraws on everything a fresh run would: a missing trigger label or a draft, and any gate failing against today's trusted policy (tightened deny list, a new `CHANGES_REQUESTED`, a conflict) — the same `gatesFor` the review path runs. A `/stamp` comment always re-reviews. `retentionHolds` runs last and re-reads live head, base and the approval's state, because every earlier check read state a push, retarget or manual dismissal can change; a push after it triggers its own run. The workflow subscribes to `converted_to_draft` and `unlabeled` so those withdrawals happen when they occur, not at the next push.
 
 There is deliberately no "this file is harmless" rule.
@@ -34,7 +36,7 @@ The nearest thing stamp has is the size exemption, and it changes only how much 
 - The hold for an in-flight reviewer bot (a fresh 👀 from `reviewer_bots`) is bounded and never terminal. Nothing re-triggers the workflow when a bot finishes, so a run that stopped to wait never came back: Greptile reacts within seconds of a push, so every run posted "waiting" and no verdict was ever reached. Hold for their findings, refresh the PR so their comments reach the prompt, then review without them.
 - Fork heads and authors below COLLABORATOR fail the prerequisites gate. Only people who could merge anyway get auto-approved.
 - Bot authors (dependabot, renovate, anything `[bot]`) are refused. There is no carve-out.
-- A credential shape on an added diff line denies the PR before the model runs. Only unambiguous shapes are listed: a generic high-entropy matcher would make a gate that denies outright into a noise generator. Deleted and context lines are ignored — a key already in the tree is a rotation problem, not this PR's.
+- A credential shape on an added diff line denies the PR before the model runs. Added lines are found by hunk, not by prefix: inside a hunk, a line reading `+++…` is added content that starts with `++`, not a file header. Only unambiguous shapes are listed: a generic high-entropy matcher would make a gate that denies outright into a noise generator. Deleted and context lines are ignored — a key already in the tree is a rotation problem, not this PR's.
 - A rename is checked on both paths. Moving a file out of `auth/` is a change to `auth/`.
 
 ## Trust boundaries

@@ -492,10 +492,15 @@ const CREDENTIAL_PATTERNS: [string, RegExp][] = [
 export function addedSecrets(diff: string): string[] {
   const found: string[] = [];
   let file = "";
+  // File headers appear only between `diff --git` and the first hunk. Inside a hunk every `+` line is
+  // added content, including one whose text starts with "++" and so renders as "+++…".
+  let inHunk = false;
 
   for (const line of diff.split("\n")) {
-    if (line.startsWith("+++ ")) file = line.slice(6).trim(); // "+++ b/path"
-    else if (line.startsWith("+") && !line.startsWith("+++")) {
+    if (line.startsWith("diff --git ")) inHunk = false;
+    else if (line.startsWith("@@")) inHunk = true;
+    else if (!inHunk && line.startsWith("+++ ")) file = line.slice(6).trim(); // "+++ b/path"
+    else if (inHunk && line.startsWith("+")) {
       const hit = CREDENTIAL_PATTERNS.find(([, re]) => re.test(line));
 
       if (hit && !found.some((f) => f === `${file}: ${hit[0]}`)) found.push(`${file}: ${hit[0]}`);

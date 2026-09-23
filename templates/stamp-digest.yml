@@ -6,7 +6,10 @@
 name: stamp-digest
 on:
   schedule:
-    - cron: "0 14 * * 1-5" # weekdays 14:00 UTC
+    # Weekdays at 14:00 UTC. Monday looks back 72 hours so Friday afternoon and the weekend are
+    # covered; the other days look back 24.
+    - cron: "0 14 * * 1"
+    - cron: "0 14 * * 2-5"
   workflow_dispatch:
 
 permissions:
@@ -22,7 +25,7 @@ jobs:
         with:
           fetch-depth: 1
       - uses: oven-sh/setup-bun@v2
-      - run: bunx @jagreehal/stamp@0.1.0 digest --since 24
+      - run: bunx @jagreehal/stamp@0.1.0 digest --since ${{ github.event.schedule == '0 14 * * 1' && 72 || 24 }}
         env:
           GH_TOKEN: ${{ github.token }}
           STAMP_BOT_LOGIN: github-actions[bot]
