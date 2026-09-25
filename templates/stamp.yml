@@ -11,7 +11,10 @@ on:
     types: [created]
   pull_request:
     # `edited` covers base retargets: the diff changes without the head moving. Title/body edits
-    # are filtered out below so they don't spend a review.
+    # are filtered out below so they don't spend a review, with one exception: the author (or an
+    # agent posting as them, like shepherd) editing a body that carries shepherd's review-changes
+    # section. shepherd writes that disclosure after pushing its fixes, so the review of that head
+    # has to see it.
     # `converted_to_draft` and `unlabeled` withdraw a standing approval: the draft/label skip paths retract it.
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled, edited]
 
@@ -21,7 +24,7 @@ concurrency:
   # gets a group of its own: in the shared group it cancelled the review in flight after that review
   # had retracted the approval, leaving no verdict coming. The condition below is the job's `if`,
   # verbatim; a test keeps them in step. Two runs that do overlap order themselves by run marker.
-  group: stamp-${{ github.event.pull_request.number || github.event.issue.number }}-${{ ((github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null)) || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && startsWith(github.event.comment.body, '/stamp') && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))) && 'review' || github.run_id }}
+  group: stamp-${{ github.event.pull_request.number || github.event.issue.number }}-${{ ((github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null || (github.event.changes.body != null && github.event.sender.login == github.event.pull_request.user.login && contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->')))) || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && startsWith(github.event.comment.body, '/stamp') && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))) && 'review' || github.run_id }}
   cancel-in-progress: true # a newer head supersedes the review in flight
 
 permissions:
@@ -35,7 +38,7 @@ jobs:
     # A comment never changes the head, so skipping one strands no approval. Only people who could
     # merge anyway may spend a run this way.
     if: >-
-      (github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null))
+      (github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null || (github.event.changes.body != null && github.event.sender.login == github.event.pull_request.user.login && contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->'))))
       || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null
           && startsWith(github.event.comment.body, '/stamp')
           && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))

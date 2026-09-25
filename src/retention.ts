@@ -4,7 +4,7 @@
 // The deliberate exception to dismiss-first. Fail closed on anything ambiguous:
 // empty diffs, binary markers, GitHub errors, missing reviewed marker, a failed
 // gate, or a PR that moved while it was being checked.
-import { compareDiff, listReviews, reviewedShas, unchanged, type PR, type ReviewRecord } from "./github.ts";
+import { compareDiff, isOurs, listReviews, reviewedShas, unchanged, type PR, type ReviewRecord } from "./github.ts";
 
 const BINARY_MARKER_RE = /^Binary files\b.*differ$/m;
 
@@ -22,7 +22,7 @@ export type StandingApproval = { reviewId: number; approvedHead: string; approve
 /** Our still-active approval of a head other than `headSha`, with the marker retention needs. A dismissed one lists as DISMISSED. */
 export function standingApproval(reviews: ReviewRecord[], headSha: string, botLogin: string): StandingApproval | null {
   for (const r of reviews) {
-    if (r.user.login !== botLogin || r.state !== "APPROVED") continue;
+    if (!isOurs(r, botLogin) || r.state !== "APPROVED") continue;
     const covered = reviewedShas(r);
 
     if (!covered || covered.head === headSha) continue; // no marker: fail closed; the live head itself: nothing to retain

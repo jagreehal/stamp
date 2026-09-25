@@ -147,6 +147,10 @@ Agents loosen these files to reach green, and a linter cannot see its own config
 
 A path deny would refuse a tightened rule along with a loosened one, so the reviewer judges the diff.
 
+The shipped `review_agents` group covers what review and fix agents follow on later PRs: `.shepherd/`, `.claude/skills/`, `.agents/skills/`, `AGENTS.md`, `CLAUDE.md` and `docs/adr/`.
+
+Its instruction is to REFUSE a removed lens, a narrowed `applies_to`, a deleted or weakened rule, loosened Fix guidance or a relaxed house rule, and to approve additions and tightening.
+
 ### Size ceiling
 
 Over 800 substantive lines or 30 substantive files is too large for auto-review.
@@ -279,6 +283,16 @@ The `github-actions[bot]` approval counts toward required approving reviews once
 It does not satisfy "require review from Code Owners", and it should not: that rule exists so a person on the owning team looks, which is what stamp escalates to.
 
 Copy `.agents/skills/` (`writing-pr-descriptions`, `merging-prs`) into repositories where agents open PRs.
+
+### With shepherd
+
+[shepherd](https://github.com/jagreehal/shepherd) gets a PR ready and hands the head to stamp.
+
+stamp reads shepherd's review threads with their resolution: an unresolved Shepherd thread is a decision left to the author.
+
+It reads the "Changes made during review" section on its own, so a long description never hides the disclosure, and re-reviews when the author's account updates that section.
+
+Commits carrying `Shepherd:` or `Shepherd-Lens:` trailers are listed for the reviewer to read first. A trailer, a swarm summary and an automated comment never count as assurance.
 
 The reviewer checks the diff against the intent, the ruled-out alternatives and the pasted test output in the body.
 
