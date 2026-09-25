@@ -28,6 +28,7 @@ const pr: PR = {
   inline: [],
   discussion: [],
   reactions: [],
+  commits: [],
   diff: `--- a/src/policy.ts
 +++ b/src/policy.ts
 @@ -116,6 +116,7 @@ export function tier(policy: Policy, files: PRFile[], denied: string[]): { tier:

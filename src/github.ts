@@ -65,7 +65,29 @@ const File = z.object({ filename: z.string(), previous_filename: z.string().opti
 
 const ReviewRow = z.object({ id: z.number(), user: Login, state: z.string(), body: z.string(), commit_id: z.string() });
 
-const InlineRow = z.object({ user: Login, path: z.string(), body: z.string(), position: z.number().nullable() });
+const ThreadPage = z.object({
+  data: z.object({
+    repository: z.object({
+      pullRequest: z.object({
+        reviewThreads: z.object({
+          nodes: z.array(
+            z.object({
+              isResolved: z.boolean(),
+              isOutdated: z.boolean(),
+              path: z.string(),
+              comments: z.object({ nodes: z.array(z.object({ author: z.object({ login: z.string(), __typename: z.string() }).nullable(), body: z.string(), createdAt: z.string() })) }),
+            }),
+          ),
+        }),
+      }),
+    }),
+  }),
+});
+
+// REST lists inline comments without their thread's resolution, so threads come from GraphQL.
+const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{isResolved isOutdated path comments(first:50){nodes{author{login __typename} body createdAt}}}}}}}`;
+
+const CommitRow = z.object({ sha: z.string(), commit: z.object({ message: z.string() }) });
 
 const CommentRow = z.object({ user: Login, body: z.string(), created_at: z.string(), reactions: z.record(z.string(), z.union([z.number(), z.string()])).optional() });
 
@@ -73,7 +95,8 @@ const ReactionRow = z.object({ user: Login, content: z.string(), created_at: z.s
 
 export type Review = { user: string; state: string; body: string; commit: string; isCurrentHead: boolean };
 
-export type InlineComment = { user: string; path: string; body: string; outdated: boolean };
+/** One comment in a review thread; `thread` groups comments of the same thread. */
+export type InlineComment = { user: string; path: string; body: string; outdated: boolean; resolved: boolean; thread: number; created: string };
 
 export type Comment = { user: string; body: string; created: string; reactions: string[] };
 
@@ -98,6 +121,7 @@ export type PR = {
   inline: InlineComment[];
   discussion: Comment[];
   reactions: { user: string; content: string; created: string }[];
+  commits: { sha: string; message: string }[];
   diff: string;
 };
 
@@ -120,6 +144,12 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
   const view = call(Pull, ["api", `${base}/pulls/${number}`], cwd);
   const headSha = view.head.sha;
   const notOurs = <T extends { user: { login: string } }>(rows: T[]) => rows.filter((r) => !exclude.includes(r.user.login));
+  const [owner = "", name = ""] = repo.nameWithOwner.split("/");
+
+  const threads = z
+    .array(ThreadPage)
+    .parse(JSON.parse(gh(["api", "graphql", "--paginate", "--slurp", "-f", `query=${THREADS_QUERY}`, "-F", `owner=${owner}`, "-F", `name=${name}`, "-F", `number=${number}`], cwd)))
+    .flatMap((p) => p.data.repository.pullRequest.reviewThreads.nodes);
 
   return {
     repo: repo.nameWithOwner,
@@ -143,20 +173,20 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
       deletions: f.deletions,
       status: f.status,
     })),
-    // Our own earlier verdicts describe an older snapshot and are never independent signal.
-    reviews: notOurs(paginated(ReviewRow, `${base}/pulls/${number}/reviews`, cwd)).map((r) => ({
+    // Our own earlier verdicts describe an older snapshot and are never independent signal, whatever login posted them.
+    reviews: notOurs(paginated(ReviewRow, `${base}/pulls/${number}/reviews`, cwd)).filter((r) => !RUN_MARKER.test(r.body)).map((r) => ({
       user: r.user.login,
       state: r.state,
       body: r.body,
       commit: r.commit_id,
       isCurrentHead: r.commit_id === headSha,
     })),
-    inline: notOurs(paginated(InlineRow, `${base}/pulls/${number}/comments`, cwd)).map((c) => ({
-      user: c.user.login,
-      path: c.path,
-      body: c.body,
-      outdated: c.position === null,
-    })),
+    inline: threads.flatMap((t, thread) =>
+      t.comments.nodes
+        // GraphQL names a bot account without the `[bot]` suffix REST uses; restore it so logins match everywhere.
+        .map((c) => ({ user: c.author ? `${c.author.login}${c.author.__typename === "Bot" ? "[bot]" : ""}` : "ghost", path: t.path, body: c.body, outdated: t.isOutdated, resolved: t.isResolved, thread, created: c.createdAt }))
+        .filter((c) => !exclude.includes(c.user)),
+    ),
     discussion: notOurs(paginated(CommentRow, `${base}/issues/${number}/comments`, cwd)).map((c) => ({
       user: c.user.login,
       body: c.body,
@@ -168,6 +198,7 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
       content: r.content,
       created: r.created_at,
     })),
+    commits: paginated(CommitRow, `${base}/pulls/${number}/commits`, cwd).map((c) => ({ sha: c.sha, message: c.commit.message })),
     diff: gh(["pr", "diff", String(number)], cwd),
   };
 }
@@ -213,6 +244,13 @@ export function reviewedShas(r: ReviewRecord): { head: string; base: string } | 
 // marker is the record; `commit_id` is the fallback only for reviews posted before the marker existed.
 const reviewedHead = (r: ReviewRecord) => reviewedShas(r)?.head ?? r.commit_id;
 
+/**
+ * Whether `r` is one of our verdicts: posted by our login, or by any bot account and carrying our run
+ * marker. A GitHub App token posts as `<app>[bot]` while `gh api user` fails, so the login alone can miss
+ * our own approvals; the marker keeps them in every sweep.
+ */
+export const isOurs = (r: ReviewRecord, botLogin: string) => r.user.login === botLogin || (r.user.login.endsWith("[bot]") && RUN_MARKER.test(r.body));
+
 /** Whether the run that posted `r` started after `iso`: the later-started run owns the newer verdict. */
 const startedAfter = (r: ReviewRecord, iso: string) => {
   const started = RUN_MARKER.exec(r.body)?.[1];
@@ -238,7 +276,7 @@ export type PostOptions = { cwd: string; botLogin: string; started: string; trig
 /** True when a run that started after `started` has already posted a verdict of ours on this head. */
 function newerVerdictExists(pr: PR, opts: PostOptions): boolean {
   const newer = listReviews(pr.repo, pr.number, opts.cwd).some(
-    (r) => r.user.login === opts.botLogin && r.state !== "DISMISSED" && reviewedHead(r) === pr.headSha && startedAfter(r, opts.started),
+    (r) => isOurs(r, opts.botLogin) && r.state !== "DISMISSED" && reviewedHead(r) === pr.headSha && startedAfter(r, opts.started),
   );
 
   if (newer) console.log("a newer stamp run already posted on this head; this run's verdict is stale");
@@ -298,13 +336,20 @@ export function dismissOwnApprovals(prNumber: number, botLogin: string, cwd: str
   const repo = repoSlug(cwd);
   const liveHead = sweep.olderThan ? call(Pull, ["api", `repos/${repo}/pulls/${prNumber}`], cwd).head.sha : null;
 
-  for (const r of listReviews(repo, prNumber, cwd)) {
-    if (r.user.login !== botLogin || r.state !== "APPROVED" || r.id === sweep.keep) continue;
-
-    if (sweep.olderThan && reviewedHead(r) === liveHead && startedAfter(r, sweep.olderThan)) continue; // a newer run's approval of this same head
-
-    gh(["api", "-X", "PUT", `repos/${repo}/pulls/${prNumber}/reviews/${r.id}/dismissals`, "-f", "message=Superseded by a newer stamp run"], cwd);
+  for (const id of sweepTargets(listReviews(repo, prNumber, cwd), botLogin, liveHead, sweep)) {
+    gh(["api", "-X", "PUT", `repos/${repo}/pulls/${prNumber}/reviews/${id}/dismissals`, "-f", "message=Superseded by a newer stamp run"], cwd);
   }
+}
+
+/** The approvals of ours a sweep dismisses, by id; `liveHead` is read only for the terminal sweep. */
+export function sweepTargets(reviews: ReviewRecord[], botLogin: string, liveHead: string | null, sweep: Sweep = {}): number[] {
+  return reviews.flatMap((r) => {
+    if (!isOurs(r, botLogin) || r.state !== "APPROVED" || r.id === sweep.keep) return [];
+
+    if (sweep.olderThan && reviewedHead(r) === liveHead && startedAfter(r, sweep.olderThan)) return []; // a newer run's approval of this same head
+
+    return [r.id];
+  });
 }
 
 /**
