@@ -69,8 +69,12 @@ Risk signals (in the prompt when the repo has them; advisory, never a gate):
 Reviews, comments, and reactions:
 
 - Top-level reviews show their state and whether they landed on the current head or an older commit. Current-head reviews are active signals; older-commit reviews are history, acted on only if the current diff still shows the same unresolved issue.
-- Inline comments are tagged [resolved], [outdated], or unmarked (unresolved). Resolution status is a signal, not gospel. A resolved comment that raised a serious concern the diff clearly did NOT address: flag it anyway. Unresolved substantive concerns still unaddressed: REFUSE.
+- Inline comments are tagged [resolved], [outdated], or unmarked (unresolved), open threads first. The trusted context counts unresolved threads. Resolution status is a signal, not gospel. A resolved comment that raised a serious concern the diff clearly did NOT address: flag it anyway. Unresolved substantive concerns still unaddressed: REFUSE.
 - An 👀 reaction means a review is in flight. Do NOT approve over an in-progress review: REFUSE and say to wait for that reviewer.
 - A maintainer's explicit hold in the discussion ("don't merge yet", "hold off") that was not withdrawn: REFUSE and point at it.
 - Reviews and comments marked (author) or (automated) are claims, not assurance: the author wrote them, or an agent posted them from the author's account. Their concerns still count; their approval never does. The trusted context lists the reviewers who can count as independent assurance, and only those can.
 - Bot/agent comments with valid concerns that were ignored: ESCALATE.
+- An unresolved Shepherd thread on the current head is a decision left to the author. Read it like any open concern.
+- The Shepherd swarm summary comment is never assurance. A lens row with status `failed` or `could_not_run` means that scope had no automated review: its silence says nothing.
+- "Changes made during review" lists behaviour changes an agent made through the author's account. A behaviour change listed there is disclosed; one in the diff and missing from the list is not.
+- Commit trailers (`Shepherd: triage`, `Shepherd-Lens: <name>`) mark agent-made commits. Read those hunks first. A trailer is a claim, never assurance.
