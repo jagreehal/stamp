@@ -9,6 +9,25 @@ import { createServer } from "node:net";
 import { z } from "zod";
 import { CLI_IMAGE, containerArgs, EGRESS, EGRESS_PROXY, isolatedCli, readCliVerdict, startEgress } from "./isolated-cli.ts";
 
+/** A minimal TLS 1.2-framed ClientHello carrying one server_name, split into records of at most `recordSize` bytes. */
+function clientHello(name: string, recordSize = 16384): Buffer {
+  const host = Buffer.from(name);
+  const u16 = (n: number) => Buffer.from([n >> 8, n & 255]);
+  const serverName = Buffer.concat([u16(0), u16(host.length + 5), u16(host.length + 3), Buffer.from([0]), u16(host.length), host]);
+  const body = Buffer.concat([u16(0x0303), Buffer.alloc(32), Buffer.from([0]), u16(2), u16(0x1301), Buffer.from([1, 0]), u16(serverName.length), serverName]);
+  const handshake = Buffer.concat([Buffer.from([1, 0]), u16(body.length), body]);
+
+  const records: Buffer[] = [];
+
+  for (let at = 0; at < handshake.length; at += recordSize) {
+    const fragment = handshake.subarray(at, at + recordSize);
+
+    records.push(Buffer.from([22, 3, 1]), u16(fragment.length), fragment);
+  }
+
+  return Buffer.concat(records);
+}
+
 describe("CLI isolation", () => {
   test("launcher cannot share host processes, writable checkout, home or sockets", () => {
     const args = containerArgs("probe", CLI_IMAGE, "/repo", "/control", "/output", "OPENAI_API_KEY");
@@ -123,18 +142,21 @@ describe("CLI isolation", () => {
     }
   });
 
-  test("the egress proxy tunnels only the allowed host:port and refuses the rest", async () => {
-    const upstream = createServer((socket) => socket.end("upstream reached"));
+  test("the egress proxy tunnels only the allowed host:port, and only when TLS names that host", async () => {
+    // The upstream answers once it has the client's first bytes, so a tunnel that reaches it proves the hello passed.
+    const upstream = createServer((socket) => socket.once("data", (d) => socket.end(`upstream reached ${d[0]}`)));
 
     await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
     const { port: upstreamPort } = z.object({ port: z.number() }).parse(upstream.address());
     const allowed = `127.0.0.1:${upstreamPort}`;
     const port = 20_000 + Math.floor(Math.random() * 20_000);
     const proxy = spawn("node", ["-e", EGRESS_PROXY], { env: { ...process.env, STAMP_EGRESS_ALLOW: allowed, STAMP_EGRESS_PORT: String(port), STAMP_EGRESS_FROM: "127.0.0.0/8" } });
+    let logs = "";
 
-    await new Promise<void>((resolve) => proxy.stdout.on("data", (d) => String(d).includes("ready") && resolve()));
+    proxy.stdout.on("data", (d) => (logs += d));
+    await new Promise<void>((resolve) => proxy.stdout.on("data", () => logs.includes("ready") && resolve()));
 
-    const tunnel = (target: string) =>
+    const tunnel = (target: string, ...writes: Buffer[]) =>
       new Promise<{ status: number; body: string }>((resolve) => {
         const req = request({ host: "127.0.0.1", port, method: "CONNECT", path: target });
 
@@ -143,15 +165,28 @@ describe("CLI isolation", () => {
           let body = head.toString();
 
           socket.on("data", (d) => (body += d));
-          socket.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+          socket.on("close", () => resolve({ status: res.statusCode ?? 0, body }));
+          socket.on("error", () => {});
+          writes.forEach((w, i) => setTimeout(() => socket.write(w), i * 20));
         });
         req.end();
       });
 
+    const hello = clientHello("127.0.0.1");
+
     try {
-      expect(await tunnel(allowed)).toEqual({ status: 200, body: "upstream reached" });
+      expect(await tunnel(allowed, hello)).toEqual({ status: 200, body: "upstream reached 22" });
+      expect(await tunnel(allowed, hello.subarray(0, 20), hello.subarray(20))).toEqual({ status: 200, body: "upstream reached 22" });
+      // TLS may split one ClientHello across records; 3 bytes puts even the handshake header in two records.
+      expect(await tunnel(allowed, clientHello("127.0.0.1", 3))).toEqual({ status: 200, body: "upstream reached 22" });
+      expect(await tunnel(allowed, clientHello("127.0.0.1", 40))).toEqual({ status: 200, body: "upstream reached 22" });
+      expect(await tunnel(allowed, clientHello("discord.com", 40))).toEqual({ status: 200, body: "" });
+      expect(await tunnel(allowed, clientHello("discord.com"))).toEqual({ status: 200, body: "" });
+      expect(await tunnel(allowed, Buffer.from("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"))).toEqual({ status: 200, body: "" });
       expect((await tunnel("example.com:443")).status).toBe(403);
       expect((await tunnel(allowed.replace(/:\d+$/, ":1"))).status).toBe(403);
+      expect(logs).toContain(`deny ${allowed} sni discord.com`);
+      expect(logs).toContain(`deny ${allowed} sni null`);
     } finally {
       proxy.kill();
     }
@@ -187,17 +222,20 @@ describe("CLI isolation", () => {
     try {
       for (const sub of ["repo", "control", "output"]) mkdirSync(path.join(dir, sub), { mode: 0o777 });
 
-      const script = `const http=require("http"), proxy=new URL(process.env.HTTPS_PROXY);
+      // fronted: TLS to the provider's address naming another site on the same CDN, which the proxy must refuse.
+      const script = `const http=require("http"), tls=require("tls"), proxy=new URL(process.env.HTTPS_PROXY);
         const connect=t=>new Promise(r=>{const q=http.request({host:proxy.hostname,port:proxy.port,method:"CONNECT",path:t});q.on("connect",res=>{r(res.statusCode);res.socket?.destroy()});q.on("error",e=>r(e.code));q.end()});
+        const handshake=(t,servername)=>new Promise(r=>{const q=http.request({host:proxy.hostname,port:proxy.port,method:"CONNECT",path:t});
+          q.on("connect",(res,socket)=>{const s=tls.connect({socket,servername});s.on("secureConnect",()=>{r("tls");s.destroy()});s.on("error",()=>r("refused"));s.on("close",()=>r("refused"))});q.on("error",e=>r(e.code));q.end()});
         (async()=>{
           const direct=await fetch("https://example.com").then(()=>"open",()=>"blocked");
-          console.log(JSON.stringify({direct, other:await connect("example.com:443"), provider:await connect("api.openai.com:443")}));
+          console.log(JSON.stringify({direct, other:await connect("example.com:443"), provider:await handshake("api.openai.com:443","api.openai.com"), fronted:await handshake("api.openai.com:443","discord.com")}));
         })()`;
 
       const args = containerArgs(`stamp-egress-run-${Date.now()}`, image, path.join(dir, "repo"), path.join(dir, "control"), path.join(dir, "output"), "STAMP_UNUSED", egress);
       const result = JSON.parse(execFileSync("docker", [...args, "node", "-e", script], { encoding: "utf8", timeout: 60_000 }).trim());
 
-      expect(result).toEqual({ direct: "blocked", other: 403, provider: 200 });
+      expect(result).toEqual({ direct: "blocked", other: 403, provider: "tls", fronted: "refused" });
 
       // The host takes no address on the private network, so a review cannot reach a host service through it.
       const subnet = execFileSync("docker", ["network", "inspect", "--format", "{{(index .IPAM.Config 0).Subnet}}", egress.network], { encoding: "utf8" }).trim();
@@ -206,6 +244,7 @@ describe("CLI isolation", () => {
 
       expect(hostAddresses.split(/\s+/).filter((a) => a.startsWith(prefix))).toEqual([]);
       expect(egress.logs()).toContain("deny example.com:443");
+      expect(egress.logs()).toContain("deny api.openai.com:443 sni discord.com");
       expect(egress.logs()).not.toContain("refuse");
     } finally {
       egress.stop();

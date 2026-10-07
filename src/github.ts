@@ -87,6 +87,17 @@ const ThreadPage = z.object({
 // REST lists inline comments without their thread's resolution, so threads come from GraphQL.
 const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{isResolved isOutdated path comments(first:50){nodes{author{login __typename} body createdAt}}}}}}}`;
 
+const IssuesPage = z.object({
+  data: z.object({
+    repository: z.object({
+      pullRequest: z.object({ closingIssuesReferences: z.object({ nodes: z.array(z.object({ number: z.number(), title: z.string(), body: z.string().nullable(), repository: z.object({ nameWithOwner: z.string() }) })) }) }),
+    }),
+  }),
+});
+
+// The issues the PR says it closes: the request the change claims to implement.
+const ISSUES_QUERY = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){closingIssuesReferences(first:5){nodes{number title body repository{nameWithOwner}}}}}}`;
+
 const CommitRow = z.object({ sha: z.string(), commit: z.object({ message: z.string() }) });
 
 const CommentRow = z.object({ user: Login, body: z.string(), created_at: z.string(), reactions: z.record(z.string(), z.union([z.number(), z.string()])).optional() });
@@ -122,8 +133,33 @@ export type PR = {
   discussion: Comment[];
   reactions: { user: string; content: string; created: string }[];
   commits: { sha: string; message: string }[];
+  /** Issues the PR closes, from GitHub's closing references. Context only: never a gate, never assurance. */
+  issues?: LinkedIssue[];
   diff: string;
 };
+
+export type LinkedIssue = { ref: string; title: string; body: string };
+
+/**
+ * The closing issues that live in the PR's own repository. An issue elsewhere can be private while the PR is
+ * public, and its text would reach the model, the evidence bundle and possibly the posted review.
+ */
+export function sameRepoIssues(nodes: z.infer<typeof IssuesPage>["data"]["repository"]["pullRequest"]["closingIssuesReferences"]["nodes"], repo: string): LinkedIssue[] {
+  return nodes.filter((i) => i.repository.nameWithOwner.toLowerCase() === repo.toLowerCase()).map((i) => ({ ref: `#${i.number}`, title: i.title, body: i.body ?? "" }));
+}
+
+/** Closing issues for a PR; empty when GitHub cannot say, since the review goes on without them. */
+function closingIssues(owner: string, name: string, number: number, cwd: string): LinkedIssue[] {
+  try {
+    const page = IssuesPage.parse(JSON.parse(gh(["api", "graphql", "-f", `query=${ISSUES_QUERY}`, "-F", `owner=${owner}`, "-F", `name=${name}`, "-F", `number=${number}`], cwd)));
+
+    return sameRepoIssues(page.data.repository.pullRequest.closingIssuesReferences.nodes, `${owner}/${name}`);
+  } catch (e) {
+    console.error(`linked issues unavailable: ${e instanceof Error ? e.message : e}`);
+
+    return [];
+  }
+}
 
 export function repoSlug(cwd: string): string {
   return call(z.object({ nameWithOwner: z.string() }), ["repo", "view", "--json", "nameWithOwner"], cwd).nameWithOwner;
@@ -199,6 +235,7 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
       created: r.created_at,
     })),
     commits: paginated(CommitRow, `${base}/pulls/${number}/commits`, cwd).map((c) => ({ sha: c.sha, message: c.commit.message })),
+    issues: closingIssues(owner, name, number, cwd),
     diff: gh(["pr", "diff", String(number)], cwd),
   };
 }

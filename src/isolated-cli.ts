@@ -35,7 +35,8 @@ export const EGRESS_PORT = 3128;
 
 /**
  * The egress proxy, run with node from the reviewer image. It tunnels CONNECT to the allowed host:port pairs
- * and refuses everything else, logging each decision.
+ * only when the client's TLS ClientHello names that same host, and refuses everything else, logging each
+ * decision.
  */
 export const EGRESS_PROXY = `const http = require("http"), net = require("net");
 const allow = new Set((process.env.STAMP_EGRESS_ALLOW || "").split(",").filter(Boolean));
@@ -49,19 +50,66 @@ const fromReview = (address) => {
 };
 const server = http.createServer((req, res) => { res.writeHead(403); res.end("stamp egress: CONNECT only\\n"); });
 server.on("connection", (socket) => { if (!fromReview(socket.remoteAddress)) { console.log("refuse " + socket.remoteAddress); socket.destroy(); } });
+// The TLS server name in the client's ClientHello, undefined until the whole message has arrived, null when
+// the bytes are not a ClientHello or carry no name. TLS may split one handshake message across records, so
+// the records' fragments are joined first. Checked so a tunnel to an allowed address cannot speak TLS to
+// another site sharing that address (a CDN fronting many domains).
+const sni = (b) => {
+  const parts = [];
+  let p = 0, have = 0, need = Infinity;
+  while (have < need) {
+    if (b.length > p && b[p] !== 22) return null;
+    if (b.length < p + 5) return undefined;
+    const len = b.readUInt16BE(p + 3);
+    if (b.length < p + 5 + len) return undefined;
+    parts.push(b.subarray(p + 5, p + 5 + len));
+    have += len;
+    p += 5 + len;
+    if (need === Infinity && have >= 4) {
+      const h = Buffer.concat(parts);
+      if (h[0] !== 1) return null;
+      need = 4 + h.readUIntBE(1, 3);
+    }
+  }
+  const h = Buffer.concat(parts);
+  let q = 4 + 2 + 32;
+  q += 1 + h[q];
+  q += 2 + h.readUInt16BE(q);
+  q += 1 + h[q];
+  const extEnd = Math.min(need, q + 2 + h.readUInt16BE(q));
+  for (q += 2; q + 4 <= extEnd; q += 4 + h.readUInt16BE(q + 2)) {
+    if (h.readUInt16BE(q) === 0 && h[q + 6] === 0) return h.toString("latin1", q + 9, q + 9 + h.readUInt16BE(q + 7)).toLowerCase();
+  }
+  return null;
+};
 server.on("connect", (req, client, head) => {
   const target = String(req.url).toLowerCase();
   if (!allow.has(target)) { console.log("deny " + target); client.end("HTTP/1.1 403 Forbidden\\r\\n\\r\\n"); return; }
-  console.log("allow " + target);
-  const at = target.lastIndexOf(":");
-  const upstream = net.connect(Number(target.slice(at + 1)), target.slice(0, at), () => {
-    client.write("HTTP/1.1 200 Connection Established\\r\\n\\r\\n");
-    upstream.write(head);
-    upstream.pipe(client);
-    client.pipe(upstream);
-  });
-  upstream.on("error", () => client.destroy());
-  client.on("error", () => upstream.destroy());
+  const at = target.lastIndexOf(":"), host = target.slice(0, at), port = Number(target.slice(at + 1));
+  let hello = head;
+  const timer = setTimeout(() => decide(null), 10000);
+  const decide = (name) => {
+    clearTimeout(timer);
+    client.removeListener("data", onData);
+    client.pause();
+    if (name !== host) { console.log("deny " + target + " sni " + name); client.destroy(); return; }
+    console.log("allow " + target);
+    const upstream = net.connect(port, host, () => { upstream.write(hello); upstream.pipe(client); client.pipe(upstream); });
+    upstream.on("error", () => client.destroy());
+    client.on("error", () => upstream.destroy());
+  };
+  const check = () => {
+    let name;
+    try { name = sni(hello); } catch { name = null; }
+    // A ClientHello is a few KiB; 64 KiB bounds what a client can make the proxy hold before it decides.
+    if (name === undefined && hello.length < 65536) return;
+    decide(name === undefined ? null : name);
+  };
+  const onData = (d) => { hello = Buffer.concat([hello, d]); check(); };
+  client.on("data", onData);
+  client.on("error", () => {});
+  client.write("HTTP/1.1 200 Connection Established\\r\\n\\r\\n");
+  if (hello.length) check();
 });
 server.listen(Number(process.env.STAMP_EGRESS_PORT || ${3128}), "0.0.0.0", () => console.log("stamp egress ready"));`;
 

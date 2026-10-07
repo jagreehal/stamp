@@ -227,6 +227,7 @@ export function buildPrompt(input: ReviewInput): string {
     sanitize(body, 6000) || "(none)",
     "",
     ...(changes ? ["Changes made during review (the PR body's shepherd:review-changes section):", sanitize(changes, 4000), ""] : []),
+    ...(pr.issues?.length ? ["Issues this PR closes (the request it claims to implement):", ...pr.issues.flatMap((i) => [line(`${oneLine(i.ref, 120)}: ${oneLine(i.title, 200)}`), sanitize(i.body, 3000) || "(no body)"]), ""] : []),
     "Commits (subjects, and any Shepherd trailers: agent claims made through the author's account, never assurance):",
     ...commits,
     "",
