@@ -741,6 +741,19 @@ describe("workflow template", () => {
     expect(reviews).toContain("github.event.changes.body != null && github.event.sender.login == github.event.pull_request.user.login && contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->')");
   });
 
+  test("edits reach the review only from stamp-edited.yml, and only for a retarget or the author's disclosure", () => {
+    const wf = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp.yml"), "utf8"));
+    const edited = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp-edited.yml"), "utf8"));
+    const condition = z.string().parse(edited.jobs.review.if).replace(/\s+/g, " ");
+
+    expect(wf.on.pull_request.types).not.toContain("edited");
+    expect(wf.on).toHaveProperty("workflow_call");
+    expect(edited.on.pull_request.types).toEqual(["edited"]);
+    expect(edited.jobs.review).toMatchObject({ uses: "./.github/workflows/stamp.yml", secrets: "inherit" });
+    expect(condition).toContain("github.event.changes.base != null");
+    expect(condition).toContain("contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->')");
+  });
+
   test("the digest covers every hour between weekday runs: Monday looks back over the weekend", () => {
     const wf = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp-digest.yml"), "utf8"));
     const crons = z.array(z.object({ cron: z.string() })).parse(wf.on.schedule).map((s) => s.cron);

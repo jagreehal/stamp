@@ -10,13 +10,11 @@ on:
   issue_comment:
     types: [created]
   pull_request:
-    # `edited` covers base retargets: the diff changes without the head moving. Title/body edits
-    # are filtered out below so they don't spend a review, with one exception: the author (or an
-    # agent posting as them, like shepherd) editing a body that carries shepherd's review-changes
-    # section. shepherd writes that disclosure after pushing its fixes, so the review of that head
-    # has to see it.
     # `converted_to_draft` and `unlabeled` withdraw a standing approval: the draft/label skip paths retract it.
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled, edited]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
+  # Edits arrive through stamp-edited.yml, which calls this workflow for a base retarget or the author's
+  # review-changes disclosure. The job `if` below still names both, since a called run sees the `edited` event.
+  workflow_call:
 
 concurrency:
   # Only runs that review share the PR's group, so a newer review supersedes an older one. A run the

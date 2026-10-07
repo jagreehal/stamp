@@ -50,13 +50,13 @@ Each run can write an evidence bundle (`--json`), and the workflow uploads it as
 
 ## Connect a repository
 
-1. From the repository you want reviewed, run `bunx @jagreehal/stamp init`. It writes `.stamp/policy.yml`, `.stamp/review-guidance.md`, `.github/workflows/stamp.yml` and `.github/workflows/stamp-digest.yml`, and never overwrites a file that exists.
+1. From the repository you want reviewed, run `bunx @jagreehal/stamp init`. It writes `.stamp/policy.yml`, `.stamp/review-guidance.md`, `.github/workflows/stamp.yml`, `.github/workflows/stamp-edited.yml` and `.github/workflows/stamp-digest.yml`, and never overwrites a file that exists.
 2. Add the secret for your backend. `ANTHROPIC_API_KEY` for the API, or `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) with the repository variable `STAMP_BACKEND` set to `claude`.
 3. Settings → Actions → General → turn on **Allow GitHub Actions to create and approve pull requests**. Without it the approval is posted but does not satisfy a required-reviews rule.
 4. Pick a **review mode**. Leave `STAMP_LABEL` unset and every pull request is reviewed. Set `STAMP_LABEL: stamp` in the workflow env and only PRs carrying that label are reviewed.
 5. Merge. Policy is read from the default branch, so it takes effect once it lands.
 
-The workflow runs on open, push, reopen, ready-for-review, label, unlabel and base retarget.
+The workflow runs on open, push, reopen, ready-for-review, label and unlabel. `stamp-edited.yml` calls it on a base retarget or when the author edits shepherd's review-changes section into the body, so other description edits add no `stamp / review` run.
 It pins the engine version, because the engine decides what gets auto-approved and a bump should be a deliberate PR.
 
 Start with one repository, all-PRs mode, and a spend cap on the key.
