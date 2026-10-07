@@ -1,6 +1,6 @@
 // The LLM reviewer: a model with read/grep/glob over the checkout, returning a structured verdict.
 import { z } from "zod";
-import { CLI_CONTROL, CLI_OUTPUT, CLI_ROOT, isolatedCli } from "./isolated-cli.ts";
+import { CLI_CONTROL, CLI_OUTPUT, CLI_ROOT, isolatedCli, type EgressDecisions } from "./isolated-cli.ts";
 import type { PR } from "./github.ts";
 import { formatFamiliarity, type AuthorFamiliarity } from "./familiarity.ts";
 import type { Gate, Ownership, ScrutinyFlag } from "./policy.ts";
@@ -255,7 +255,7 @@ export function buildPrompt(input: ReviewInput): string {
 }
 
 /** A verdict, with the run record when the api backend produced it. */
-export type Reviewed = LLMVerdict & { run?: RunRecord };
+export type Reviewed = LLMVerdict & { run?: RunRecord; egress?: EgressDecisions };
 
 export type Opinion = Reviewed & { backend: Backend };
 
@@ -315,7 +315,7 @@ const ClaudeResult = z.object({ is_error: z.boolean(), subtype: z.string(), resu
  * no settings sources (hooks), no CLAUDE.md, no project MCP servers. Tools are the three read-only
  * ones, --restricted removes anything that runs code, and the run is capped in turns and dollars.
  */
-function viaClaudeCode(system: string, prompt: string, repoRoot: string, verbose: boolean): LLMVerdict {
+function viaClaudeCode(system: string, prompt: string, repoRoot: string, verbose: boolean): Reviewed {
   const args = [
     "-p",
     "--output-format", "json",
@@ -341,7 +341,7 @@ function viaClaudeCode(system: string, prompt: string, repoRoot: string, verbose
 
   if (result.data.is_error || result.data.subtype !== "success") throw new Error(`claude: ${result.data.result ?? result.data.subtype}`.slice(0, 500));
 
-  return result.data.structured_output ?? parseVerdict(result.data.result ?? "");
+  return { ...(result.data.structured_output ?? parseVerdict(result.data.result ?? "")), egress: run.egress };
 
 }
 
@@ -354,7 +354,7 @@ function viaClaudeCode(system: string, prompt: string, repoRoot: string, verbose
  * so it is the model's standing instructions rather than text at the top of an untrusted prompt.
  * Docker supplies a read-only filesystem and private PID namespace; ephemeral session, schema-constrained output.
  */
-function viaCodex(system: string, prompt: string, repoRoot: string, verbose: boolean): LLMVerdict {
+function viaCodex(system: string, prompt: string, repoRoot: string, verbose: boolean): Reviewed {
   const schemaFile = `${CLI_CONTROL}/schema.json`;
   const instructionsFile = `${CLI_CONTROL}/instructions.md`;
   const outFile = CLI_OUTPUT;
@@ -381,7 +381,7 @@ function viaCodex(system: string, prompt: string, repoRoot: string, verbose: boo
   if (verbose) console.error(`  codex ${args.join(" ")}`);
   const run = isolatedCli("codex", args, { repoRoot, prompt, system, schema: verdictJsonSchema() });
 
-  return parseVerdict(run.verdict ?? "");
+  return { ...parseVerdict(run.verdict ?? ""), egress: run.egress };
 }
 
 async function viaModel(modelId: string, system: string, prompt: string, repoRoot: string, input: ReviewInput, verbose: boolean): Promise<Reviewed> {
