@@ -1,0 +1,24 @@
+# stamp: re-review on the two PR edits that change what was reviewed. Installed by `bunx @jagreehal/stamp init`.
+# - A base retarget rewrites the diff without moving the head, so a standing approval would cover a diff
+#   nobody reviewed.
+# - The author (or shepherd, posting as them) edits a body that carries shepherd's review-changes section:
+#   shepherd writes that disclosure after pushing its fixes, so the review of that head has to see it.
+# Every other edit (a bot rewriting the description after each push) skips here, under this workflow's own
+# name, so it never stacks a skipped "stamp / review" run over the real one.
+name: stamp-edited
+on:
+  pull_request:
+    types: [edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: >-
+      github.event.changes.base != null
+      || (github.event.changes.body != null && github.event.sender.login == github.event.pull_request.user.login
+          && contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->'))
+    uses: ./.github/workflows/stamp.yml
+    secrets: inherit

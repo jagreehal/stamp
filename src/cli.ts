@@ -63,7 +63,7 @@ const git = (...args: string[]) => execFileSync("git", ["-C", repoRoot, ...args]
 
 if (positionals[0] === "init") {
   // Existing files are never overwritten: the repo's policy is the repo's.
-  for (const rel of [".stamp/policy.yml", ".stamp/review-guidance.md", ".github/workflows/stamp.yml", ".github/workflows/stamp-digest.yml"]) {
+  for (const rel of [".stamp/policy.yml", ".stamp/review-guidance.md", ".github/workflows/stamp.yml", ".github/workflows/stamp-edited.yml", ".github/workflows/stamp-digest.yml"]) {
     const dest = path.join(repoRoot, rel);
     const src = path.join(DEFAULTS_DIR, rel.startsWith(".github") ? `templates/${path.basename(rel)}` : rel);
 
