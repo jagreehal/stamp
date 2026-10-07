@@ -2,12 +2,13 @@
 // stamp <pr-number> [--dry-run] [--post] [--label <name>] [--json <path>] [-v]
 // stamp init   copies .stamp/ and the workflow into the current repo
 // stamp digest [--since <hours>]   posts a Slack summary of recent stamp-approved merges
+// stamp rule <template>   copies a bundled rule pack (observability) into .stamp/rules/
 //
 // Pipeline: (retention?) → retract stale approvals → fetch → gates → (wait for
 // in-flight reviewer bots) → familiarity → LLM review → verdict → post → sweep.
 // The verdict is the output; --post puts it on GitHub as a real approval or a comment.
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
@@ -25,6 +26,7 @@ import {
   readTrusted,
   resolveSizeOverrides,
   runGates,
+  ruleFlags,
   scrutinyFlags,
   suppressionFlags,
   titleFlags,
@@ -81,6 +83,31 @@ if (positionals[0] === "init") {
 
   console.log("\nNext: add the ANTHROPIC_API_KEY secret, enable 'Allow GitHub Actions to create and approve pull requests', merge.");
   console.log("Optional digest: add the STAMP_SLACK_WEBHOOK secret; the digest stays off without it.");
+  process.exit(0);
+}
+
+if (positionals[0] === "rule") {
+  // Copy a bundled rule pack into the repository, where the team owns and edits it.
+  const template = positionals[1];
+  const bundled = path.join(DEFAULTS_DIR, "templates", "rules");
+  const available = readdirSync(bundled);
+
+  if (!template || !available.includes(template)) {
+    console.error(`usage: stamp rule <${available.join("|")}>`);
+    process.exit(2);
+  }
+
+  const rel = `.stamp/rules/${template}/SKILL.md`;
+  const dest = path.join(repoRoot, rel);
+
+  if (existsSync(dest)) console.log(`kept    ${rel}`);
+  else {
+    mkdirSync(path.dirname(dest), { recursive: true });
+    copyFileSync(path.join(bundled, template, "SKILL.md"), dest);
+    console.log(`created ${rel}`);
+  }
+
+  console.log(`\nAdd to .stamp/policy.yml, then merge: stamp reads both from the default branch.\n\nrules:\n  ${template}:\n    skill: .stamp/rules/${template}\n    applies_to: ['src/**']   # optional; without it the rules apply to every changed file\n    on_break: escalate       # refuse, escalate or note`);
   process.exit(0);
 }
 
@@ -220,7 +247,11 @@ const gateVerdict = gated.gates.every((g) => g.passed) ? "PASSED" : "DENIED";
 
 const flags = titleFlags(policy, pr.title, gated.denied);
 
-const scrutiny = [...scrutinyFlags(policy, pr.files.map((f) => f.filename)), ...suppressionFlags(pr.diff)];
+const rules = ruleFlags(policy, pr.files.map((f) => f.filename), (rel) => readTrusted(repoRoot, rel, trustedRef));
+
+for (const m of rules.missing) console.error(`rule pack not found on the default branch, skipped: ${m}`);
+
+const scrutiny = [...scrutinyFlags(policy, pr.files.map((f) => f.filename)), ...suppressionFlags(pr.diff), ...rules.flags];
 
 // Jev risk signals: advisory, before the reviewer, skipped without TYPESAFE_API_KEY. A failure here
 // loses a signal, not the review, so it is logged and the run goes on without it.

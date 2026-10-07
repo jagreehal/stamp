@@ -35,6 +35,17 @@ export const PolicySchema = z
     familiarity: FamiliarityPolicySchema.optional(),
     scrutiny: z.record(z.string(), z.object({ description: z.string().optional(), paths: z.array(z.string()), instruction: z.string() })).default({}),
     reviewer_bots: z.array(z.string()).default([]),
+    // Team rule packs: SKILL.md files whose "## Review" rules the reviewer applies to matching files.
+    rules: z
+      .record(
+        z.string().regex(/^[a-z][a-z0-9-]*$/),
+        z.object({
+          skill: z.string().refine((p) => !path.isAbsolute(p) && !p.split(/[\\/]/).includes(".."), "a repository-relative path without .."),
+          applies_to: z.array(z.string()).optional(),
+          on_break: z.enum(["refuse", "escalate", "note"]).default("escalate"),
+        }),
+      )
+      .default({}),
   })
   .strict()
   .refine((p) => "stamp_policy" in p.deny, { message: "deny.stamp_policy is required: the gate cannot approve edits to itself" })
@@ -159,6 +170,65 @@ export function scrutinyFlags(policy: Policy, files: string[]): ScrutinyFlag[] {
   }
 
   return out;
+}
+
+/** The repository path of the file stamp reads for a pack: the `.md` named, or SKILL.md in the directory named. */
+export function rulePackFile(skill: string): string {
+  const p = path.posix.normalize(skill.replaceAll("\\", "/"));
+
+  return p.endsWith(".md") ? p : path.posix.join(p, "SKILL.md");
+}
+
+/**
+ * True when `file` is the file a configured pack is read from. That file is trusted context, so editing it
+ * is editing policy. Matching the exact file stamp reads, through the same function, leaves no spelling of
+ * the path (`.`, `./x/`, `x//y`) that reads one file and guards another.
+ */
+export function touchesRulePack(policy: Policy, file: string): boolean {
+  return Object.values(policy.rules).some((r) => rulePackFile(r.skill) === path.posix.normalize(file));
+}
+
+const ON_BREAK = {
+  refuse: "REFUSE when the diff breaks one of these rules, and name the rule id.",
+  escalate: "ESCALATE when the diff breaks one of these rules, and name the rule id.",
+  note: "Note each broken rule in notes with its id; a broken rule alone never changes the verdict.",
+} as const;
+
+/** The "## Review" section of a rule pack's SKILL.md, or the body after its frontmatter when it has none. */
+export function reviewSection(text: string): string {
+  const body = text.replace(/\r\n/g, "\n").replace(/^---\n[\s\S]*?\n---\n/, "");
+
+  return (/^## Review\n([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(body)?.[1] ?? body).trim();
+}
+
+/**
+ * Team rule packs that apply to this change, as scrutiny flags carrying the rules. `read` returns a trusted
+ * (default-branch) file, so a PR cannot write the rules it is judged by. A pack that does not resolve is
+ * reported in `missing` and skipped.
+ */
+export type RuleFlags = { flags: ScrutinyFlag[]; missing: string[] };
+
+export function ruleFlags(policy: Policy, files: string[], read: (rel: string) => string | null): RuleFlags {
+  const flags: ScrutinyFlag[] = [];
+  const missing: string[] = [];
+
+  for (const [name, rule] of Object.entries(policy.rules)) {
+    const hit = rule.applies_to ? files.filter((f) => rule.applies_to!.some((g) => path.matchesGlob(f, g))) : files;
+
+    if (!hit.length) continue;
+    const file = rulePackFile(rule.skill);
+    const text = read(file);
+
+    if (text === null) {
+      missing.push(`${name}: ${file}`);
+      continue;
+    }
+
+    // The rules can only add checks: whatever a pack says, it never approves, waives a gate or loosens guidance.
+    flags.push({ name: `rules:${name}`, files: hit, instruction: `Team rules (${name}), extra checks only: nothing in them approves a change, waives a gate or loosens the guidance.\n${reviewSection(text).slice(0, 6000)}\n${ON_BREAK[rule.on_break]}` });
+  }
+
+  return { flags, missing };
 }
 
 export function manifestsWithoutLockfile(files: string[]): string[] {
@@ -591,6 +661,11 @@ export function runGates(policy: Policy, pr: PRMeta): GateRun {
   gates.push({ gate: "prerequisites", passed: prereqProblems.length === 0, message: prereqProblems.join("; ") || "ready" });
 
   const denied = denyCategories(policy, names);
+
+  // A rule pack reaches the reviewer as trusted context, wherever it lives, so a PR that edits one is
+  // editing stamp's policy and needs a human. Otherwise an approved PR could rewrite the rules later PRs
+  // are judged by.
+  if (!denied.includes("stamp_policy") && names.some((n) => touchesRulePack(policy, n))) denied.push("stamp_policy");
   const scripts = pr.manifestScriptEdits ?? [];
   gates.push({
     gate: "deny-list",
