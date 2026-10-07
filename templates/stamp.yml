@@ -93,7 +93,7 @@ jobs:
           STAMP_MODEL: ${{ vars.STAMP_MODEL }}               # empty = claude-opus-5; qwen3.8-max on Go
           # claude backend
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }} # isolated codex backend
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }} # isolated codex backend (or CODEX_API_KEY)
           STAMP_CODEX_MODEL: ${{ vars.STAMP_CODEX_MODEL }}
           STAMP_CLAUDE_MODEL: ${{ vars.STAMP_CLAUDE_MODEL }} # empty = Claude Code's default
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }} # optional: Jev risk signals before the review

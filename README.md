@@ -193,7 +193,7 @@ The prompt, the gates and the verdict schema are the same in every case.
 | --------------- | ----------------------- | ---- | ----- |
 | `api` (default) | The AI SDK, on any provider below | That provider's key | `STAMP_MODEL`, default `claude-opus-5` |
 | `claude`        | Claude Code, headless (`claude -p`) | `CLAUDE_CODE_OAUTH_TOKEN` in an isolated container from `claude setup-token` | `STAMP_CLAUDE_MODEL`, default Claude Code's |
-| `codex`         | Codex, headless (`codex exec`) | `OPENAI_API_KEY` in an isolated container | `STAMP_CODEX_MODEL`, default Codex's |
+| `codex`         | Codex, headless (`codex exec`) | `CODEX_API_KEY` or `OPENAI_API_KEY` in an isolated container | `STAMP_CODEX_MODEL`, default Codex's |
 
 `STAMP_MODEL` is `provider:model`, or a bare Claude id for Anthropic. The `api` backend gives the model three tools, `read_file`, `grep` and `glob`, confined to the checkout, and the model ends by calling `submit_verdict`.
 
@@ -211,7 +211,7 @@ STAMP_MODEL=bedrock:zai.glm-4.7-flash           AWS_BEARER_TOKEN_BEDROCK=...  AW
 STAMP_MODEL=opencode-go:deepseek-v4-flash       OPENCODE_API_KEY=...
 STAMP_MODEL=openrouter:moonshotai/kimi-k3       OPENROUTER_API_KEY=...
 STAMP_BACKEND=claude                            # CLAUDE_CODE_OAUTH_TOKEN required
-STAMP_BACKEND=codex                             # OPENAI_API_KEY required
+STAMP_BACKEND=codex                             # CODEX_API_KEY or OPENAI_API_KEY required
 ```
 
 ### Isolated CLI reviewers
@@ -225,11 +225,13 @@ review_context="$(mktemp -d)"
 docker build -f templates/reviewer.Dockerfile -t stamp-reviewer:local "$review_context"
 ```
 
-`STAMP_CLI_IMAGE` can select another trusted image (prefer a digest for a published image). A missing Docker daemon, image or backend credential makes the review ERROR; there is no host CLI fallback. Host subscription login files are never mounted. Claude uses `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`); Codex uses `OPENAI_API_KEY`.
+`STAMP_CLI_IMAGE` can select another trusted image (prefer a digest for a published image). A missing Docker daemon, image or backend credential makes the review ERROR; there is no host CLI fallback. Host subscription login files are never mounted. Claude uses `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`); Codex uses `CODEX_API_KEY` or `OPENAI_API_KEY`, which Stamp passes to `codex exec` as `CODEX_API_KEY`.
 
 The container has its own process namespace, so `/proc` cannot expose Stamp's environment. It receives only its own backend credential, a read-only checkout copy without `.git`, trusted review instructions, and an empty output directory. It runs as a non-root user with capabilities dropped and privilege escalation disabled. Host homes, Docker sockets and credential directories are never mounted. Container output is untrusted, including verdict-file symlinks.
 
-Codex's inner sandbox uses `danger-full-access` because nested Linux sandboxing needs privileges this container deliberately does not grant. The outer container enforces the read-only checkout and filesystem; writable storage is limited to temporary state and verdict output. Both CLIs still have network access for inference and can see their own credential, so use a dedicated credential with appropriate spend limits. This change protects the other credentials in Stamp's process; it does not make the model immune to prompt injection.
+Each review gets a private Docker network with no route out, on which the host itself has no address. Its one door is an egress proxy, started from the same image, which tunnels `CONNECT` to the reviewer's model API and refuses everything else: `api.anthropic.com:443` for Claude, `api.openai.com:443` for Codex. The reviewer reaches the proxy through `HTTPS_PROXY`; a request that ignores it has no route and no DNS. The proxy logs each decision.
+
+Codex runs `danger-full-access` because nested Linux sandboxing needs privileges this container does not grant. The container is the boundary: a read-only checkout and filesystem, writable storage limited to temporary state and the verdict, and network only to its own provider. A command Codex runs can reach that provider and nothing else. The provider's API can itself fetch a URL it is given, such as an image input, so a hijacked review could still route data out through the provider; the proxy sees only encrypted traffic and cannot inspect requests. Use a dedicated key with a spend limit, and prefer the `api` backend, which has no shell, where that matters.
 
 The `api` backend continues to use repository-confined tools in-process and requires no Docker setup.
 
