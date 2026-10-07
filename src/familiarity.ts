@@ -10,7 +10,7 @@
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { z } from "zod";
-import { mergedPRNumbers } from "./github.ts";
+import { GH_CREDENTIALS, mergedPRNumbers } from "./github.ts";
 
 /** Author names are untrusted display hints; strip controls and cap length. */
 const scrubName = (s: string, max: number) => s.replace(/[^\P{C}\n\t]/gu, "").slice(0, max);
@@ -351,7 +351,7 @@ const isShallow = (repoRoot: string) => git(repoRoot, ["rev-parse", "--is-shallo
  * reach familiarity pay nothing. False when the repo is still shallow; the signal is then skipped.
  */
 export function ensureFullHistory(repoRoot: string): boolean {
-  if (isShallow(repoRoot)) git(repoRoot, ["fetch", "-q", "--unshallow", "origin"], UNSHALLOW_TIMEOUT_MS);
+  if (isShallow(repoRoot)) git(repoRoot, [...GH_CREDENTIALS, "fetch", "-q", "--unshallow", "origin"], UNSHALLOW_TIMEOUT_MS);
 
   return !isShallow(repoRoot);
 }
