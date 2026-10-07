@@ -26,6 +26,7 @@ import {
   resolveSizeOverrides,
   runGates,
   scrutinyFlags,
+  suppressionFlags,
   titleFlags,
   type Gate,
   type Policy,
@@ -219,7 +220,7 @@ const gateVerdict = gated.gates.every((g) => g.passed) ? "PASSED" : "DENIED";
 
 const flags = titleFlags(policy, pr.title, gated.denied);
 
-const scrutiny = scrutinyFlags(policy, pr.files.map((f) => f.filename));
+const scrutiny = [...scrutinyFlags(policy, pr.files.map((f) => f.filename)), ...suppressionFlags(pr.diff)];
 
 // Jev risk signals: advisory, before the reviewer, skipped without TYPESAFE_API_KEY. A failure here
 // loses a signal, not the review, so it is logged and the run goes on without it.

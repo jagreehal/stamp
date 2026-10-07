@@ -23,6 +23,7 @@ import {
   scrutinyFlags,
   sizeWithinBudgets,
   substantiveSize,
+  suppressionFlags,
   tier,
   titleFlags,
   type PRFile,
@@ -272,6 +273,23 @@ test("addedSecrets scans an added line whose content starts with ++", () => {
   const diff = fileDiff("notes/keys.txt", "+++ AKIAIOSFODNN7EXAMPLE", "+ordinary line").join("\n");
 
   expect(addedSecrets(diff)).toEqual(["notes/keys.txt: AWS access key"]);
+});
+
+test("suppressionFlags names suppression comments on added lines only", () => {
+  const diff = [
+    ...fileDiff("src/a.ts", "+  // eslint-disable-next-line no-explicit-any", "+  // @ts-ignore", " // oxlint-disable-line"),
+    ...fileDiff("app/b.py", "+x = eval(s)  # nosec B307", "-y = 1  # noqa", "+import os  # type: ignore[import]"),
+    ...fileDiff("src/c.ts", "+const nosecrets = true; // keep the author list", "+/* istanbul ignore next */"),
+  ].join("\n");
+
+  expect(suppressionFlags(diff)).toEqual([
+    {
+      name: "suppressions",
+      files: ["src/a.ts: eslint-disable", "src/a.ts: @ts-ignore", "app/b.py: nosec", "app/b.py: type: ignore", "src/c.ts: istanbul ignore"],
+      instruction: expect.stringContaining("REFUSE"),
+    },
+  ]);
+  expect(suppressionFlags(fileDiff("src/d.ts", "+const ok = 1;").join("\n"))).toEqual([]);
 });
 
 const thresholds: FamiliarityPolicy = {
