@@ -51,7 +51,7 @@ Each run can write an evidence bundle (`--json`), and the workflow uploads it as
 ## Connect a repository
 
 1. From the repository you want reviewed, run `bunx @jagreehal/stamp init`. It writes `.stamp/policy.yml`, `.stamp/review-guidance.md`, `.github/workflows/stamp.yml`, `.github/workflows/stamp-edited.yml` and `.github/workflows/stamp-digest.yml`, and never overwrites a file that exists.
-2. Add the secret for your backend. `ANTHROPIC_API_KEY` for the API, or `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) with the repository variable `STAMP_BACKEND` set to `claude`.
+2. Add the secret for your backend: your model provider's key (see [Backends](#backends)) with `STAMP_MODEL` as a repository variable, or `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) with `STAMP_BACKEND` set to `claude`.
 3. Settings → Actions → General → turn on **Allow GitHub Actions to create and approve pull requests**. Without it the approval is posted but does not satisfy a required-reviews rule.
 4. Pick a **review mode**. Leave `STAMP_LABEL` unset and every pull request is reviewed. Set `STAMP_LABEL: stamp` in the workflow env and only PRs carrying that label are reviewed.
 5. Merge. Policy is read from the default branch, so it takes effect once it lands.
@@ -189,19 +189,55 @@ A push that leaves the PR's own unified diff byte-identical to the approved one 
 `STAMP_BACKEND` decides who runs the model.
 The prompt, the gates and the verdict schema are the same in every case.
 
-| `STAMP_BACKEND` | Runs the review through                                   | Auth                                                                        | Model                                       |
-| --------------- | --------------------------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------- |
-| `api` (default) | The Anthropic Messages API, or any endpoint that speaks it | `ANTHROPIC_API_KEY`, optional `ANTHROPIC_BASE_URL`                          | `STAMP_MODEL`, default `claude-opus-5`      |
-| `claude`        | Claude Code, headless (`claude -p`)                        | The `claude` login; in CI, `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` | `STAMP_CLAUDE_MODEL`, default Claude Code's |
-| `codex`         | Codex, headless (`codex exec`)                             | The `codex` login; in CI, `OPENAI_API_KEY`                                  | `STAMP_CODEX_MODEL`, default Codex's        |
+| `STAMP_BACKEND` | Runs the review through | Auth | Model |
+| --------------- | ----------------------- | ---- | ----- |
+| `api` (default) | The AI SDK, on any provider below | That provider's key | `STAMP_MODEL`, default `claude-opus-5` |
+| `claude`        | Claude Code, headless (`claude -p`) | `CLAUDE_CODE_OAUTH_TOKEN` in an isolated container from `claude setup-token` | `STAMP_CLAUDE_MODEL`, default Claude Code's |
+| `codex`         | Codex, headless (`codex exec`) | `OPENAI_API_KEY` in an isolated container | `STAMP_CODEX_MODEL`, default Codex's |
+
+`STAMP_MODEL` is `provider:model`, or a bare Claude id for Anthropic. The `api` backend gives the model three tools, `read_file`, `grep` and `glob`, confined to the checkout, and the model ends by calling `submit_verdict`.
+
+| `STAMP_MODEL` | Provider | Key |
+| ------------- | -------- | --- |
+| `claude-opus-5` (no prefix) | Anthropic, or any endpoint in `ANTHROPIC_BASE_URL` | `ANTHROPIC_API_KEY` |
+| `bedrock:zai.glm-4.7-flash`, `bedrock:us.anthropic.claude-sonnet-5-5` | Amazon Bedrock (Claude through InvokeModel, the rest through Converse) | `AWS_BEARER_TOKEN_BEDROCK` or OIDC credentials, and `AWS_REGION` |
+| `opencode-go:kimi-k3`, `opencode:claude-sonnet-5-5` | OpenCode Go and Zen | `OPENCODE_API_KEY` |
+| `openrouter:moonshotai/kimi-k3` | OpenRouter | `OPENROUTER_API_KEY` |
+| `gateway:anthropic/claude-sonnet-5.5` | Vercel AI Gateway | `AI_GATEWAY_API_KEY` |
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-...                                                        # api: Anthropic direct
-ANTHROPIC_API_KEY=<zen key>  ANTHROPIC_BASE_URL=https://opencode.ai/zen              # api: OpenCode Zen, Claude, pay per use
-ANTHROPIC_API_KEY=<go key>   ANTHROPIC_BASE_URL=https://opencode.ai/zen/go  STAMP_MODEL=qwen3.8-max   # api: OpenCode Go, $10/mo, no Claude
-STAMP_BACKEND=claude                                                                # a Claude subscription, no key
-STAMP_BACKEND=codex                                                                 # a ChatGPT login, no key
+STAMP_MODEL=claude-opus-5                       ANTHROPIC_API_KEY=sk-ant-...
+STAMP_MODEL=bedrock:zai.glm-4.7-flash           AWS_BEARER_TOKEN_BEDROCK=...  AWS_REGION=eu-west-1
+STAMP_MODEL=opencode-go:deepseek-v4-flash       OPENCODE_API_KEY=...
+STAMP_MODEL=openrouter:moonshotai/kimi-k3       OPENROUTER_API_KEY=...
+STAMP_BACKEND=claude                            # CLAUDE_CODE_OAUTH_TOKEN required
+STAMP_BACKEND=codex                             # OPENAI_API_KEY required
 ```
+
+### Isolated CLI reviewers
+
+Both `claude` and `codex` run in Docker containers. Docker must be running, with a trusted reviewer image built from the packaged `templates/reviewer.Dockerfile`. The generated workflow builds that image from the pinned Stamp package before a CLI review; it never builds from the PR checkout. Existing installations must update their workflow to include that step and the Codex key.
+
+For local use, build from a trusted Stamp checkout with an empty build context:
+
+```bash
+review_context="$(mktemp -d)"
+docker build -f templates/reviewer.Dockerfile -t stamp-reviewer:local "$review_context"
+```
+
+`STAMP_CLI_IMAGE` can select another trusted image (prefer a digest for a published image). A missing Docker daemon, image or backend credential makes the review ERROR; there is no host CLI fallback. Host subscription login files are never mounted. Claude uses `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`); Codex uses `OPENAI_API_KEY`.
+
+The container has its own process namespace, so `/proc` cannot expose Stamp's environment. It receives only its own backend credential, a read-only checkout copy without `.git`, trusted review instructions, and an empty output directory. It runs as a non-root user with capabilities dropped and privilege escalation disabled. Host homes, Docker sockets and credential directories are never mounted. Container output is untrusted, including verdict-file symlinks.
+
+Codex's inner sandbox uses `danger-full-access` because nested Linux sandboxing needs privileges this container deliberately does not grant. The outer container enforces the read-only checkout and filesystem; writable storage is limited to temporary state and verdict output. Both CLIs still have network access for inference and can see their own credential, so use a dedicated credential with appropriate spend limits. This change protects the other credentials in Stamp's process; it does not make the model immune to prompt injection.
+
+The `api` backend continues to use repository-confined tools in-process and requires no Docker setup.
+
+### Limits, cost and traces
+
+Every `api` review runs under `STAMP_GUARD`, in autotel's rule shorthand. The default is `budget:$2,tokens:3m,loop:4/12,max-tools:80,timeout:15m`: a cost ceiling, a token ceiling, a spin-loop rule (the same call 4 times in 12), a tool-call cap, and a timeout that also cuts off a model call in flight. A rule that fires ends the review as ERROR. A model without a price keeps its token ceiling; give it a price with `STAMP_PRICING='{"kimi-k3":{"inputPer1M":3,"outputPer1M":15}}'`.
+
+The mechanics table names the model, its tool calls, the cost and the time (`bedrock:zai.glm-4.7-flash · 9 tool calls · $0.0042 · 6.2s`), and the `--json` evidence carries the full run record: steps, tool calls and failures, tokens, cost, the limits it ran under. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and each review is also a trace of `gen_ai.*` spans, one per model call and tool call.
 
 The agent backends load nothing the PR ships as configuration.
 
@@ -217,6 +253,7 @@ Set `STAMP_CODEX_MODEL` to a model that explores.
 
 ```bash
 STAMP_BACKENDS=claude,codex
+STAMP_BACKENDS=bedrock:zai.glm-4.7-flash,openrouter:moonshotai/kimi-k3   # two api models from different families
 ```
 
 The first backend reviews every PR.

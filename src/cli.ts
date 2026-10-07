@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
-import { callTimeout, dismissOwnApprovals, fetchPR, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, withBudget, type PR, type Verdict } from "./github.ts";
+import { callTimeout, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, withBudget, type PR, type Verdict } from "./github.ts";
 import {
   DEFAULTS_DIR,
   detectOwnership,
@@ -32,7 +32,8 @@ import {
   type ScopeBudget,
 } from "./policy.ts";
 import { tryRetainApproval, type RetentionResult } from "./retention.ts";
-import { BACKENDS, combine, review, secondOpinionNeeded, type LLMVerdict, type Opinion } from "./reviewer.ts";
+import { stopTelemetry, summarizeRun } from "./llm.ts";
+import { BACKENDS, combine, review, secondOpinionNeeded, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
 
 const VERSION = "0.1.0";
@@ -268,7 +269,7 @@ if (sizeBudgets.invalid_folder_files.length) console.log(`  invalid AGENT_APPROV
 
 let verdict: Verdict;
 
-let llm: LLMVerdict | null = null;
+let llm: Reviewed | null = null;
 
 let opinion: Opinion | null = null;
 
@@ -327,6 +328,8 @@ if (llm?.next_steps) console.log(`next: ${llm.next_steps}`);
 
 if (opinion) console.log(`second opinion (${opinion.backend}): ${opinion.verdict} — ${opinion.reasoning}`);
 
+for (const run of [llm?.run, opinion?.run]) if (run) console.log(`reviewer run: ${summarizeRun(run)}`);
+
 const folderGrants = (kind: "max_files" | "max_lines", scopes: ScopeBudget[]) =>
   scopes.flatMap((s) => (s.path === null ? [] : [{ path: s.path, kind, ceiling: s.ceiling, files: s.files.length }]));
 
@@ -365,6 +368,8 @@ if (opts.post) {
 
   if (posted !== null) reconcilePosted(pr, posted, verdict, post);
 }
+
+await stopTelemetry();
 
 process.exit(verdict === "APPROVED" ? 0 : 1);
 
@@ -423,7 +428,7 @@ function agentPrompt(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdic
   ];
 }
 
-function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict | null, opinion: Opinion | null, gates: Gate[]): string {
+function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed | null, opinion: Opinion | null, gates: Gate[]): string {
   const icon = { APPROVED: "✅", REFUSED: "❌", ESCALATE: "🙋", ERROR: "⚠️" }[verdict];
   const parts = [`## ${icon} stamp: ${verdict}`, "", reasoning];
 
@@ -443,8 +448,8 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict
     "| gate | result |",
     "|---|---|",
     ...gates.map((g) => `| ${g.gate} | ${g.passed ? "✓" : "✗"} ${g.message} |`),
-    `| reviewer | ${BACKENDS[0]}${llm ? ` → ${llm.verdict}` : ""} |`,
-    ...(opinion ? [`| second opinion | ${opinion.backend} → ${opinion.verdict} (${opinion.risk} risk) |`] : []),
+    `| reviewer | ${llm?.run ? summarizeRun(llm.run) : BACKENDS[0]}${llm ? ` → ${llm.verdict}` : ""} |`,
+    ...(opinion ? [`| second opinion | ${opinion.run ? summarizeRun(opinion.run) : opinion.backend} → ${opinion.verdict} (${opinion.risk} risk) |`] : []),
     "",
     `stamp ${VERSION} · head \`${pr.headSha.slice(0, 7)}\` · base \`${pr.baseRef}@${pr.baseSha.slice(0, 7)}\` · policy \`${policySource(`origin/${pr.defaultBranch}`).policy}\` · risk ${llm?.risk ?? "n/a"}`,
     "</details>",
@@ -494,7 +499,7 @@ function finished() {
 
 /** Fetch the PR head, its base and the default branch, so both diff ends and trusted policy are local. */
 function fetchRefs(pr: PR): void {
-  git("fetch", "-q", "origin", `refs/pull/${pr.number}/head`, pr.baseRef, `+refs/heads/${pr.defaultBranch}:refs/remotes/origin/${pr.defaultBranch}`);
+  git(...GH_CREDENTIALS, "fetch", "-q", "origin", `refs/pull/${pr.number}/head`, pr.baseRef, `+refs/heads/${pr.defaultBranch}:refs/remotes/origin/${pr.defaultBranch}`);
 }
 
 /** Every deterministic gate for `pr`, with policy and folder size grants read from the default branch. */

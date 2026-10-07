@@ -220,6 +220,12 @@ export function unchanged(pr: PR, cwd: string): boolean {
 // can be ordered without shared state: the run that started later owns the newer verdict.
 const RUN_MARKER = /<!-- stamp-run:(\S+) -->/;
 
+/**
+ * Git config for a fetch that authenticates through gh (GH_TOKEN in CI), so the workflow can check out with
+ * persist-credentials: false and no token sits in .git/config for a reviewer to read.
+ */
+export const GH_CREDENTIALS = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
+
 export const runMarker = (started: string) => `<!-- stamp-run:${started} -->`;
 
 // The full SHAs a review covered. Approval retention compares diffs on exactly these.

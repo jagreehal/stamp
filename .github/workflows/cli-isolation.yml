@@ -1,0 +1,29 @@
+name: CLI isolation
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: Build pinned CLI image with an empty context
+        run: |
+          review_context="$(mktemp -d)"
+          docker build -f templates/reviewer.Dockerfile -t stamp-reviewer:local "$review_context"
+      - name: Check installed CLI options
+        run: |
+          docker run --rm stamp-reviewer:local claude --help | grep -F -- --restricted
+          docker run --rm stamp-reviewer:local codex exec --help | grep -F -- --ignore-user-config
+      - name: Probe Linux process and filesystem isolation
+        run: bun test src/isolated-cli.test.ts
+        env:
+          STAMP_ISOLATION_TEST: '1'

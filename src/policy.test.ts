@@ -1,3 +1,4 @@
+import { PROVIDER_ENV } from "./llm.ts";
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -752,6 +753,14 @@ describe("workflow template", () => {
     expect(edited.jobs.review).toMatchObject({ uses: "./.github/workflows/stamp.yml", secrets: "inherit" });
     expect(condition).toContain("github.event.changes.base != null");
     expect(condition).toContain("contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->')");
+  });
+
+  test("the workflow passes every provider's credentials, so choosing a provider needs only a secret and STAMP_MODEL", () => {
+    const wf = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp.yml"), "utf8"));
+    const env = Object.keys(wf.jobs.review.steps.find((s: { env?: object }) => s.env && "STAMP_MODEL" in s.env).env);
+
+    expect(PROVIDER_ENV.filter((k) => !env.includes(k))).toEqual([]);
+    expect(env).toEqual(expect.arrayContaining(["STAMP_MODEL", "STAMP_GUARD", "STAMP_PRICING", "OTEL_EXPORTER_OTLP_ENDPOINT"]));
   });
 
   test("the digest covers every hour between weekday runs: Monday looks back over the weekend", () => {

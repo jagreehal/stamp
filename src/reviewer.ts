@@ -1,23 +1,18 @@
-// The LLM reviewer: Claude with read/grep/glob over the checkout, returning a structured verdict.
-import Anthropic from "@anthropic-ai/sdk";
-import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
-import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+// The LLM reviewer: a model with read/grep/glob over the checkout, returning a structured verdict.
 import { z } from "zod";
+import { CLI_CONTROL, CLI_OUTPUT, CLI_ROOT, isolatedCli } from "./isolated-cli.ts";
 import type { PR } from "./github.ts";
 import { formatFamiliarity, type AuthorFamiliarity } from "./familiarity.ts";
 import type { Gate, Ownership, ScrutinyFlag } from "./policy.ts";
+import { reviewWithTools, type RunRecord } from "./llm.ts";
 import { formatSignals, type Signals } from "./signals.ts";
 
-export const MODEL = process.env.STAMP_MODEL || "claude-opus-5"; // api backend only; `||`: a blank workflow variable means "default"
+export const MODEL = process.env.STAMP_MODEL || "claude-opus-5"; // the api backend's model; `||`: a blank workflow variable means "default"
 
-// api: the Anthropic Messages API (key or any compatible endpoint). claude / codex: the installed
-// coding-agent CLI in headless mode, so a subscription login works and the agent's own sandbox
-// applies on top of the worktree. Same prompt, same verdict schema, same gates either way.
-const Backend = z.enum(["api", "claude", "codex"]);
+// api: STAMP_MODEL through the AI SDK, on any provider (`bedrock:zai.glm-4.7-flash`, `opencode-go:kimi-k3`,
+// a bare Claude id for Anthropic). A `provider:model` entry is the api backend on that model. claude / codex:
+// a pinned coding-agent CLI inside a private Docker container, with only its own credential. Same prompt, same verdict schema, same gates either way.
+const Backend = z.union([z.enum(["api", "claude", "codex"]), z.string().regex(/^[a-z][a-z-]*:\S+$/, "a backend is api, claude, codex, or provider:model")]);
 
 export type Backend = z.infer<typeof Backend>;
 
@@ -100,63 +95,6 @@ export function diffCut(diff: string): { first: string; more: number } | null {
   const shown = headers.filter((h) => (h.index ?? 0) < DIFF_MAX).length;
 
   return { first: headers[shown - 1]?.[1] ?? "(unknown)", more: headers.length - shown };
-}
-
-function tools(root: string) {
-  const real = realpathSync(root);
-
-  const inside = (p: string) => {
-    const abs = path.resolve(real, p);
-    let target = abs;
-
-    try {
-      target = realpathSync(abs);
-    } catch {
-      /* missing file: still check the lexical path */
-    }
-
-    if (!abs.startsWith(real + path.sep) && abs !== real) throw new Error("path escapes the repository");
-
-    if (!target.startsWith(real + path.sep) && target !== real) throw new Error("path escapes the repository (symlink)");
-
-    return abs;
-  };
-
-  const git = (args: string[]) => {
-    try {
-      return execFileSync("git", ["-C", real, ...args], { encoding: "utf8", maxBuffer: 8 << 20 });
-    } catch (e) {
-      // git grep exits 1 for "no matches", which is an answer, not an error.
-      if (e instanceof Error && "status" in e && e.status === 1) return "(no matches)";
-      throw e;
-    }
-  };
-
-  return [
-    betaZodTool({
-      name: "read_file",
-      description: "Read a file from the repository, with 1-based line numbers. Use offset/limit for large files.",
-      inputSchema: z.object({ path: z.string(), offset: z.number().int().min(1).optional(), limit: z.number().int().min(1).max(2000).optional() }),
-      run: ({ path: p, offset = 1, limit = 400 }) =>
-        readFileSync(inside(p), "utf8")
-          .split("\n")
-          .slice(offset - 1, offset - 1 + limit)
-          .map((l, i) => `${offset + i}\t${l}`)
-          .join("\n"),
-    }),
-    betaZodTool({
-      name: "grep",
-      description: "Search tracked files with an extended regex (git grep -nE). Optional path prefix to narrow.",
-      inputSchema: z.object({ pattern: z.string(), path: z.string().optional() }),
-      run: ({ pattern, path: p }) => git(["grep", "-nIE", "--", pattern, ...(p ? [inside(p)] : [])]).slice(0, 20_000),
-    }),
-    betaZodTool({
-      name: "glob",
-      description: "List tracked files matching a glob, e.g. 'src/**/*.ts'.",
-      inputSchema: z.object({ pattern: z.string() }),
-      run: ({ pattern }) => git(["ls-files", "--", pattern]).slice(0, 20_000),
-    }),
-  ];
 }
 
 export type ReviewInput = {
@@ -315,7 +253,10 @@ export function buildPrompt(input: ReviewInput): string {
   ].join("\n");
 }
 
-export type Opinion = LLMVerdict & { backend: Backend };
+/** A verdict, with the run record when the api backend produced it. */
+export type Reviewed = LLMVerdict & { run?: RunRecord };
+
+export type Opinion = Reviewed & { backend: Backend };
 
 /** A second opinion is worth its cost only where it can change the outcome: an approval that isn't plainly low-risk. */
 export const secondOpinionNeeded = (llm: LLMVerdict, flagged: boolean): boolean => llm.verdict === "APPROVE" && (llm.risk !== "low" || flagged);
@@ -339,7 +280,7 @@ export function combine(primary: Backend, llm: LLMVerdict, opinion: Opinion): Co
   };
 }
 
-export async function review(backend: Backend, input: ReviewInput, guidance: string, repoRoot: string, verbose = false): Promise<LLMVerdict> {
+export async function review(backend: Backend, input: ReviewInput, guidance: string, repoRoot: string, verbose = false): Promise<Reviewed> {
   const system = guidance + "\n" + SCAFFOLD;
   const prompt = buildPrompt(input);
 
@@ -347,7 +288,7 @@ export async function review(backend: Backend, input: ReviewInput, guidance: str
 
   if (backend === "codex") return viaCodex(system, prompt, repoRoot, verbose);
 
-  return viaApi(system, prompt, repoRoot, input, verbose);
+  return viaModel(backend === "api" ? MODEL : backend, system, prompt, repoRoot, input, verbose);
 }
 
 /** Model text → verdict. Tolerates prose or a code fence around the JSON. */
@@ -390,17 +331,12 @@ function viaClaudeCode(system: string, prompt: string, repoRoot: string, verbose
   ];
 
   if (verbose) console.error(`  claude -p --json-schema … --tools Read Grep Glob --restricted --setting-sources "" (cwd ${repoRoot})`);
-  // This backend authenticates as Claude Code does: a subscription login or CLAUDE_CODE_OAUTH_TOKEN.
-  // ANTHROPIC_* belongs to the api backend and is withheld, so a key or proxy URL meant for that
-  // path (or a blank workflow variable) can never redirect or break the CLI. Non-zero exit still
-  // carries a JSON result.
-  const env = Object.fromEntries(Object.entries(process.env).filter(([k, v]) => v !== "" && !k.startsWith("ANTHROPIC_")));
-  const run = spawnSync("claude", args, { cwd: repoRoot, input: prompt, encoding: "utf8", maxBuffer: 64 << 20, env });
-
-  if (run.error) throw run.error;
+  // The container receives CLAUDE_CODE_OAUTH_TOKEN and nothing else: a key or proxy URL meant for the api
+  // backend never reaches the CLI. A container failure is ERROR.
+  const run = isolatedCli("claude", args, { repoRoot, prompt, system, schema: verdictJsonSchema() });
   const result = ClaudeResult.safeParse(run.stdout.trim() ? JSON.parse(run.stdout) : {});
 
-  if (!result.success) throw new Error(`claude exited ${run.status}: ${(run.stderr || run.stdout).slice(0, 500)}`);
+  if (!result.success) throw new Error(`claude returned an invalid result: ${run.stdout.slice(0, 500)}`);
 
   if (result.data.is_error || result.data.subtype !== "success") throw new Error(`claude: ${result.data.result ?? result.data.subtype}`.slice(0, 500));
 
@@ -415,28 +351,25 @@ function viaClaudeCode(system: string, prompt: string, repoRoot: string, verbose
  * are ignored (`--ignore-user-config`, `--ignore-rules`, `mcp_servers={}`) while auth still resolves.
  * The trusted guidance goes in as `model_instructions_file`, the slot AGENTS.md would otherwise fill,
  * so it is the model's standing instructions rather than text at the top of an untrusted prompt.
- * Read-only sandbox, ephemeral session, output constrained to the verdict schema.
+ * Docker supplies a read-only filesystem and private PID namespace; ephemeral session, schema-constrained output.
  */
 function viaCodex(system: string, prompt: string, repoRoot: string, verbose: boolean): LLMVerdict {
-  const dir = mkdtempSync(path.join(tmpdir(), "stamp-codex-"));
-  const schemaFile = path.join(dir, "schema.json");
-  const instructionsFile = path.join(dir, "instructions.md");
-  const outFile = path.join(dir, "verdict.json");
-  writeFileSync(schemaFile, verdictJsonSchema());
-  writeFileSync(instructionsFile, system);
+  const schemaFile = `${CLI_CONTROL}/schema.json`;
+  const instructionsFile = `${CLI_CONTROL}/instructions.md`;
+  const outFile = CLI_OUTPUT;
 
   const args = [
     "exec",
     "--json",
-    "--sandbox", "read-only",
+    "--sandbox", "danger-full-access", // Docker supplies the OS boundary; nested bubblewrap requires extra privileges.
     "--ephemeral",
     "--skip-git-repo-check",
     "--ignore-user-config",
     "--ignore-rules",
-    "-C", repoRoot,
+    "-C", CLI_ROOT,
     "-c", "project_doc_max_bytes=0",
     "-c", "project_doc_fallback_filenames=[]",
-    "-c", `projects.${JSON.stringify(repoRoot)}.trust_level="untrusted"`,
+    "-c", `projects.${JSON.stringify(CLI_ROOT)}.trust_level="untrusted"`,
     "-c", "mcp_servers={}",
     "-c", `model_instructions_file=${JSON.stringify(instructionsFile)}`,
     "--output-schema", schemaFile,
@@ -445,57 +378,23 @@ function viaCodex(system: string, prompt: string, repoRoot: string, verbose: boo
   ];
 
   if (verbose) console.error(`  codex ${args.join(" ")}`);
-  execFileSync("codex", args, { cwd: repoRoot, input: prompt, encoding: "utf8", maxBuffer: 64 << 20, stdio: ["pipe", verbose ? "inherit" : "ignore", "inherit"] });
+  const run = isolatedCli("codex", args, { repoRoot, prompt, system, schema: verdictJsonSchema() });
 
-  return parseVerdict(readFileSync(outFile, "utf8"));
+  return parseVerdict(run.verdict ?? "");
 }
 
-async function viaApi(system: string, prompt: string, repoRoot: string, input: ReviewInput, verbose: boolean): Promise<LLMVerdict> {
-  // Stable per-PR session id + a real user agent: required by OpenCode Go, harmless for Anthropic.
-  const client = new Anthropic({
-    baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
-    defaultHeaders: { "x-opencode-session": `stamp-${input.pr.number}-${input.pr.headSha}`, "User-Agent": "stamp/0.1 (pr-review)" },
+async function viaModel(modelId: string, system: string, prompt: string, repoRoot: string, input: ReviewInput, verbose: boolean): Promise<Reviewed> {
+  const result = await reviewWithTools({
+    modelId,
+    schema: VerdictSchema,
+    system: `${system}\nFinish by calling submit_verdict with that verdict; the call ends the review.`,
+    prompt,
+    repoRoot,
+    session: `stamp-${input.pr.number}-${input.pr.headSha}`,
+    verbose,
   });
 
-  const params = {
-    model: MODEL,
-    max_tokens: 16_000,
-    max_iterations: 40,
-    system: [{ type: "text" as const, text: system, cache_control: { type: "ephemeral" as const } }],
-    tools: tools(repoRoot),
-    messages: [{ role: "user" as const, content: prompt }],
-  };
+  if (result.refused) return { verdict: "ESCALATE", reasoning: "Model declined to review.", risk: "high", issues: [], notes: [], next_steps: "Human review.", change_summary: "", run: result.run };
 
-  const run = async (structured: boolean) => {
-    const runner = client.beta.messages.toolRunner(structured ? { ...params, output_config: { format: zodOutputFormat(VerdictSchema) } } : params);
-    let final: Anthropic.Beta.BetaMessage | undefined;
-
-    for await (const message of runner) {
-      final = message;
-
-      if (verbose) for (const b of message.content) if (b.type === "tool_use") console.error(`  → ${b.name} ${JSON.stringify(b.input)}`);
-    }
-
-    if (!final) throw new Error("reviewer produced no message");
-
-    return final;
-  };
-
-  let final: Anthropic.Beta.BetaMessage;
-
-  try {
-    final = await run(true);
-  } catch (e) {
-    // Anthropic-compatible proxies serving other models don't all support structured outputs; the scaffold asks for JSON anyway.
-    if (!(e instanceof Anthropic.BadRequestError)) throw e;
-
-    if (verbose) console.error("  structured output rejected, retrying with plain JSON");
-    final = await run(false);
-  }
-
-  if (final.stop_reason === "refusal") return { verdict: "ESCALATE", reasoning: "Model declined to review.", risk: "high", issues: [], notes: [], next_steps: "Human review.", change_summary: "" };
-
-  if (final.stop_reason === "max_tokens") throw new Error("reviewer hit max_tokens");
-
-  return parseVerdict(final.content.map((b) => (b.type === "text" ? b.text : "")).join(""));
+  return { ...(result.output ?? parseVerdict(result.text)), run: result.run };
 }
