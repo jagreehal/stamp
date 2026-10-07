@@ -491,12 +491,9 @@ const CREDENTIAL_PATTERNS: [string, RegExp][] = [
   ["Stripe live key", /\b[sr]k_live_[0-9a-zA-Z]{16,}/],
 ];
 
-/**
- * Credentials added by the diff, as "path: what it looks like". Added lines only: a key being
- * deleted is a key being removed, and context lines are already in the base.
- */
-export function addedSecrets(diff: string): string[] {
-  const found: string[] = [];
+/** Lines the diff adds, with the file each one lands in. */
+function addedLines(diff: string): [file: string, line: string][] {
+  const out: [string, string][] = [];
   let file = "";
   // File headers appear only between `diff --git` and the first hunk. Inside a hunk every `+` line is
   // added content, including one whose text starts with "++" and so renders as "+++…".
@@ -506,14 +503,46 @@ export function addedSecrets(diff: string): string[] {
     if (line.startsWith("diff --git ")) inHunk = false;
     else if (line.startsWith("@@")) inHunk = true;
     else if (!inHunk && line.startsWith("+++ ")) file = line.slice(6).trim(); // "+++ b/path"
-    else if (inHunk && line.startsWith("+")) {
-      const hit = CREDENTIAL_PATTERNS.find(([, re]) => re.test(line));
-
-      if (hit && !found.some((f) => f === `${file}: ${hit[0]}`)) found.push(`${file}: ${hit[0]}`);
-    }
+    else if (inHunk && line.startsWith("+")) out.push([file, line]);
   }
 
-  return found;
+  return out;
+}
+
+/**
+ * Credentials added by the diff, as "path: what it looks like". Added lines only: a key being
+ * deleted is a key being removed, and context lines are already in the base.
+ */
+export function addedSecrets(diff: string): string[] {
+  const found = new Set<string>();
+
+  for (const [file, line] of addedLines(diff)) {
+    const hit = CREDENTIAL_PATTERNS.find(([, re]) => re.test(line));
+
+    if (hit) found.add(`${file}: ${hit[0]}`);
+  }
+
+  return [...found];
+}
+
+// Inline comments that silence a linter, type checker, scanner or coverage tool for the lines around them.
+const SUPPRESSION_RE =
+  /(?<![\w-])(eslint-disable|oxlint-disable|biome-ignore|@ts-ignore|@ts-expect-error|@ts-nocheck|noqa|nosec|nosemgrep|nolint|type:\s*ignore|pylint:\s*disable|rubocop:\s*disable|shellcheck\s+disable|hadolint\s+ignore|gitleaks:allow|istanbul\s+ignore|c8\s+ignore|v8\s+ignore|pragma:\s*no\s*cover)(?!\w)/i;
+
+const SUPPRESSION_INSTRUCTION =
+  "These added comments silence a linter, type checker, scanner or coverage tool. Read the code each one covers. REFUSE if a suppression hides a finding the change introduces, or covers more than the line that needs it without a stated reason. A narrow suppression with its reason is fine.";
+
+/** Suppression comments the diff adds, as one scrutiny flag listing "path: kind". */
+export function suppressionFlags(diff: string): ScrutinyFlag[] {
+  const found = new Set<string>();
+
+  for (const [file, line] of addedLines(diff)) {
+    const hit = SUPPRESSION_RE.exec(line);
+
+    if (hit) found.add(`${file}: ${hit[1]!.toLowerCase().replace(/\s+/g, " ")}`);
+  }
+
+  return found.size ? [{ name: "suppressions", files: [...found], instruction: SUPPRESSION_INSTRUCTION }] : [];
 }
 
 export type PRMeta = {
