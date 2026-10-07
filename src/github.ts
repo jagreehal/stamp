@@ -315,14 +315,29 @@ export function postVerdict(pr: PR, verdict: Verdict, body: string, opts: PostOp
 
 /** Deterministic redaction of anything that could be a credential before it reaches GitHub. */
 export function scrub(text: string): string {
-  for (const k of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]) {
+  const keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "TYPESAFE_API_KEY", "OTEL_EXPORTER_OTLP_HEADERS", "STAMP_SLACK_WEBHOOK"];
+
+  const values = keys.flatMap((k) => {
     const v = process.env[k];
 
-    if (v) text = text.split(v).join("[redacted]");
-  }
+    return v ? [v] : [];
+  }).sort((a, b) => b.length - a.length);
 
-  return text.replace(/\b(sk-ant-[\w-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g, "[redacted]");
+  for (const v of values) text = text.split(v).join("[redacted]");
+
+  return text.replace(/\b(sk-(?:ant-|proj-|svcacct-)?[\w-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g, "[redacted]");
 }
+
+type EvidenceValue = string | number | boolean | null | undefined | EvidenceValue[] | { [key: string]: EvidenceValue };
+
+type EvidenceBundle = { [key: string]: EvidenceValue };
+
+/** Redact string values before JSON escaping so evidence preserves its structure. */
+export const scrubJson = (value: EvidenceBundle): string => JSON.stringify(value, (_k, v) => {
+  const text = z.string().safeParse(v);
+
+  return text.success ? scrub(text.data) : v;
+}, 2);
 
 export type Sweep = {
   /** The review this run just posted; never dismissed. */

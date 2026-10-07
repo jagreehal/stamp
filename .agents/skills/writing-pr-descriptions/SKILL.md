@@ -11,7 +11,7 @@ description: >-
 
 A PR written by an agent is the first time a human has laid eyes on the code.
 The reasoning that produced it is gone unless you write it down here.
-So the body has one job: hand the reviewer the intent they would otherwise have to reconstruct from the diff.
+Give the reviewer the intent and evidence alongside the diff.
 
 ## Shape
 
@@ -19,14 +19,11 @@ So the body has one job: hand the reviewer the intent they would otherwise have 
 <one line: the effect a person sees, present tense>
 
 ## Why
-<the problem, one or two sentences; link the issue if one exists>
+<the reason for the change; link the issue if one exists>
 
 ## What changed
 - one fact per bullet, active voice, under 25 words
 - mechanism, not narration of the diff
-
-## Ruled out
-- <alternative> — <why not>, one line each. Empty section is fine; a missing one is not.
 
 ## Evidence
 - tests: <command run> → <pass/fail counts, pasted, not paraphrased>
@@ -38,8 +35,9 @@ So the body has one job: hand the reviewer the intent they would otherwise have 
 ## Rules
 
 - **Lead with the effect.** The first line is what a user or maintainer observes, not what the code does. "Exports no longer time out on large cohorts", not "Add pagination to export query".
-- **Undisclosed behavior is a refusal.** stamp compares the diff against this body. Any substantive behavior in the diff that the body does not mention gets extra scrutiny, and in risky territory (auth, billing, migrations, deps, CI, data writes, prompts fed from user input) it is refused outright. If you touched it, say it.
+- **Describe behavior changes.** Name the user-visible effect of auth, billing, migrations, dependencies, CI, data writes and prompt changes. Stamp compares those details with the diff.
 - **Get a second model's review before a human's.** If the Codex plugin is installed, run `/codex:review` (or `/codex:adversarial-review` for anything touching auth, billing, migrations, deps, CI, or data writes) before opening the PR, fix what it finds, and list the findings and their resolution under Evidence. A PR that arrives pre-reviewed by a different model is cheaper to review and is what lets stamp count "independent assurance" in risky territory.
+- **CLI review setup.** For `claude` or `codex`, use `STAMP_BUILD_CLI_IMAGE=1` and the backend credential. Record the Linux isolation probe result alongside review evidence.
 - **Evidence is pasted, never claimed.** "Tests pass" is a claim. `bun test → 41 pass, 0 fail` is evidence. If you did not run it, write "not run" and why.
 - **Test edits get their own line.** If you changed an assertion, deleted a test, or added `skip`/`only`, list each one under Evidence with the reason. A reviewer reads those hunks first; make them cheap to check.
 - **Size the body to the change.** A ten-line fix gets a four-line body. Only the first line and Evidence are mandatory.

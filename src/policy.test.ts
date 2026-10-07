@@ -7,7 +7,7 @@ import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { band, computeFamiliarity, ensureFullHistory, formatFamiliarity, parseDiff, type AuthorFamiliarity, type FamiliarityPolicy } from "./familiarity.ts";
-import { callTimeout, isOurs, scrub, sweepTargets, withBudget, type PR, type ReviewRecord } from "./github.ts";
+import { callTimeout, isOurs, scrub, scrubJson, sweepTargets, withBudget, type PR, type ReviewRecord } from "./github.ts";
 import {
   addedSecrets,
   denyCategories,
@@ -211,8 +211,25 @@ test("risk signals: request shape, flags above threshold strongest first, prompt
 });
 
 test("scrub redacts key shapes and the live key value", () => {
-  process.env.ANTHROPIC_API_KEY = "zen-abc123";
-  expect(scrub("key is zen-abc123 and sk-ant-api03-abcdefghijklmnopqrstuvwxyz and ghp_abcdefghijklmnopqrstuvwxyz1234")).toBe("key is [redacted] and [redacted] and [redacted]");
+  const keys = ["ANTHROPIC_API_KEY", "CODEX_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "TYPESAFE_API_KEY", "OTEL_EXPORTER_OTLP_HEADERS"];
+  const saved = keys.map((k) => [k, process.env[k]] as const);
+
+  try {
+    for (const [i, k] of keys.entries()) process.env[k] = `stamp-credential-canary-${i}`;
+
+    for (const k of keys) expect(scrub(`review evidence: ${process.env[k]}`)).toBe("review evidence: [redacted]");
+
+    expect(scrub("sk-proj-abcdefghijklmnopqrstuvwxyz sk-ant-api03-abcdefghijklmnopqrstuvwxyz ghp_abcdefghijklmnopqrstuvwxyz1234")).toBe("[redacted] [redacted] [redacted]");
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'token-with-"quotes"-and-\\slashes';
+    const evidence = { llm: { reasoning: process.env.CLAUDE_CODE_OAUTH_TOKEN, issues: [process.env.CODEX_API_KEY] }, count: 2, valid: true };
+
+    expect(JSON.parse(scrubJson(evidence))).toEqual({ llm: { reasoning: "[redacted]", issues: ["[redacted]"] }, count: 2, valid: true });
+  } finally {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
 });
 
 test("sanitize strips control chars and forged sentinels", () => {
@@ -761,6 +778,17 @@ describe("workflow template", () => {
 
     expect(PROVIDER_ENV.filter((k) => !env.includes(k))).toEqual([]);
     expect(env).toEqual(expect.arrayContaining(["STAMP_MODEL", "STAMP_GUARD", "STAMP_PRICING", "OTEL_EXPORTER_OTLP_ENDPOINT"]));
+  });
+
+  test("the posting run prepares CLI images and accepts either Codex credential", () => {
+    const wf = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp.yml"), "utf8"));
+    const steps = wf.jobs.review.steps;
+    const posting = steps.find((s: { run?: string }) => s.run?.includes("--post"));
+
+    expect(posting.env.STAMP_BUILD_CLI_IMAGE).toBe("1");
+    expect(posting.env.CODEX_API_KEY).toBe("${{ secrets.CODEX_API_KEY }}");
+    expect(posting.env.OPENAI_API_KEY).toBe("${{ secrets.OPENAI_API_KEY }}");
+    expect(steps.filter((s: { run?: string }) => /docker build|npm pack/.test(s.run ?? ""))).toHaveLength(0);
   });
 
   test("the digest covers every hour between weekday runs: Monday looks back over the weekend", () => {
