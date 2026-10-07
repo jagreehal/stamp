@@ -13,7 +13,8 @@
     "!src/*.test.ts",
     ".stamp",
     "templates",
-    "AGENTS.md"
+    "AGENTS.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
     "bun": ">=1.2",
