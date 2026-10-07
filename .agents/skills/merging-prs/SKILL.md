@@ -9,7 +9,7 @@ description: >-
 
 # Merging PRs
 
-The human owns the merge. stamp is a sensor, not a verdict: it tells you which PRs are safe to look at quickly and which need real attention. You may do everything up to the merge; the merge itself waits for a direct "merge it" from the user for this specific PR.
+Prepare the PR, read Stamp’s verdict and wait for the user’s instruction to merge that PR.
 
 `<n>` is the PR number.
 
@@ -20,6 +20,8 @@ gh pr view <n> --json state,isDraft,mergeable,reviewDecision,statusCheckRollup,l
 ```
 
 Stop and report if: draft, `CONFLICTING`, any check failing, or `reviewDecision` is `CHANGES_REQUESTED`. Fix what you can (rebase, CI) and re-check; never `--no-verify`, never edit a workflow or lower a threshold to get green.
+
+For CLI review workflows, set `STAMP_BUILD_CLI_IMAGE=1` on the posting run. Stamp handles retention or withdrawal before image preparation. Read the verdict and checks on the current head.
 
 ## 2. Get the stamp verdict
 
@@ -34,7 +36,7 @@ Label mode: `gh pr edit <n> --add-label stamp`. All-PRs mode: it already ran; re
 
 An approval survives a base-branch merge that leaves the PR's diff byte-identical, so you need no re-review after updating the branch. Comment `/stamp` to force a fresh review.
 
-Never argue with a gate. A deny-list or size refusal is not a bug to work around: do not split the PR into pseudo-scopes, move files, rename paths, or add an `AGENT_APPROVALS.md` to dodge a pattern or raise a ceiling. Say what was denied and let the human decide.
+Respect the gate’s scope and size policy. Keep file paths and scope intact, report the gate result, and leave policy changes to the maintainer.
 
 ## 3. Merge
 

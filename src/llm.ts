@@ -94,7 +94,7 @@ export function languageModel(id: string, session: string): LanguageModel {
 
       if (/^(gpt|grok)-/.test(model)) return createOpenAI({ baseURL, apiKey, headers }).responses(model);
 
-      if (/^claude-/.test(model)) return createAnthropic({ baseURL, apiKey, headers })(model);
+      if (model.startsWith("claude-")) return createAnthropic({ baseURL, apiKey, headers })(model);
 
       return createOpenAICompatible({ name: provider, baseURL, apiKey, headers })(model);
     }

@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
-import { callTimeout, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, withBudget, type PR, type Verdict } from "./github.ts";
+import { callTimeout, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
 import {
   DEFAULTS_DIR,
   detectOwnership,
@@ -141,7 +141,7 @@ if (opts.post) {
         ...finished(),
       };
 
-      if (opts.json) writeFileSync(opts.json, JSON.stringify(evidence, null, 2));
+      if (opts.json) writeFileSync(opts.json, scrubJson(evidence));
       process.exit(0);
     }
 
@@ -320,13 +320,13 @@ if (opts["dry-run"]) {
   }
 }
 
-console.log(`\n${verdict}: ${body}`);
+console.log(scrub(`\n${verdict}: ${body}`));
 
-if (llm?.issues.length) console.log(llm.issues.map((i) => `  - ${i}`).join("\n"));
+if (llm?.issues.length) console.log(scrub(llm.issues.map((i) => `  - ${i}`).join("\n")));
 
-if (llm?.next_steps) console.log(`next: ${llm.next_steps}`);
+if (llm?.next_steps) console.log(scrub(`next: ${llm.next_steps}`));
 
-if (opinion) console.log(`second opinion (${opinion.backend}): ${opinion.verdict} — ${opinion.reasoning}`);
+if (opinion) console.log(scrub(`second opinion (${opinion.backend}): ${opinion.verdict}, ${opinion.reasoning}`));
 
 for (const run of [llm?.run, opinion?.run]) if (run) console.log(`reviewer run: ${summarizeRun(run)}`);
 
@@ -355,7 +355,7 @@ const evidence = {
   ...finished(),
 };
 
-if (opts.json) writeFileSync(opts.json, JSON.stringify(evidence, null, 2));
+if (opts.json) writeFileSync(opts.json, scrubJson(evidence));
 
 if (opts.post) {
   const post = { cwd: repoRoot, botLogin: me, started: STARTED, triggerLabel: opts.label };

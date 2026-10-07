@@ -58,22 +58,13 @@ jobs:
       #     role-to-assume: ${{ vars.AWS_ROLE_ARN }}
       #     aws-region: ${{ vars.AWS_REGION }}
       - uses: oven-sh/setup-bun@v2
-      # Both CLI reviewers require Docker isolation. Build only trusted package files, never the PR checkout.
-      - name: Build isolated CLI reviewers
-        if: contains(vars.STAMP_BACKEND, 'claude') || contains(vars.STAMP_BACKEND, 'codex') || contains(vars.STAMP_BACKENDS, 'claude') || contains(vars.STAMP_BACKENDS, 'codex')
-        shell: bash
-        run: |
-          build_dir="$(mktemp -d)"
-          npm pack "@jagreehal/stamp@$STAMP_VERSION" --pack-destination "$build_dir"
-          tar -xzf "$build_dir"/jagreehal-stamp-*.tgz -C "$build_dir" package/templates/reviewer.Dockerfile
-          mkdir "$build_dir/context"
-          docker build -f "$build_dir/package/templates/reviewer.Dockerfile" -t stamp-reviewer:local "$build_dir/context"
       - run: bunx "@jagreehal/stamp@$STAMP_VERSION" "$PR" --post --json "$RUNNER_TEMP/stamp.json"
         env:
           PR: ${{ github.event.pull_request.number || github.event.issue.number }}
           GH_TOKEN: ${{ github.token }}
           STAMP_BOT_LOGIN: github-actions[bot]
           STAMP_CLI_IMAGE: stamp-reviewer:local
+          STAMP_BUILD_CLI_IMAGE: '1' # Stamp prepares the packaged image after approval handling and gates
           STAMP_BACKEND: ${{ vars.STAMP_BACKEND }}           # empty = api; "claude" for Claude Code
           STAMP_BACKENDS: ${{ vars.STAMP_BACKENDS }}         # e.g. "claude,codex": a second opinion on non-trivial approvals (needs both auths)
           # api backend. STAMP_MODEL picks the provider: claude-opus-5 (Anthropic), bedrock:zai.glm-4.7-flash,
@@ -93,7 +84,8 @@ jobs:
           STAMP_MODEL: ${{ vars.STAMP_MODEL }}               # empty = claude-opus-5; qwen3.8-max on Go
           # claude backend
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }} # isolated codex backend
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           STAMP_CODEX_MODEL: ${{ vars.STAMP_CODEX_MODEL }}
           STAMP_CLAUDE_MODEL: ${{ vars.STAMP_CLAUDE_MODEL }} # empty = Claude Code's default
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }} # optional: Jev risk signals before the review
