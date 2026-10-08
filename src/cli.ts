@@ -33,7 +33,8 @@ import {
   type ScopeBudget,
 } from "./policy.ts";
 import { tryRetainApproval, type RetentionResult } from "./retention.ts";
-import { stopTelemetry, summarizeRun } from "./llm.ts";
+import { beginReviewSpan, endReviewSpan, inReviewSpan, summarizeRun, type ReviewAttributes } from "./llm.ts";
+import { egressRefusals } from "./isolated-cli.ts";
 import { BACKENDS, combine, review, secondOpinionNeeded, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
 
@@ -103,6 +104,8 @@ const me = process.env.STAMP_BOT_LOGIN || whoami(); // the login our verdicts po
 
 opts.label ||= process.env.STAMP_LABEL || undefined;
 
+await beginReviewSpan(STARTED);
+
 let retention: RetentionResult = { kept: false, reason: "not_posting" };
 
 // Retention is the deliberate exception to dismiss-first. It keeps a standing approval, and skips the
@@ -143,6 +146,7 @@ if (opts.post) {
       };
 
       if (opts.json) writeFileSync(opts.json, scrubJson(evidence));
+      await endReviewSpan(reviewAttributes(retention.pr, "APPROVED", { "stamp.retention": "kept" }), false);
       process.exit(0);
     }
 
@@ -301,7 +305,7 @@ if (opts["dry-run"]) {
   const guidance = loadGuidance(repoRoot, trustedRef);
 
   try {
-    llm = await review(primary!, input, guidance, exploreRoot, opts.verbose);
+    llm = await inReviewSpan(() => review(primary!, input, guidance, exploreRoot, opts.verbose));
     verdict = VERDICT_OF[llm.verdict];
     body = llm.reasoning;
 
@@ -309,7 +313,7 @@ if (opts["dry-run"]) {
     // reviewer never sees the first verdict, so it cannot anchor on it. Agreement is the independent
     // assurance the guidance asks for in risky territory; disagreement escalates with both reasonings.
     if (second && secondOpinionNeeded(llm, flags.length + scrutiny.length + manifests.length + signalFlags.length > 0)) {
-      opinion = { backend: second, ...(await review(second, input, guidance, exploreRoot, opts.verbose)) };
+      opinion = { backend: second, ...(await inReviewSpan(() => review(second, input, guidance, exploreRoot, opts.verbose))) };
       const combined = combine(primary!, llm, opinion);
       verdict = VERDICT_OF[combined.verdict];
       llm = combined.llm;
@@ -330,6 +334,10 @@ if (llm?.next_steps) console.log(scrub(`next: ${llm.next_steps}`));
 if (opinion) console.log(scrub(`second opinion (${opinion.backend}): ${opinion.verdict}, ${opinion.reasoning}`));
 
 for (const run of [llm?.run, opinion?.run]) if (run) console.log(`reviewer run: ${summarizeRun(run)}`);
+
+const egressDenied = egressRefusals([llm?.egress, opinion?.egress]);
+
+if (egressDenied) console.log(`reviewer egress refused: ${egressDenied}`);
 
 const folderGrants = (kind: "max_files" | "max_lines", scopes: ScopeBudget[]) =>
   scopes.flatMap((s) => (s.path === null ? [] : [{ path: s.path, kind, ceiling: s.ceiling, files: s.files.length }]));
@@ -370,7 +378,28 @@ if (opts.post) {
   if (posted !== null) reconcilePosted(pr, posted, verdict, post);
 }
 
-await stopTelemetry();
+const costs = [llm?.run?.costUsd, opinion?.run?.costUsd].flatMap((c) => (c === null || c === undefined ? [] : [c]));
+
+await endReviewSpan(
+  reviewAttributes(pr, verdict, {
+    "stamp.retention": retention.reason,
+    "stamp.tier": [gated.tier, gated.sub].filter(Boolean).join(" / "),
+    "stamp.gates.failed": gated.gates.filter((g) => !g.passed).map((g) => g.gate),
+    "stamp.denied": gated.denied,
+    "stamp.backends": BACKENDS,
+    "stamp.title_flags": flags,
+    "stamp.scrutiny": scrutiny.map((s) => s.name),
+    "stamp.signal_flags": signalFlags,
+    "stamp.familiarity": familiarity?.band,
+    "stamp.risk": llm?.risk,
+    "stamp.second_opinion": opinion?.verdict,
+    "stamp.cost_usd": costs.length ? costs.reduce((a, b) => a + b, 0) : undefined,
+    "stamp.egress.denied_host": [llm, opinion].reduce((n, r) => n + (r?.egress?.deniedHost ?? 0), 0),
+    "stamp.egress.denied_name": [llm, opinion].reduce((n, r) => n + (r?.egress?.deniedName ?? 0), 0),
+    "stamp.egress.refused": [llm, opinion].reduce((n, r) => n + (r?.egress?.refused ?? 0), 0),
+  }),
+  verdict === "ERROR",
+);
 
 process.exit(verdict === "APPROVED" ? 0 : 1);
 
@@ -492,6 +521,11 @@ function policySource(trustedRef: string) {
 /** The fields every evidence record starts with, on the kept-approval path and the review path alike. */
 function baseEvidence(pr: PR) {
   return { stamp: VERSION, pr: pr.number, head: pr.headSha, base: `${pr.baseRef}@${pr.baseSha}`, author: pr.author, title: pr.title };
+}
+
+/** The `stamp.review` span's attributes: who and what was reviewed, the verdict, and the run's own detail. */
+function reviewAttributes(pr: PR, verdict: Verdict, detail: ReviewAttributes): ReviewAttributes {
+  return { "stamp.version": VERSION, "stamp.verdict": verdict, "vcs.repository.name": pr.repo, "vcs.change.id": String(pr.number), "vcs.ref.head.revision": pr.headSha, ...detail };
 }
 
 function finished() {

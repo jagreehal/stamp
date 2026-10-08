@@ -387,7 +387,19 @@ The `api` backend runs its repository-confined tools in-process and needs no Doc
 
 Every `api` review runs under `STAMP_GUARD`, written in autotel's rule shorthand. The default is `budget:$2,tokens:3m,loop:4/12,max-tools:80,timeout:15m`: a cost ceiling, a token ceiling, a spin-loop rule (the same call 4 times in 12), a tool-call cap, and a timeout that also cuts off a model call in flight. A rule that fires ends the review as ERROR. A model without a price keeps its token ceiling; give it a price with `STAMP_PRICING='{"kimi-k3":{"inputPer1M":3,"outputPer1M":15}}'`.
 
-The mechanics table names the model, its tool calls, the cost and the time (`bedrock:zai.glm-4.7-flash · 9 tool calls · $0.0042 · 6.2s`). The `--json` evidence carries the full run record: steps, tool calls and failures, tokens, cost and the limits it ran under. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and each review also becomes a trace of `gen_ai.*` spans, one per model call and tool call.
+The mechanics table names the model, its tool calls, the cost and the time (`bedrock:zai.glm-4.7-flash · 9 tool calls · $0.0042 · 6.2s`). The `--json` evidence carries the full run record: steps, tool calls and failures, tokens, cost and the limits it ran under. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and each run also becomes a trace. One `stamp.review` span covers the run from start to verdict, and the `gen_ai.*` spans, one per model call and tool call, nest under it. Its attributes make one wide event per review, so you can chart approval rates, refusal reasons and ERROR runs by repository:
+
+| Attribute | Holds |
+| --- | --- |
+| `stamp.verdict` | APPROVED, REFUSED, ESCALATE or ERROR; an ERROR run also marks the span failed |
+| `vcs.repository.name`, `vcs.change.id`, `vcs.ref.head.revision` | the repository, the PR number and the reviewed head |
+| `stamp.tier`, `stamp.gates.failed`, `stamp.denied` | the size tier, the gates that failed and the deny-list categories hit |
+| `stamp.retention` | `kept` when a standing approval survived, otherwise why it was dismissed |
+| `stamp.backends`, `stamp.risk`, `stamp.second_opinion`, `stamp.cost_usd` | who reviewed, the reviewer's risk grade, the second verdict and the run's model cost |
+| `stamp.title_flags`, `stamp.scrutiny`, `stamp.signal_flags`, `stamp.familiarity` | the flags and familiarity band the reviewer was given |
+| `stamp.egress.denied_host`, `stamp.egress.denied_name`, `stamp.egress.refused` | how many connections the egress proxy refused a CLI reviewer: to another host, with another TLS name, or from outside the review network |
+
+Without the variable, stamp loads no OpenTelemetry code. CLI reviews also print the proxy's refusal counts as `reviewer egress refused: ...` and keep them in the `--json` evidence under `llm.egress`. Stamp records counts, never the hosts or TLS names: the reviewer chooses those, so a hijacked one could encode a secret in them. A refused connection to another host can be a CLI's routine call home (Codex asks for `chatgpt.com`); one with another TLS name is a fronting attempt. The proxy's own log, which names each target, stays in the container and is removed with it.
 
 The agent backends load nothing the PR ships as configuration. [AGENTS.md](AGENTS.md) records how stamp isolates each one and what was tested.
 

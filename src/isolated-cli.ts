@@ -115,6 +115,39 @@ server.listen(Number(process.env.STAMP_EGRESS_PORT || ${3128}), "0.0.0.0", () =>
 
 export type Egress = { network: string; proxyUrl: string; logs: () => string; stop: () => void };
 
+/**
+ * How many connections the proxy let through and refused, by kind, during one review. A refusal can mean a
+ * hijacked reviewer reaching out. Counts only: the target and the TLS name are chosen by the reviewer, so a
+ * hijacked one could encode a secret in them, and logs, evidence and telemetry would carry it out.
+ */
+export type EgressDecisions = { allowed: number; deniedHost: number; deniedName: number; refused: number };
+
+/** Count the proxy's decision lines: `allow <target>`, `deny <target>`, `deny <target> sni <name>`, `refuse <address>`. */
+export function egressDecisions(logs: string): EgressDecisions {
+  const counts = { allowed: 0, deniedHost: 0, deniedName: 0, refused: 0 };
+
+  for (const line of logs.split("\n")) {
+    if (line.startsWith("allow ")) counts.allowed++;
+    else if (line.startsWith("deny ")) counts[/ sni /.test(line) ? "deniedName" : "deniedHost"]++;
+    else if (line.startsWith("refuse ")) counts.refused++;
+  }
+
+  return counts;
+}
+
+/** Refusals across reviews, as one line: "2 to another host, 1 with another TLS name", or "" for none. */
+export function egressRefusals(decisions: (EgressDecisions | undefined)[]): string {
+  const sum = (k: "deniedHost" | "deniedName" | "refused") => decisions.reduce((n, d) => n + (d?.[k] ?? 0), 0);
+
+  const parts = [
+    [sum("deniedHost"), "to another host"],
+    [sum("deniedName"), "with another TLS name"],
+    [sum("refused"), "from outside the review network"],
+  ] as const;
+
+  return parts.flatMap(([n, what]) => (n ? [`${n} ${what}`] : [])).join(", ");
+}
+
 const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /**
@@ -238,7 +271,7 @@ export function isolatedCli(backend: "claude" | "codex", args: string[], options
 
     if (run.error || run.status !== 0) throw new Error(`${backend} isolated review failed (${run.status ?? "launch"}); Docker and a trusted STAMP_CLI_IMAGE are required. ${run.error?.message ?? run.stderr.slice(0, 500)}`);
 
-    return { stdout: run.stdout, verdict: backend === "codex" ? readCliVerdict(path.join(output, "verdict.json")) : null };
+    return { stdout: run.stdout, verdict: backend === "codex" ? readCliVerdict(path.join(output, "verdict.json")) : null, egress: egressDecisions(egress.logs()) };
   } finally {
     // Killing the client on timeout does not necessarily stop its container.
     spawnSync("docker", ["rm", "--force", name], { env, stdio: "ignore", timeout: 10_000 });

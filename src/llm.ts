@@ -7,6 +7,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { gateway, generateText, hasToolCall, stepCountIs, tool, type LanguageModel, type ModelMessage, type StepResult, type ToolSet } from "ai";
+import type { runWithSpan, Span, SpanStatusCode } from "autotel";
 import { BEDROCK_PRICING } from "autotel-bedrock";
 import { estimateLLMCost, registerModelPricing } from "autotel-genai/cost";
 import { createGenAiGuard, parseGuardRules } from "autotel-genai/guard";
@@ -343,4 +344,38 @@ export async function startTelemetry(): Promise<void> {
 /** Flush and stop telemetry, if it started. */
 export async function stopTelemetry(): Promise<void> {
   if (telemetry) await (await telemetry).shutdown();
+}
+
+type ReviewSpan = { span: Span; runWithSpan: typeof runWithSpan; error: typeof SpanStatusCode.ERROR };
+
+let reviewSpan: ReviewSpan | null = null;
+
+/**
+ * Open the `stamp.review` span for this run, backdated to its start, when an OTLP endpoint is configured.
+ * Model and tool spans from the review nest under it; its attributes are set once, at the verdict.
+ */
+export async function beginReviewSpan(started: string): Promise<void> {
+  if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT) return;
+  await startTelemetry();
+  const { getTracer, runWithSpan, SpanStatusCode } = await import("autotel");
+
+  reviewSpan = { span: getTracer("stamp").startSpan("stamp.review", { startTime: new Date(started) }), runWithSpan, error: SpanStatusCode.ERROR };
+}
+
+/** Run `fn` with the review span active, so the spans it opens are its children. */
+export const inReviewSpan = <T>(fn: () => T): T => (reviewSpan ? reviewSpan.runWithSpan(reviewSpan.span, fn) : fn());
+
+export type ReviewAttributes = Record<string, string | number | boolean | string[] | undefined>;
+
+/** Close the review span with one wide event's worth of attributes, then flush. ERROR marks the span failed. */
+export async function endReviewSpan(attributes: ReviewAttributes, failed: boolean): Promise<void> {
+  if (reviewSpan) {
+    for (const [key, value] of Object.entries(attributes)) if (value !== undefined) reviewSpan.span.setAttribute(key, value);
+
+    if (failed) reviewSpan.span.setStatus({ code: reviewSpan.error });
+    reviewSpan.span.end();
+    reviewSpan = null;
+  }
+
+  await stopTelemetry();
 }
