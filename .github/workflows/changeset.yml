@@ -1,0 +1,30 @@
+name: Changeset
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  changeset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - run: bun install --frozen-lockfile
+
+      - name: Check for a changeset
+        run: |
+          # The release PR consumes changesets and adds none: deleted .changeset/*.md marks it.
+          if git diff --diff-filter=D --name-only origin/main...HEAD | grep -qE '^\.changeset/.+\.md$'; then
+            echo "Release PR: changesets consumed."
+            exit 0
+          fi
+          bunx changeset status --since=origin/main
