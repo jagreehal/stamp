@@ -68,11 +68,14 @@ jobs:
           STAMP_BACKEND: ${{ vars.STAMP_BACKEND }}           # empty = api; "claude" for Claude Code
           STAMP_BACKENDS: ${{ vars.STAMP_BACKENDS }}         # e.g. "claude,codex": a second opinion on non-trivial approvals (needs both auths)
           # api backend. STAMP_MODEL picks the provider: claude-opus-5 (Anthropic), bedrock:zai.glm-4.7-flash,
-          # opencode-go:kimi-k3, opencode:claude-sonnet-5-5, openrouter:moonshotai/kimi-k3, gateway:anthropic/claude-sonnet-5.5.
+          # opencode-go:kimi-k3, opencode:claude-sonnet-5-5, openrouter:moonshotai/kimi-k3, groq:openai/gpt-oss-120b,
+          # mistral:mistral-small-latest, gateway:anthropic/claude-sonnet-5.5.
           # Set the secret for that provider; the others stay empty.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}         # opencode-go:, opencode:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}     # openrouter:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}                 # groq:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}           # mistral:
           AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}     # gateway: (Vercel AI Gateway)
           AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }} # bedrock: with an API key; or leave empty and use OIDC (step above)
           AWS_REGION: ${{ vars.AWS_REGION }}                        # bedrock:

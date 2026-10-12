@@ -5,6 +5,8 @@ import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import { createBedrockAnthropic } from "@ai-sdk/amazon-bedrock/anthropic";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
+import { createGroq } from "@ai-sdk/groq";
+import { createMistral } from "@ai-sdk/mistral";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { gateway, generateText, hasToolCall, stepCountIs, tool, type LanguageModel, type ModelMessage, type StepResult, type ToolSet } from "ai";
 import type { runWithSpan, Span, SpanStatusCode } from "autotel";
@@ -46,7 +48,7 @@ function loadPricing(): void {
   pricingLoadedFor = process.env.STAMP_PRICING;
 }
 
-const PROVIDERS = ["anthropic", "bedrock", "opencode", "opencode-go", "openrouter", "gateway"] as const;
+const PROVIDERS = ["anthropic", "bedrock", "opencode", "opencode-go", "openrouter", "groq", "mistral", "gateway"] as const;
 
 type Provider = (typeof PROVIDERS)[number];
 
@@ -69,7 +71,7 @@ export function anthropicBaseURL(raw = process.env.ANTHROPIC_BASE_URL): string |
 }
 
 /** Every variable a provider reads its credentials or endpoint from. The workflow template passes each one. */
-export const PROVIDER_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"];
+export const PROVIDER_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"];
 
 const OPENCODE = { opencode: "https://opencode.ai/zen/v1", "opencode-go": "https://opencode.ai/zen/go/v1" } as const;
 
@@ -102,6 +104,10 @@ export function languageModel(id: string, session: string): LanguageModel {
 
     case "openrouter":
       return createOpenAICompatible({ name: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKey: process.env.OPENROUTER_API_KEY, headers })(model);
+    case "groq":
+      return createGroq({ headers })(model);
+    case "mistral":
+      return createMistral({ headers })(model);
     case "gateway":
       return gateway(model);
     case "anthropic":

@@ -34,6 +34,8 @@ describe("model ids", () => {
     expect(parseModelId("bedrock:anthropic.claude-3-5-sonnet-20241022-v2:0")).toEqual({ provider: "bedrock", model: "anthropic.claude-3-5-sonnet-20241022-v2:0" });
     expect(parseModelId("opencode-go:deepseek-v4-flash")).toEqual({ provider: "opencode-go", model: "deepseek-v4-flash" });
     expect(parseModelId("openrouter:moonshotai/kimi-k3")).toEqual({ provider: "openrouter", model: "moonshotai/kimi-k3" });
+    expect(parseModelId("groq:openai/gpt-oss-120b")).toEqual({ provider: "groq", model: "openai/gpt-oss-120b" });
+    expect(parseModelId("mistral:mistral-small-latest")).toEqual({ provider: "mistral", model: "mistral-small-latest" });
     expect(parseModelId("claude-opus-5")).toEqual({ provider: "anthropic", model: "claude-opus-5" });
     expect(parseModelId("qwen3.8-max")).toEqual({ provider: "anthropic", model: "qwen3.8-max" });
   });
