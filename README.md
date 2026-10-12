@@ -353,6 +353,8 @@ flowchart LR
 | `bedrock:zai.glm-4.7-flash`, `bedrock:us.anthropic.claude-sonnet-5-5` | Amazon Bedrock (Claude through InvokeModel, the rest through Converse) | `AWS_BEARER_TOKEN_BEDROCK` or OIDC credentials, and `AWS_REGION` |
 | `opencode-go:kimi-k3`, `opencode:claude-sonnet-5-5` | OpenCode Go and Zen | `OPENCODE_API_KEY` |
 | `openrouter:moonshotai/kimi-k3` | OpenRouter | `OPENROUTER_API_KEY` |
+| `groq:openai/gpt-oss-120b` | Groq | `GROQ_API_KEY` |
+| `mistral:mistral-small-latest` | Mistral | `MISTRAL_API_KEY` |
 | `gateway:anthropic/claude-sonnet-5.5` | Vercel AI Gateway | `AI_GATEWAY_API_KEY` |
 
 ```bash
@@ -360,6 +362,8 @@ STAMP_MODEL=claude-opus-5                       ANTHROPIC_API_KEY=sk-ant-...
 STAMP_MODEL=bedrock:zai.glm-4.7-flash           AWS_BEARER_TOKEN_BEDROCK=...  AWS_REGION=eu-west-1
 STAMP_MODEL=opencode-go:deepseek-v4-flash       OPENCODE_API_KEY=...
 STAMP_MODEL=openrouter:moonshotai/kimi-k3       OPENROUTER_API_KEY=...
+STAMP_MODEL=groq:openai/gpt-oss-120b            GROQ_API_KEY=...
+STAMP_MODEL=mistral:mistral-small-latest        MISTRAL_API_KEY=...
 STAMP_BACKEND=claude                            # CLAUDE_CODE_OAUTH_TOKEN required
 STAMP_BACKEND=codex                             # CODEX_API_KEY or OPENAI_API_KEY required
 ```

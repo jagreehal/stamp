@@ -218,7 +218,9 @@ test("risk signals: request shape, flags above threshold strongest first, prompt
 });
 
 test("scrub redacts key shapes and the live key value", () => {
-  const keys = ["ANTHROPIC_API_KEY", "CODEX_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "TYPESAFE_API_KEY", "OTEL_EXPORTER_OTLP_HEADERS"];
+  // Every provider credential, so a new provider's key fails here until scrub redacts it.
+  const credentials = PROVIDER_ENV.filter((k) => k !== "ANTHROPIC_BASE_URL" && k !== "AWS_REGION");
+  const keys = [...new Set([...credentials, "CODEX_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "TYPESAFE_API_KEY", "OTEL_EXPORTER_OTLP_HEADERS"])];
   const saved = keys.map((k) => [k, process.env[k]] as const);
 
   try {
@@ -226,7 +228,7 @@ test("scrub redacts key shapes and the live key value", () => {
 
     for (const k of keys) expect(scrub(`review evidence: ${process.env[k]}`)).toBe("review evidence: [redacted]");
 
-    expect(scrub("sk-proj-abcdefghijklmnopqrstuvwxyz sk-ant-api03-abcdefghijklmnopqrstuvwxyz ghp_abcdefghijklmnopqrstuvwxyz1234")).toBe("[redacted] [redacted] [redacted]");
+    expect(scrub("sk-proj-abcdefghijklmnopqrstuvwxyz sk-ant-api03-abcdefghijklmnopqrstuvwxyz ghp_abcdefghijklmnopqrstuvwxyz1234 gsk_abcdefghijklmnopqrstuvwxyz1234")).toBe("[redacted] [redacted] [redacted] [redacted]");
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'token-with-"quotes"-and-\\slashes';
     const evidence = { llm: { reasoning: process.env.CLAUDE_CODE_OAUTH_TOKEN, issues: [process.env.CODEX_API_KEY] }, count: 2, valid: true };
 
