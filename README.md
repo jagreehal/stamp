@@ -241,6 +241,8 @@ Agents loosen these files to reach green, and a linter cannot see its own config
 
 stamp also scans added lines for suppression comments: `eslint-disable`, `oxlint-disable`, `biome-ignore`, `@ts-ignore`, `@ts-expect-error`, `noqa`, `nosec`, `nosemgrep`, `nolint`, `type: ignore`, coverage ignores and their kin. Each one reaches the reviewer as a `suppressions` scrutiny flag naming the file and the kind. The reviewer reads the code each one covers, refuses a suppression that hides a finding the change introduces, and approves a narrow one with its reason. Like any scrutiny flag, it also brings in the second reviewer when one is configured.
 
+A PR that closes an issue labelled `incident` (a failure seen on the default branch or in production, often opened by shepherd's `incident` skill) gets an `incident` scrutiny flag. The reviewer refuses it unless a test reproduces the reported failure (one the diff adds, or for a red default branch the test already failing there), and refuses a fix that hides the symptom: an error swallowed, a retry or timeout raised around it, the alert removed, the test skipped.
+
 The shipped `review_agents` group covers what review and fix agents follow on later PRs: `.shepherd/`, `.claude/skills/`, `.agents/skills/`, `AGENTS.md`, `CLAUDE.md` and `docs/adr/`. The reviewer must REFUSE a removed lens, a narrowed `applies_to`, a deleted or weakened rule, loosened Fix guidance or a relaxed house rule. It approves additions and tightening.
 
 ### Team rules
@@ -270,7 +272,11 @@ rules:
     skill: .stamp/rules/observability       # a directory holding SKILL.md, or a .md file
     applies_to: ['src/**/*.ts']             # optional; without it the pack applies to every changed file
     on_break: escalate                      # refuse, escalate (default) or note
+  payments:
+    skill: github:acme/policy/lenses/payments@0123456789abcdef0123456789abcdef01234567   # another repository, pinned
 ```
+
+A pack can live in an organisation's policy repository, pinned to a full commit: `github:owner/repo/<path>@<sha>`. stamp reads it through gh at that commit, and only when that commit is on the policy repository's default branch (GitHub serves fork commits through the parent repository too), so the shepherd pack that carries the lens and the stamp policy that gates on it name the same file. A branch or tag is rejected, since it can move. A private policy repository needs the workflow's `GH_TOKEN` to be a token that can read it; the default `GITHUB_TOKEN` reads only this repository, and a pack it cannot read is skipped with a warning. No PR in this repository can edit a pinned pack, so it is not part of the stamp_policy deny check; changing it means moving the pin, which edits `.stamp/policy.yml`.
 
 The observability pack checks that outbound calls carry a span or log, that errors keep their cause, that logs are structured and free of secrets and personal data, that dropped data is counted, that labels stay bounded, and that a user-facing change emits a signal.
 

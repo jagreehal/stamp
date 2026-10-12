@@ -26,7 +26,9 @@ import {
   readTrusted,
   resolveSizeOverrides,
   runGates,
+  incidentFlags,
   ruleFlags,
+  type FetchPinned,
   scrutinyFlags,
   suppressionFlags,
   titleFlags,
@@ -251,11 +253,33 @@ const gateVerdict = gated.gates.every((g) => g.passed) ? "PASSED" : "DENIED";
 
 const flags = titleFlags(policy, pr.title, gated.denied);
 
-const rules = ruleFlags(policy, pr.files.map((f) => f.filename), (rel) => readTrusted(repoRoot, rel, trustedRef));
+// A pinned pack in another repository comes through gh, so a private one needs a GH_TOKEN that can read it.
+// GitHub serves any commit in a fork network through the parent repository, so the commit must also be on the
+// pack repository's default branch: otherwise a pin could name a commit someone pushed to a fork.
+const fetchPinned: FetchPinned = (owner, repo, file, sha) => {
+  const api = (...args: string[]) => execFileSync("gh", ["api", ...args], { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: callTimeout() }).trim();
 
-for (const m of rules.missing) console.error(`rule pack not found on the default branch, skipped: ${m}`);
+  try {
+    const branch = api(`repos/${owner}/${repo}`, "--jq", ".default_branch");
+    const status = api(`repos/${owner}/${repo}/compare/${branch}...${sha}`, "--jq", ".status");
 
-const scrutiny = [...scrutinyFlags(policy, pr.files.map((f) => f.filename)), ...suppressionFlags(pr.diff), ...rules.flags];
+    if (status !== "behind" && status !== "identical") {
+      console.error(`rule pack ${owner}/${repo}@${sha.slice(0, 7)}: that commit is not on ${branch}, so it is not trusted`);
+
+      return null;
+    }
+
+    return api("-H", "Accept: application/vnd.github.raw", `repos/${owner}/${repo}/contents/${file}?ref=${sha}`);
+  } catch {
+    return null;
+  }
+};
+
+const rules = ruleFlags(policy, pr.files.map((f) => f.filename), (rel) => readTrusted(repoRoot, rel, trustedRef), fetchPinned);
+
+for (const m of rules.missing) console.error(`rule pack not found (default branch, or the pinned repository and commit), skipped: ${m}`);
+
+const scrutiny = [...scrutinyFlags(policy, pr.files.map((f) => f.filename)), ...suppressionFlags(pr.diff), ...incidentFlags(pr.issues ?? []), ...rules.flags];
 
 // Jev risk signals: advisory, before the reviewer, skipped without TYPESAFE_API_KEY. A failure here
 // loses a signal, not the review, so it is logged and the run goes on without it.
