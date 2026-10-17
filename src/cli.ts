@@ -13,11 +13,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
-import { callTimeout, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
+import { callTimeout, checkRuns, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
 import {
   DEFAULTS_DIR,
   detectOwnership,
   inFlightBots,
+  inFlightChecks,
   loadGuidance,
   loadPolicy,
   manifestScriptEdits,
@@ -31,16 +32,18 @@ import {
   type FetchPinned,
   scrutinyFlags,
   suppressionFlags,
+  testMarkerFlags,
   titleFlags,
   type Gate,
   type Policy,
   type ScopeBudget,
 } from "./policy.ts";
 import { tryRetainApproval, type RetentionResult } from "./retention.ts";
-import { beginReviewSpan, endReviewSpan, inReviewSpan, summarizeRun, type ReviewAttributes } from "./llm.ts";
+import { beginReviewSpan, endReviewSpan, inReviewSpan, reviewMeasurements, summarizeRun, type ReviewAttributes } from "./llm.ts";
 import { egressRefusals } from "./isolated-cli.ts";
 import { BACKENDS, combine, review, secondOpinionNeeded, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
+import { ghStoryDeps, loadStoryEvidence, storyEvidenceRecord, type StoryEvidence } from "./stories.ts";
 
 const VERSION = "0.1.0";
 
@@ -225,7 +228,20 @@ const policy = loadPolicy(repoRoot, trustedRef);
 // belong in the prompt, so hold for them. Bounded, and never terminal: nothing re-triggers the
 // workflow when a bot finishes, so a run that stopped here would never come back. Greptile reacts
 // within seconds of a push, which is faster than this run reaches this line every time.
-const inFlight = () => inFlightBots(pr.reactions, policy.reviewer_bots, STALE_EYES_MS);
+// Review services such as Claude Code Review report as a check run on the head instead; a failed lookup waits for none.
+const checksInFlight = () => {
+  try {
+    return inFlightChecks(policy.reviewer_checks.flatMap((name) => checkRuns(pr.repo, pr.headSha, name, repoRoot)), policy.reviewer_checks);
+  } catch (e) {
+    console.error(`reviewer check runs unavailable, reviewing without waiting for them: ${e instanceof Error ? e.message.split("\n")[0] : e}`);
+
+    return [];
+  }
+};
+
+let checking = checksInFlight();
+
+const inFlight = () => [...inFlightBots(pr.reactions, policy.reviewer_bots, STALE_EYES_MS), ...checking];
 
 const waitUntil = Date.now() + REVIEWER_WAIT_MS;
 
@@ -237,6 +253,7 @@ while (inFlight().length && Date.now() < waitUntil) {
   if (fresh.headSha !== pr.headSha) break; // a new head: this run is superseded, and postVerdict will refuse to post
 
   pr = fresh; // their comments are part of the review input, so take the refreshed PR, not just the reactions
+  checking = checksInFlight();
 }
 
 if (inFlight().length) console.log(`reviewing without ${inFlight().join(", ")}: still going after ${REVIEWER_WAIT_MS / 60_000}m`);
@@ -279,7 +296,7 @@ const rules = ruleFlags(policy, pr.files.map((f) => f.filename), (rel) => readTr
 
 for (const m of rules.missing) console.error(`rule pack not found (default branch, or the pinned repository and commit), skipped: ${m}`);
 
-const scrutiny = [...scrutinyFlags(policy, pr.files.map((f) => f.filename)), ...suppressionFlags(pr.diff), ...incidentFlags(pr.issues ?? []), ...rules.flags];
+const scrutiny = [...scrutinyFlags(policy, pr.files.map((f) => f.filename)), ...suppressionFlags(pr.diff), ...testMarkerFlags(pr.diff), ...incidentFlags(pr.issues ?? []), ...rules.flags];
 
 // Jev risk signals: advisory, before the reviewer, skipped without TYPESAFE_API_KEY. A failure here
 // loses a signal, not the review, so it is logged and the run goes on without it.
@@ -315,9 +332,22 @@ if (gateVerdict === "PASSED" && policy.familiarity) {
   }
 }
 
+// Test evidence from CI: judgment only, read when the policy names the workflow that uploads it.
+let stories: StoryEvidence | null = null;
+
+if (gateVerdict === "PASSED" && policy.stories) {
+  try {
+    stories = loadStoryEvidence(policy.stories, pr.headSha, pr.baseSha, ghStoryDeps(pr.repo, repoRoot, callTimeout()));
+  } catch (e) {
+    console.error(`test evidence unavailable: ${e instanceof Error ? e.message : e}`);
+  }
+}
+
 for (const g of gated.gates) console.log(`${g.passed ? "✓" : "✗"} ${g.gate}: ${g.message}`);
 
 if (signals) console.log(`  risk signals: ${signalFlags.length ? signalFlags.map((f) => `${f} ${signals[f].toFixed(2)}`).join(", ") : "none flagged"}`);
+
+if (stories) console.log(`  test evidence: ${stories.status}${"run" in stories ? ` (run ${stories.run.id})` : ""}`);
 
 if (familiarity) console.log(`  familiarity: ${familiarity.band} (${familiarity.blame_overlap_pct.toFixed(0)}% blame, ${familiarity.prior_prs_in_paths} prior PRs)`);
 
@@ -355,6 +385,7 @@ if (opts["dry-run"]) {
     ownership,
     signals,
     familiarity,
+    stories,
   } as const;
 
   const guidance = loadGuidance(repoRoot, trustedRef);
@@ -410,6 +441,7 @@ const evidence = {
   signals,
   signalFlags,
   familiarity: familiarityEvidence(familiarity),
+  stories: storyEvidenceRecord(stories),
   size_overrides: [...folderGrants("max_files", sizeBudgets.file_scopes), ...folderGrants("max_lines", sizeBudgets.line_scopes)],
   retention: { status: "dismissed" as const, reason: retention.reason },
   backends: BACKENDS,
@@ -433,7 +465,7 @@ if (opts.post) {
   if (posted !== null) reconcilePosted(pr, posted, verdict, post);
 }
 
-const costs = [llm?.run?.costUsd, opinion?.run?.costUsd].flatMap((c) => (c === null || c === undefined ? [] : [c]));
+const measurements = reviewMeasurements([llm, opinion].flatMap((r) => r ? [r.run] : []), verdict === "ERROR");
 
 await endReviewSpan(
   reviewAttributes(pr, verdict, {
@@ -446,9 +478,10 @@ await endReviewSpan(
     "stamp.scrutiny": scrutiny.map((s) => s.name),
     "stamp.signal_flags": signalFlags,
     "stamp.familiarity": familiarity?.band,
+    "stamp.stories": stories?.status,
     "stamp.risk": llm?.risk,
     "stamp.second_opinion": opinion?.verdict,
-    "stamp.cost_usd": costs.length ? costs.reduce((a, b) => a + b, 0) : undefined,
+    ...measurements,
     "stamp.egress.denied_host": [llm, opinion].reduce((n, r) => n + (r?.egress?.deniedHost ?? 0), 0),
     "stamp.egress.denied_name": [llm, opinion].reduce((n, r) => n + (r?.egress?.deniedName ?? 0), 0),
     "stamp.egress.refused": [llm, opinion].reduce((n, r) => n + (r?.egress?.refused ?? 0), 0),
@@ -580,7 +613,7 @@ function baseEvidence(pr: PR) {
 
 /** The `stamp.review` span's attributes: who and what was reviewed, the verdict, and the run's own detail. */
 function reviewAttributes(pr: PR, verdict: Verdict, detail: ReviewAttributes): ReviewAttributes {
-  return { "stamp.version": VERSION, "stamp.verdict": verdict, "vcs.repository.name": pr.repo, "vcs.change.id": String(pr.number), "vcs.ref.head.revision": pr.headSha, ...detail };
+  return { "stamp.version": VERSION, "stamp.verdict": verdict, "vcs.repository.name": pr.repo, "vcs.change.id": String(pr.number), "vcs.ref.head.revision": pr.headSha, "vcs.ref.base.revision": pr.baseSha, "cicd.pipeline.run.id": process.env.GITHUB_RUN_ID, "stamp.ci.attempt": process.env.GITHUB_RUN_ATTEMPT ? Number(process.env.GITHUB_RUN_ATTEMPT) : undefined, ...reviewMeasurements([], false), ...detail };
 }
 
 function finished() {

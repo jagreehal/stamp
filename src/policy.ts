@@ -5,8 +5,9 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { FamiliarityPolicySchema } from "./familiarity.ts";
+import { FamiliarityPolicySchema, stripDiffPath } from "./familiarity.ts";
 import { TimedOut, callTimeout, type LinkedIssue } from "./github.ts";
+import { StoriesPolicySchema } from "./stories.ts";
 
 const Match = z.object({
   any: z.array(z.string()).default([]),
@@ -33,8 +34,12 @@ export const PolicySchema = z
       .optional(),
     // Judgment-layer only; never a gate. Absent = no familiarity signal computed.
     familiarity: FamiliarityPolicySchema.optional(),
+    // Judgment-layer only; never a gate. Absent = no test evidence read from CI.
+    stories: StoriesPolicySchema.optional(),
     scrutiny: z.record(z.string(), z.object({ description: z.string().optional(), paths: z.array(z.string()), instruction: z.string() })).default({}),
     reviewer_bots: z.array(z.string()).default([]),
+    // Review services that report progress as a check run on the head, such as Claude Code Review.
+    reviewer_checks: z.array(z.string()).default([]),
     // Team rule packs: SKILL.md files whose "## Review" rules the reviewer applies to matching files.
     rules: z
       .record(
@@ -124,7 +129,10 @@ export type PRFile = { filename: string; previousFilename?: string; additions: n
 const wb = (p: string) =>
   p.includes("/") || p.startsWith("\\.") ? new RegExp(p, "i") : new RegExp(`(?<![a-z0-9])(?:${p})(?![a-z0-9])`, "i");
 
-const TEST_RE = /(^|\/)(tests?|__tests__|spec|e2e)\/|\.(test|spec)\.[cm]?[jt]sx?$|_test\.(py|go|rs)$|(^|\/)test_[^/]+\.py$|(^|\/)conftest\.py$/i;
+// File names test runners collect, wherever they live; TEST_RE adds the test directories.
+const TEST_NAME_RE = /\.(test|spec)\.[cm]?[jt]sx?$|_test\.(py|go|rs)$|(^|\/)test_[^/]+\.py$|(^|\/)conftest\.py$/i;
+
+const TEST_RE = new RegExp(`(^|\\/)(tests?|__tests__|spec|e2e)\\/|${TEST_NAME_RE.source}`, "i");
 
 const SIZE_EXEMPT_RE = /\.(md|mdx|txt|rst|snap|ambr|lock|png|jpe?g|gif|svg|webp|ico)$|(^|\/)__snapshots__\//i;
 
@@ -267,6 +275,9 @@ const RISKY_LINE_RE = /^[+-]\s*(\[?(tool\.)?scripts|entry[-_]points|build\s*=|re
 export function inFlightBots(reactions: { user: string; content: string; created: string }[], bots: string[], staleMs: number, now = Date.now()): string[] {
   return reactions.flatMap((r) => (r.content === "eyes" && bots.includes(r.user) && now - Date.parse(r.created) < staleMs ? [r.user] : []));
 }
+
+/** Review services still working on this head: a listed check run that has not completed. */
+export const inFlightChecks = (runs: { name: string; status: string }[], names: string[]): string[] => runs.flatMap((r) => (names.includes(r.name) && r.status !== "completed" ? [r.name] : []));
 
 export function manifestScriptEdits(repoRoot: string, baseSha: string, headSha: string, manifests: string[]): string[] {
   const show = (ref: string, file: string) => {
@@ -586,7 +597,7 @@ function addedLines(diff: string): [file: string, line: string][] {
   for (const line of diff.split("\n")) {
     if (line.startsWith("diff --git ")) inHunk = false;
     else if (line.startsWith("@@")) inHunk = true;
-    else if (!inHunk && line.startsWith("+++ ")) file = line.slice(6).trim(); // "+++ b/path"
+    else if (!inHunk && line.startsWith("+++ ")) file = stripDiffPath(line.slice(4)) ?? ""; // "+++ b/path", or quoted
     else if (inHunk && line.startsWith("+")) out.push([file, line]);
   }
 
@@ -607,6 +618,111 @@ export function addedSecrets(diff: string): string[] {
   }
 
   return [...found];
+}
+
+// Markers that switch a test off, or narrow a run to one: JS/TS, pytest/unittest, Go, Rust, JUnit. A
+// conditional skip (`skipIf`, `mark.skipif`) is left to the reviewer: it is usually an environment guard.
+// Any .skip or .only access counts, so a call split across lines (`test\n  .skip(`) or a parameterized form
+// (`.skip.each`) still matches.
+const TEST_SKIP_RE = /(\.(?:skip|only)\b|\bx(?:it|describe|test)\b|(?<![.\w])f(?:it|describe)\s*\(|mark\.(?:skip|xfail)\b|unittest\.skip\b|skipTest\s*\(|\bt\.Skip(?:Now|f)?\s*\()/i;
+
+// A computed access needs a receiver (`test["skip"]`, `describe ['only']`), so an array literal of the word is not one.
+const COMPUTED_SKIP_RE = /([\w$)\]]\s*\[\s*)(["'`])(skip|only)\2\s*\]/g;
+
+// Attribute markers, read in their own language wherever the file lives: Rust keeps unit tests inside src/*.rs.
+const ATTRIBUTE_SKIPS: [language: RegExp, marker: RegExp][] = [
+  [/\.rs$/i, /(#\[ignore\b)/],
+  [/\.(?:java|kts?|groovy|scala)$/i, /(@(?:[\w.]+\.)?(?:Disabled|Ignore)\b)/],
+];
+
+// Class names JVM runners collect (Surefire, Failsafe, Gradle, Spock), read for renames only: TEST_RE leaves
+// them to the test directories, so they stay out of size exemptions.
+const JVM_TEST_NAME_RE = /(^|\/)(Test[^/]*|[^/]*(Tests?|TestCase|Spec|IT))\.(java|kts?|groovy|scala)$/;
+
+const blank = (text: string) => " ".repeat(text.length);
+
+/**
+ * A line's code with its quoted string contents and comments blanked to spaces, so a marker named in prose or a
+ * fixture reads as text and every column still lines up with the raw line. Strings go first, so a `//` inside
+ * a URL survives. Template literals stay, since `${}` holds code, and `#` starts a comment in Python only.
+ * Anything this cannot tell apart stays in, and the gate flags it.
+ */
+const codeOnly = (file: string, line: string) => {
+  const code = line
+    .replace(file.endsWith(".rs") ? /(")(?:\\.|(?!\1).)*\1/g : /(["'])(?:\\.|(?!\1).)*\1/g, (s, q: string) => q + blank(s.slice(2)) + q) // ' opens a Rust lifetime
+    .replace(/\/\*.*?\*\//g, blank)
+    .replace(/\/\/.*$/, blank);
+
+  return file.endsWith(".py") ? code.replace(/(?:^|\s)#.*$/, blank) : code;
+};
+
+/** Computed skip or only accesses in a raw line, split by whether the receiver and bracket sit in code or in text. */
+function computedSkips(raw: string, code: string) {
+  const inCode: string[] = [];
+  const inText: string[] = [];
+
+  for (const m of raw.matchAll(COMPUTED_SKIP_RE)) {
+    const end = m.index + m[1]!.length + 1; // through the opening quote, which codeOnly keeps
+
+    (code.slice(m.index, end) === raw.slice(m.index, end) ? inCode : inText).push(`[${m[2]}${m[3]}${m[2]}]`);
+  }
+
+  return { inCode, inText };
+}
+
+/**
+ * Tests the change switches off, as "path: what": deleted test files and skip or only markers added to
+ * test files. Agents reach green this way, and it is the one shape of it a regex can decide.
+ */
+export function weakenedTests(files: PRFile[], diff: string): string[] {
+  // A rename takes a test out of the suite, the same as deleting it, when it leaves the test paths, drops a
+  // runner's file-name pattern (a.test.ts → a.ts) or moves to an extension no runner collects (FooTest.java → FooTest.java.off).
+  const runnerName = (p: string) => TEST_NAME_RE.test(p) || JVM_TEST_NAME_RE.test(p);
+
+  const renamedOut = (from: string, to: string) =>
+    isTest(from) && (!isTest(to) || (runnerName(from) && !runnerName(to)) || (path.posix.extname(from) !== path.posix.extname(to) && !runnerName(to)));
+
+  const gone = (f: PRFile) => (f.status === "removed" && isTest(f.filename)) || (f.previousFilename !== undefined && renamedOut(f.previousFilename, f.filename));
+  const found = new Set(files.flatMap((f) => (gone(f) ? [`${f.previousFilename ?? f.filename}: deleted`] : [])));
+
+  for (const [file, added] of addedLines(diff)) {
+    const raw = added.slice(1);
+    const line = codeOnly(file, raw);
+    // A computed access (`test["skip"]`) is a string by shape, so it is read from the raw line, where it lines up with the code.
+    const marker = (isTest(file) && (TEST_SKIP_RE.exec(line)?.[1] ?? computedSkips(raw, line).inCode[0])) || ATTRIBUTE_SKIPS.find(([language]) => language.test(file))?.[1].exec(line)?.[1];
+
+    if (marker) found.add(`${file}: ${marker.toLowerCase().replace(/\s+/g, "")}`);
+  }
+
+  return [...found];
+}
+
+// Skips that are often legitimate: a condition (an environment guard, mostly) or a placeholder for a test to come.
+const CONDITIONAL_SKIP_RE = /(\.(?:skipIf|runIf|todo)\b|mark\.skipif\b|#\[cfg_attr\()/i;
+
+const TEST_MARKER_INSTRUCTION =
+  "These lines gained a conditional skip, a todo, or a skip or only marker inside a comment or string, where the tests gate leaves the call to you. Read each line. REFUSE if it switches a test off or narrows the run where it should run: a condition that is always true, a todo replacing a test that had a body, a marker hidden in code a line-by-line read misses.";
+
+/** Skip markers the tests gate leaves to the reviewer, as one scrutiny flag: conditional skips, todos, and markers it read as prose. */
+export function testMarkerFlags(diff: string): ScrutinyFlag[] {
+  const found = new Set<string>();
+
+  for (const [file, added] of addedLines(diff)) {
+    const raw = added.slice(1);
+    const code = codeOnly(file, raw);
+    const attribute = ATTRIBUTE_SKIPS.find(([language]) => language.test(file))?.[1];
+    const conditional = (isTest(file) || attribute) && CONDITIONAL_SKIP_RE.exec(code)?.[1];
+
+    const prose =
+      (isTest(file) && !TEST_SKIP_RE.test(code) && (TEST_SKIP_RE.exec(raw)?.[1] ?? computedSkips(raw, code).inText[0])) ||
+      (attribute && !attribute.test(code) && attribute.exec(raw)?.[1]);
+
+    const marker = conditional || prose;
+
+    if (marker) found.add(`${file}: ${marker.toLowerCase().replace(/\s+/g, "")}`);
+  }
+
+  return found.size ? [{ name: "test_markers", files: [...found], instruction: TEST_MARKER_INSTRUCTION }] : [];
 }
 
 // Inline comments that silence a linter, type checker, scanner or coverage tool for the lines around them.
@@ -706,6 +822,12 @@ export function runGates(policy: Policy, pr: PRMeta): GateRun {
   const secrets = pr.diff ? addedSecrets(pr.diff) : [];
 
   gates.push({ gate: "secrets", passed: secrets.length === 0, message: secrets.length ? `credential added in ${secrets.join("; ")}` : "no credentials in the diff" });
+
+  // A green run over a deleted or skipped test proves nothing, and no reviewer paragraph should be able to
+  // argue otherwise, so this denies before the model. Rewritten assertions stay with the reviewer.
+  const weakened = weakenedTests(pr.files, pr.diff ?? "");
+
+  gates.push({ gate: "tests", passed: weakened.length === 0, message: weakened.length ? `tests weakened: ${weakened.join("; ")}` : "no tests deleted or skipped" });
 
   const t = tier(policy, pr.files, denied);
   gates.push({ gate: "tier", passed: t.tier !== "T2-never", message: [t.tier, t.sub].filter(Boolean).join(" / ") });

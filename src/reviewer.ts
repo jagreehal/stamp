@@ -6,6 +6,7 @@ import { formatFamiliarity, type AuthorFamiliarity } from "./familiarity.ts";
 import type { Gate, Ownership, ScrutinyFlag } from "./policy.ts";
 import { reviewWithTools, type RunRecord } from "./llm.ts";
 import { formatSignals, type Signals } from "./signals.ts";
+import { formatStoryReport, formatStoryStatus, type StoryEvidence } from "./stories.ts";
 
 export const MODEL = process.env.STAMP_MODEL || "claude-opus-5"; // the api backend's model; `||`: a blank workflow variable means "default"
 
@@ -108,6 +109,7 @@ export type ReviewInput = {
   ownership?: Ownership;
   signals?: Signals | null;
   familiarity?: AuthorFamiliarity | null;
+  stories?: StoryEvidence | null;
 };
 
 // Review agents that post through the PR author's own account (shepherd's swarm, for one) open
@@ -217,6 +219,7 @@ export function buildPrompt(input: ReviewInput): string {
     ownership,
     ...(input.signals ? ["", formatSignals(input.signals)] : []),
     formatFamiliarity(input.familiarity),
+    ...(input.stories ? ["", formatStoryStatus(input.stories)] : []),
     ...constraints.map((c) => "\n" + c),
     "",
     "--- BEGIN UNTRUSTED CONTENT ---",
@@ -246,6 +249,7 @@ export function buildPrompt(input: ReviewInput): string {
     "Reactions on the PR:",
     ...reactions,
     "",
+    ...(input.stories?.status === "ok" ? [...formatStoryReport(input.stories.report, oneLine), ""] : []),
     "Diff:",
     "```diff",
     sanitize(pr.diff, DIFF_MAX),

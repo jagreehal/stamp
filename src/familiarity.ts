@@ -104,8 +104,38 @@ function extractPrNumber(subject: string): number | null {
   return last;
 }
 
-function stripDiffPath(raw: string): string | null {
-  const t = raw.trim();
+// C escapes Git writes inside a quoted path, as the byte each one stands for.
+const QUOTED_ESCAPES = new Map([["a", 7], ["b", 8], ["t", 9], ["n", 10], ["v", 11], ["f", 12], ["r", 13], ['"', 34], ["\\", 92]]);
+
+/** A path Git quoted (`"b/caf\\303\\251.ts"`, for non-ASCII bytes or control characters) back to its UTF-8 text. */
+function unquoteGitPath(quoted: string): string {
+  const bytes: number[] = [];
+
+  for (let i = 0; i < quoted.length; i++) {
+    if (quoted[i] !== "\\") {
+      bytes.push(...Buffer.from(quoted[i]!));
+      continue;
+    }
+
+    const octal = /^[0-7]{3}/.exec(quoted.slice(i + 1));
+
+    if (octal) {
+      bytes.push(parseInt(octal[0], 8));
+      i += 3;
+    } else {
+      bytes.push(QUOTED_ESCAPES.get(quoted[i + 1] ?? "") ?? quoted.charCodeAt(i + 1));
+      i++;
+    }
+  }
+
+  return Buffer.from(bytes).toString("utf8");
+}
+
+/** The repository path in a `---`/`+++` header value, unquoted, without its a/ or b/ prefix; null for /dev/null. */
+export function stripDiffPath(raw: string): string | null {
+  let t = raw.trim();
+
+  if (t.length > 1 && t.startsWith('"') && t.endsWith('"')) t = unquoteGitPath(t.slice(1, -1));
 
   if (t === "/dev/null") return null;
 

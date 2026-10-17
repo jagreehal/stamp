@@ -3,6 +3,7 @@
 // calling is the one capability every supported provider shares.
 import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import { createBedrockAnthropic } from "@ai-sdk/amazon-bedrock/anthropic";
+import { defaultProvider } from "@aws-sdk/credential-provider-node";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createGroq } from "@ai-sdk/groq";
@@ -87,9 +88,15 @@ export function languageModel(id: string, session: string): LanguageModel {
   const headers = { "x-opencode-session": session, "User-Agent": "stamp (pr-review)" };
 
   switch (provider) {
-    case "bedrock":
+    case "bedrock": {
+      // AWS_BEARER_TOKEN_BEDROCK wins when set. Otherwise SigV4 through the AWS credential chain: environment
+      // keys (what an OIDC step exports), then AWS_PROFILE, SSO and instance roles. The region stays AWS_REGION.
+      const aws = { credentialProvider: defaultProvider() };
+
       // Claude on Bedrock through InvokeModel (prompt caching, native features); everything else through Converse.
-      return model.includes("anthropic.") ? createBedrockAnthropic()(model) : createAmazonBedrock()(model);
+      return model.includes("anthropic.") ? createBedrockAnthropic(aws)(model) : createAmazonBedrock(aws)(model);
+    }
+
     case "opencode":
     case "opencode-go": {
       const baseURL = OPENCODE[provider];
@@ -372,6 +379,23 @@ export async function beginReviewSpan(started: string): Promise<void> {
 export const inReviewSpan = <T>(fn: () => T): T => (reviewSpan ? reviewSpan.runWithSpan(reviewSpan.span, fn) : fn());
 
 export type ReviewAttributes = Record<string, string | number | boolean | string[] | undefined>;
+
+/** Root measurements for garden: missing or partially priced reviewers stay explicit, never a zero-cost claim. */
+export function reviewMeasurements(runs: (RunRecord | undefined)[], failed: boolean) {
+  const costs = runs.flatMap((r) => r?.costUsd === null || r?.costUsd === undefined ? [] : [r.costUsd]);
+  const complete = !failed && costs.length === runs.length;
+  const measured = runs.flatMap((r) => r ? [r] : []);
+  const callsKnown = !failed && measured.length === runs.length;
+
+  return {
+    "stamp.cost_usd": costs.length ? costs.reduce((a, b) => a + b, 0) : complete ? 0 : undefined,
+    "stamp.cost_complete": complete,
+    "stamp.reviewers": runs.length,
+    "stamp.tool_calls": callsKnown ? measured.reduce((n, r) => n + r.toolCalls, 0) : undefined,
+    "stamp.input_tokens": callsKnown ? measured.reduce((n, r) => n + r.inputTokens, 0) : undefined,
+    "stamp.output_tokens": callsKnown ? measured.reduce((n, r) => n + r.outputTokens, 0) : undefined,
+  } satisfies ReviewAttributes;
+}
 
 /** Close the review span with one wide event's worth of attributes, then flush. ERROR marks the span failed. */
 export async function endReviewSpan(attributes: ReviewAttributes, failed: boolean): Promise<void> {

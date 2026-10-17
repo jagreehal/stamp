@@ -14,6 +14,7 @@ import {
   denyCategories,
   detectOwnership,
   inFlightBots,
+  inFlightChecks,
   loadPolicy,
   manifestScriptEdits,
   manifestsWithoutLockfile,
@@ -29,6 +30,8 @@ import {
   sizeWithinBudgets,
   substantiveSize,
   suppressionFlags,
+  testMarkerFlags,
+  weakenedTests,
   incidentFlags,
   tier,
   titleFlags,
@@ -264,6 +267,18 @@ test("inFlightBots counts only fresh eyes from listed bots", () => {
   expect(inFlightBots(reactions, bots, 45 * 60_000, now)).toEqual(["greptile-apps[bot]"]);
 });
 
+test("inFlightChecks counts listed check runs that have not completed", () => {
+  const runs = [
+    { name: "Claude Code Review", status: "in_progress" },
+    { name: "check", status: "queued" },
+    { name: "Claude Code Review", status: "completed" },
+  ];
+
+  expect(inFlightChecks(runs, ["Claude Code Review"])).toEqual(["Claude Code Review"]);
+  expect(inFlightChecks(runs.slice(1), ["Claude Code Review"])).toEqual([]);
+  expect(policy.reviewer_checks).toEqual(["Claude Code Review"]);
+});
+
 const fileDiff = (path: string, ...body: string[]) => [`diff --git a/${path} b/${path}`, `--- a/${path}`, `+++ b/${path}`, "@@ -1,3 +1,3 @@", ...body];
 
 test("addedSecrets flags credentials on added lines only", () => {
@@ -281,6 +296,135 @@ test("addedSecrets scans an added line whose content starts with ++", () => {
   const diff = fileDiff("notes/keys.txt", "+++ AKIAIOSFODNN7EXAMPLE", "+ordinary line").join("\n");
 
   expect(addedSecrets(diff)).toEqual(["notes/keys.txt: AWS access key"]);
+});
+
+test("weakenedTests names deleted test files and skip markers added to tests", () => {
+  const diff = [
+    ...fileDiff("src/a.test.ts", "+test.skip('retries', () => {});", "+describe.only('x', () => {});", "-it.skip('was skipped', () => {});"),
+    ...fileDiff("tests/test_b.py", "+@pytest.mark.xfail", "+    self.skipTest('flaky')"),
+    ...fileDiff("pkg/c_test.go", "+\tt.Skip(\"later\")"),
+    ...fileDiff("src/parse.rs", "+    #[ignore = \"slow\"]"), // Rust unit tests live beside the code
+    ...fileDiff("src/d.test.ts", "+test.skipIf(!process.env.CI)('needs docker', () => {});"), // conditional skip on purpose
+    ...fileDiff("src/e.ts", "+const run = suite.skip(1);"), // not a test file
+  ].join("\n");
+
+  const files = [f("src/a.test.ts"), { filename: "src/old.test.ts", additions: 0, deletions: 40, status: "removed" }, { filename: "src/gone.ts", additions: 0, deletions: 9, status: "removed" }, { filename: "src/moved.ts", previousFilename: "src/moved.test.ts", additions: 0, deletions: 0, status: "renamed" }];
+
+  expect(weakenedTests(files, diff)).toEqual(["src/old.test.ts: deleted", "src/moved.test.ts: deleted", "src/a.test.ts: .skip", "src/a.test.ts: .only", "tests/test_b.py: mark.xfail", "tests/test_b.py: skiptest(", "pkg/c_test.go: t.skip(", "src/parse.rs: #[ignore"]);
+
+  expect(weakenedTests([f("src/a.test.ts")], fileDiff("src/a.test.ts", "+test('new', () => {});").join("\n"))).toEqual([]);
+});
+
+test("weakenedTests reads attribute markers in their own languages only", () => {
+  const diff = [
+    ...fileDiff("README.md", "+Use #[ignore] for slow Rust tests, @Disabled for JUnit."),
+    ...fileDiff("src/Billing.java", "+  @Disabled(\"flaky\")"),
+  ].join("\n");
+
+  expect(weakenedTests([], diff)).toEqual(["src/Billing.java: @disabled"]);
+});
+
+test("weakenedTests counts a rename that leaves the runner's file pattern as a deletion", () => {
+  const moved = (from: string, to: string): PRFile => ({ filename: to, previousFilename: from, additions: 0, deletions: 0, status: "renamed" });
+
+  expect(
+    weakenedTests([moved("tests/a.test.ts", "tests/a.test.ts.bak"), moved("tests/b.test.ts", "tests/b.ts"), moved("src/test/FooTest.java", "src/test/FooTest.java.off"), moved("tests/c.test.ts", "tests/unit/c.test.ts"), moved("tests/helpers.ts", "tests/helpers.test.ts"), moved("src/test/java/BarTest.java", "src/test/java/Bar.java"), moved("src/test/kotlin/BazSpec.kt", "src/test/kotlin/BazIT.kt"), moved("tests/d.test.ts", "tests/d.test.tsx")], ""),
+  ).toEqual(["tests/a.test.ts: deleted", "tests/b.test.ts: deleted", "src/test/FooTest.java: deleted", "src/test/java/BarTest.java: deleted"]);
+});
+
+test("weakenedTests catches parameterized skip and only", () => {
+  const diff = fileDiff("src/a.test.ts", "+test.skip.each([1, 2])('case %i', () => {});", "+describe.only.each`a | b`('rows', () => {});").join("\n");
+
+  expect(weakenedTests([], diff)).toEqual(["src/a.test.ts: .skip", "src/a.test.ts: .only"]);
+});
+
+test("weakenedTests ignores markers in comments and strings", () => {
+  const diff = fileDiff(
+    "src/a.test.ts",
+    "+// Unlike test.skip(), this test runs on every platform.",
+    "+/* it.skip( */ const label = 'test.only(';",
+    "+expect(lint('it.skip(1)')).toEqual([]); // a fixture, not a marker",
+    "+const url = 'https://x.dev/a'; it.only('runs', () => {});",
+  ).join("\n");
+
+  const py = fileDiff("tests/test_a.py", "+# pytest.mark.skip is for platform gaps", "+@pytest.mark.skip(reason='#1')").join("\n");
+
+  expect(weakenedTests([], diff)).toEqual(["src/a.test.ts: .only"]);
+  expect(weakenedTests([], py)).toEqual(["tests/test_a.py: mark.skip"]);
+});
+
+test("weakenedTests flags what it cannot read as prose", () => {
+  const diff = fileDiff(
+    "src/a.test.ts",
+    "+const t = `${test.skip('hidden', () => {})}`;", // code inside a template literal
+    "+  * it.only('x', () => {});", // a leading * outside a block comment
+    "+class Box { #state = 1; } describe.skip('x', () => {});", // # is a private field in JS, not a comment
+    "+test",
+    "+  .only('split across lines', () => {});",
+    "+test['skip']('computed', () => {});",
+  ).join("\n");
+
+  expect(weakenedTests([], diff)).toEqual(["src/a.test.ts: .skip", "src/a.test.ts: .only", "src/a.test.ts: ['skip']"]);
+});
+
+test("testMarkerFlags hands the reviewer markers the gate read as prose", () => {
+  const diff = [
+    ...fileDiff("src/a.test.ts", "+// Unlike test.skip(), this test runs on every platform.", "+describe.only('x', () => {});", "+xit"),
+    ...fileDiff("src/b.ts", "+// call test.skip( here"), // not a test file
+  ].join("\n");
+
+  expect(weakenedTests([], diff)).toEqual(["src/a.test.ts: .only", "src/a.test.ts: xit"]);
+  expect(testMarkerFlags(diff)).toEqual([{ name: "test_markers", files: ["src/a.test.ts: .skip"], instruction: expect.stringContaining("REFUSE") }]);
+  expect(testMarkerFlags(fileDiff("src/a.test.ts", "+test('x', () => {});").join("\n"))).toEqual([]);
+});
+
+test("weakenedTests catches focus helpers and qualified annotations; testMarkerFlags takes conditional skips", () => {
+  const diff = [
+    ...fileDiff("spec/a.spec.js", "+fit('focused', () => {});", "+fdescribe('suite', () => {});", "+model.fit(data);", "+test.todo('later');", "+test.skipIf(isWindows)('posix', () => {});"),
+    ...fileDiff("src/FooTest.java", "+  @org.junit.jupiter.api.Disabled"),
+    ...fileDiff("src/lib.rs", '+    #[cfg_attr(not(feature = "net"), ignore)]'),
+    ...fileDiff("tests/test_a.py", "+@pytest.mark.skipif(True, reason='x')"),
+  ].join("\n");
+
+  expect(weakenedTests([], diff)).toEqual(["spec/a.spec.js: fit(", "spec/a.spec.js: fdescribe(", "src/FooTest.java: @org.junit.jupiter.api.disabled"]);
+  expect(testMarkerFlags(diff)[0]?.files).toEqual(["spec/a.spec.js: .todo", "spec/a.spec.js: .skipif", "src/lib.rs: #[cfg_attr(", "tests/test_a.py: mark.skipif"]);
+});
+
+test("a computed marker needs a receiver in code; text naming one goes to the reviewer", () => {
+  const diff = fileDiff(
+    "src/a.test.ts",
+    '+const allowed = ["only"];',
+    '+// Prefer test["skip"] for platform-specific tests.',
+    "+const doc = \"use describe['only'] sparingly\";",
+    "+describe [ 'only' ]('spaced', () => {});",
+  ).join("\n");
+
+  expect(weakenedTests([], diff)).toEqual(["src/a.test.ts: ['only']"]);
+  expect(testMarkerFlags(diff)[0]?.files).toEqual(['src/a.test.ts: ["skip"]', "src/a.test.ts: ['only']"]);
+});
+
+test("Rust lifetimes are not strings, and a stripped attribute marker reaches the reviewer", () => {
+  const rs = fileDiff("src/lib.rs", "+fn f<'a>(x: &'a str) {} #[ignore] fn g<'b>() {}").join("\n");
+  const java = fileDiff("src/Foo.java", '+  String s = "x"; @Disabled /* "y" */').join("\n");
+  const hidden = fileDiff("src/Bar.java", '+  String s = "@Disabled";').join("\n");
+
+  expect(weakenedTests([], rs)).toEqual(["src/lib.rs: #[ignore"]);
+  expect(weakenedTests([], java)).toEqual(["src/Foo.java: @disabled"]);
+  expect(weakenedTests([], hidden)).toEqual([]);
+  expect(testMarkerFlags(hidden)[0]?.files).toEqual(["src/Bar.java: @disabled"]);
+});
+
+test("weakenedTests decodes paths Git quotes", () => {
+  // Git quotes a path with non-ASCII bytes and escapes them in octal: café → caf\303\251.
+  const diff = ['diff --git "a/src/caf\\303\\251.test.ts" "b/src/caf\\303\\251.test.ts"', '--- "a/src/caf\\303\\251.test.ts"', '+++ "b/src/caf\\303\\251.test.ts"', "@@ -1 +1 @@", "+test.skip('x', () => {});"].join("\n");
+
+  expect(weakenedTests([], diff)).toEqual(["src/café.test.ts: .skip"]);
+});
+
+test("the tests gate denies on its own, before the model", () => {
+  const r = gates({ ...ready, files: [{ filename: "src/old.test.ts", additions: 0, deletions: 40, status: "removed" }] });
+
+  expect(r.gates.find((g) => g.gate === "tests")).toEqual({ gate: "tests", passed: false, message: "tests weakened: src/old.test.ts: deleted" });
 });
 
 test("suppressionFlags names suppression comments on added lines only", () => {
@@ -807,7 +951,7 @@ stamp:
   });
 
   test("files that steer review and fix agents get scrutiny, not a denial", () => {
-    const files = [".shepherd/lenses.yml", ".shepherd/lenses/react/SKILL.md", ".agents/skills/x/SKILL.md", "AGENTS.md", "packages/web/CLAUDE.md", "docs/adr/0001.md", "src/agents.ts"];
+    const files = [".shepherd/lenses.yml", ".shepherd/lenses/react/SKILL.md", ".agents/skills/x/SKILL.md", "AGENTS.md", "packages/web/CLAUDE.md", "REVIEW.md", "services/search/REVIEW.md", "docs/adr/0001.md", "src/agents.ts"];
     const flag = scrutinyFlags(policy, files).find((f) => f.name === "review_agents");
 
     expect(flag?.files).toEqual(files.slice(0, -1));
@@ -848,6 +992,13 @@ describe("workflow template", () => {
     expect(edited.jobs.review).toMatchObject({ uses: "./.github/workflows/stamp.yml", secrets: "inherit" });
     expect(condition).toContain("github.event.changes.base != null");
     expect(condition).toContain("contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->')");
+  });
+
+  test("stamp-edited.yml grants every permission stamp.yml asks for, so the called workflow starts", () => {
+    const wf = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp.yml"), "utf8"));
+    const edited = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp-edited.yml"), "utf8"));
+
+    expect(edited.permissions).toMatchObject(wf.permissions);
   });
 
   test("the workflow passes every provider's credentials, so choosing a provider needs only a secret and STAMP_MODEL", () => {
