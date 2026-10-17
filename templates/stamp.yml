@@ -29,6 +29,10 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  # Reads the test-evidence artifact when policy sets `stories:`.
+  actions: read
+  # Reads reviewer check runs, such as Claude Code Review, to wait while one is running.
+  checks: read
 
 jobs:
   review:
@@ -51,7 +55,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }} # on a comment event stamp fetches the head itself
           persist-credentials: false # no token in .git/config for a reviewer to read; stamp's fetches authenticate through gh
           fetch-depth: 1 # stamp fetches the base ref and origin/<default> itself, and unshallows only when a run reaches the familiarity signal
-      # Bedrock through OIDC instead of AWS_BEARER_TOKEN_BEDROCK: add `id-token: write` under permissions,
+      # Bedrock through OIDC instead of AWS_BEARER_TOKEN_BEDROCK: add `id-token: write` under permissions here and in stamp-edited.yml,
       # then uncomment. The provider reads the credentials this step exports.
       # - uses: aws-actions/configure-aws-credentials@v4
       #   with:

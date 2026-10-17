@@ -47,6 +47,12 @@ const paginated = <T>(schema: z.ZodType<T>, endpoint: string, cwd: string): T[] 
 
 const Login = z.object({ login: z.string() });
 
+const CheckRuns = z.object({ check_runs: z.array(z.object({ name: z.string(), status: z.string() })) });
+
+/** The check runs with one name on one commit, by name and status. */
+export const checkRuns = (repo: string, sha: string, name: string, cwd: string) =>
+  call(CheckRuns, ["api", `repos/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&per_page=100`], cwd).check_runs;
+
 const RepoView = z.object({ nameWithOwner: z.string(), defaultBranchRef: z.object({ name: z.string() }) });
 
 const Pull = z.object({

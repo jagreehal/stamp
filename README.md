@@ -51,11 +51,13 @@ flowchart TD
     P -- fail --> X[Comment review]
     P -- pass --> DL{Deny-list<br/>and manifest scan}
     DL -- hit --> X
-    DL -- clear --> CS{Credential scan<br/>on added lines}
-    CS -- hit --> X
-    CS -- clear --> SZ{Size ceiling}
+    DL -- clear --> SZ{Size ceiling}
     SZ -- over --> X
-    SZ -- under --> TI[Tier classification]
+    SZ -- under --> CS{Credential scan<br/>on added lines}
+    CS -- hit --> X
+    CS -- clear --> TS{Deleted or skipped<br/>tests}
+    TS -- hit --> X
+    TS -- clear --> TI[Tier classification]
     TI --> WB[Wait up to 5 minutes<br/>for reviewer bots]
     WB --> RS[Risk signals,<br/>with TYPESAFE_API_KEY]
     RS --> LLM[LLM review]
@@ -66,6 +68,8 @@ flowchart TD
 ```
 
 The gates decide first. The LLM can tighten a gate's result and can never loosen it.
+
+The `tests` gate holds a PR that deletes a test file, or renames one so the runner skips it (out of a test path, off its `.test.` name, or to an extension no runner collects), or adds a marker that switches a test off or narrows a run to one: any `.skip` or `.only` access (`test.skip(`, `.only.each`, `test["skip"]`), `xit`, `fit(`, `fdescribe(`, `mark.skip`, `mark.xfail`, `skipTest(`, `t.Skip(`, `#[ignore]`, `@Disabled`, `@Ignore`. It reads the code on added lines in test files, with quoted strings, `//` and `/* */` comments, and Python `#` comments left out. Anything else it cannot read as prose counts. It also reads `#[ignore]` in any Rust file and `@Disabled` or `@Ignore` in any JVM file, since Rust keeps unit tests beside the code. A green run with a test skipped hides what that test covered, so a person decides. Conditional skips (`skipIf`, `runIf`, `mark.skipif`, `#[cfg_attr(..., ignore)]`), `test.todo`, and markers it read as prose reach the reviewer as a `test_markers` scrutiny flag. Rewritten assertions stay with the reviewer.
 
 ### Prerequisites
 
@@ -235,7 +239,7 @@ stamp keeps manifest PRs out of the T0 fast path.
 
 `scrutiny:` in `policy.yml` names files that never deny on their own. stamp reports them to the reviewer with what would make the change a refusal.
 
-The shipped `quality_gates` group covers lint, type-check, test and coverage configuration: `.oxlintrc`, `eslint.config`, `biome.json`, `vitest.config`, `codecov`, `.pre-commit-config`, `.husky/`, scanner settings such as `.semgrepignore`, `.gitleaks.toml` and `.golangci`, and the rest of that list. The reviewer must REFUSE a disabled or downgraded rule, a widened ignore, a lowered coverage threshold, a strict flag turned off, a `skip` or `only` on a test, a removed hook, or an excluded scanner rule or path. It approves tightening.
+The shipped `quality_gates` group covers lint, type-check, test and coverage configuration: `.oxlintrc`, `eslint.config`, `biome.json`, `vitest.config`, `codecov`, `.pre-commit-config`, `.husky/`, scanner settings such as `.semgrepignore`, `.gitleaks.toml` and `.golangci`, and the rest of that list. The reviewer must REFUSE a disabled or downgraded rule, a widened ignore, a lowered coverage threshold, a strict flag turned off, a removed hook, or an excluded scanner rule or path. It approves tightening. A `skip` or `only` added to a test never reaches the reviewer: the `tests` gate holds it first.
 
 Agents loosen these files to reach green, and a linter cannot see its own config change. A path deny would refuse a tightened rule along with a loosened one, so the reviewer judges the diff.
 
@@ -243,7 +247,7 @@ stamp also scans added lines for suppression comments: `eslint-disable`, `oxlint
 
 A PR that closes an issue labelled `incident` (a failure seen on the default branch or in production, often opened by shepherd's `incident` skill) gets an `incident` scrutiny flag. The reviewer refuses it unless a test reproduces the reported failure (one the diff adds, or for a red default branch the test already failing there), and refuses a fix that hides the symptom: an error swallowed, a retry or timeout raised around it, the alert removed, the test skipped.
 
-The shipped `review_agents` group covers what review and fix agents follow on later PRs: `.shepherd/`, `.claude/skills/`, `.agents/skills/`, `AGENTS.md`, `CLAUDE.md` and `docs/adr/`. The reviewer must REFUSE a removed lens, a narrowed `applies_to`, a deleted or weakened rule, loosened Fix guidance or a relaxed house rule. It approves additions and tightening.
+The shipped `review_agents` group covers what review and fix agents follow on later PRs: `.shepherd/`, `.claude/skills/`, `.agents/skills/`, `AGENTS.md`, `CLAUDE.md`, `REVIEW.md` (Claude Code Review's instructions) and `docs/adr/`. The reviewer must REFUSE a removed lens, a narrowed `applies_to`, a deleted or weakened rule, loosened Fix guidance or a relaxed house rule. It approves additions and tightening.
 
 ### Team rules
 
@@ -307,6 +311,22 @@ stamp reads grants from the **default branch** only, the same trust boundary as 
 
 When policy sets `familiarity:` (the bundled policy does), stamp measures how well the author knows the changed code from git blame and their merged PRs in those paths. It reads default-branch history only. STRONG and MODERATE bands reach the reviewer as trusted facts and never touch a gate. A missing signal or band NONE leaves the review as strict as before.
 
+### Test evidence
+
+When policy sets `stories:`, stamp reads the [executable-stories](https://github.com/jagreehal/executable-stories) review report your CI uploads, so the reviewer sees which scenarios failed or were skipped and which changed files no scenario covers.
+
+```yaml
+stories:
+  workflow: ci.yml           # the workflow that runs your tests
+  artifact: executable-stories
+  file: index.review.json    # path inside the artifact (default)
+  max_bytes: 1000000         # default
+```
+
+stamp takes the newest run of that workflow for the exact PR head. It goes by the commit the tests ran on, which the report records as `execution.gitSha` (executable-stories-formatters 1.27 or later), never by the `headRef` the report was asked to compare. The run is `ok` when that commit is the head, or GitHub's merge commit whose parents are exactly the reviewed base and the head; a filtered run says it covers only the scenarios that ran. Otherwise stamp reports `stale` (another commit, including a merge into an older base), `pending` (still running), `missing` (no run or no artifact) or `invalid` (no recorded commit, over the size limit, or not a v1 review report). stamp refuses an artifact over 50 MB zipped and reads the one report file out of it, at most `max_bytes`, without unpacking the rest. The status is trusted context; the report's text sits inside the untrusted content.
+
+The report is advisory. The PR's author wrote the tests behind it, so a strong evidence grade, a declared `covers` or an attached trace never waives a gate and never counts as independent assurance. Matching the commit makes the report relevant to this head, nothing more. The workflows need `actions: read`, which both generated workflows grant.
+
 ### Approval retention
 
 ```mermaid
@@ -350,7 +370,7 @@ flowchart LR
 | `STAMP_MODEL` | Provider | Key |
 | ------------- | -------- | --- |
 | `claude-opus-5` (no prefix) | Anthropic, or any endpoint in `ANTHROPIC_BASE_URL` | `ANTHROPIC_API_KEY` |
-| `bedrock:zai.glm-4.7-flash`, `bedrock:us.anthropic.claude-sonnet-5-5` | Amazon Bedrock (Claude through InvokeModel, the rest through Converse) | `AWS_BEARER_TOKEN_BEDROCK` or OIDC credentials, and `AWS_REGION` |
+| `bedrock:zai.glm-4.7-flash`, `bedrock:us.anthropic.claude-sonnet-5-5` | Amazon Bedrock (Claude through InvokeModel, the rest through Converse) | `AWS_BEARER_TOKEN_BEDROCK`, or any AWS credentials (OIDC, `AWS_PROFILE`, SSO, an instance role), and `AWS_REGION` |
 | `opencode-go:kimi-k3`, `opencode:claude-sonnet-5-5` | OpenCode Go and Zen | `OPENCODE_API_KEY` |
 | `openrouter:moonshotai/kimi-k3` | OpenRouter | `OPENROUTER_API_KEY` |
 | `groq:openai/gpt-oss-120b` | Groq | `GROQ_API_KEY` |
@@ -436,11 +456,15 @@ The mechanics table names the model, its tool calls, the cost and the time (`bed
 | --- | --- |
 | `stamp.verdict` | APPROVED, REFUSED, ESCALATE or ERROR; an ERROR run also marks the span failed |
 | `vcs.repository.name`, `vcs.change.id`, `vcs.ref.head.revision` | the repository, the PR number and the reviewed head |
+| `vcs.ref.base.revision`, `cicd.pipeline.run.id`, `stamp.ci.attempt` | the reviewed base and CI run/attempt, for correlation with Shepherd |
 | `stamp.tier`, `stamp.gates.failed`, `stamp.denied` | the size tier, the gates that failed and the deny-list categories hit |
 | `stamp.retention` | `kept` when a standing approval survived, otherwise why it was dismissed |
 | `stamp.backends`, `stamp.risk`, `stamp.second_opinion`, `stamp.cost_usd` | who reviewed, the reviewer's risk grade, the second verdict and the run's model cost |
+| `stamp.cost_complete`, `stamp.reviewers`, `stamp.tool_calls`, `stamp.input_tokens`, `stamp.output_tokens` | whether all reviewer costs are known, how many reviewers ran, and their measured tool/token totals |
 | `stamp.title_flags`, `stamp.scrutiny`, `stamp.signal_flags`, `stamp.familiarity` | the flags and familiarity band the reviewer was given |
 | `stamp.egress.denied_host`, `stamp.egress.denied_name`, `stamp.egress.refused` | how many connections the egress proxy refused a CLI reviewer: to another host, with another TLS name, or from outside the review network |
+
+Shepherd's gardener can read these spans from OTLP JSON/JSON-lines exports (`shepherd garden owner/repo --traces file.json`) or a read-only Grafana Tempo endpoint. It reports known review spend and unpriced reviews alongside stage timing and approval waits. `stamp.cost_usd` is the known subtotal; `stamp.cost_complete=false` means a reviewer was unpriced or the review failed before all usage was recorded. A gated or retained run with no model calls records zero cost. The gardener counts the root subtotal once, with the child model calls inside it, and these measurements leave Stamp's gates unchanged.
 
 Without the variable, stamp loads no OpenTelemetry code. CLI reviews also print the proxy's refusal counts as `reviewer egress refused: ...` and keep them in the `--json` evidence under `llm.egress`. Stamp records counts, never the hosts or TLS names: the reviewer chooses those, so a hijacked one could encode a secret in them. A refused connection to another host can be a CLI's routine call home (Codex asks for `chatgpt.com`); one with another TLS name is a fronting attempt. The proxy's own log, which names each target, stays in the container and is removed with it.
 
@@ -502,11 +526,11 @@ flowchart LR
     Q -- none --> E[ESCALATE to the owning team]
 ```
 
-List your other reviewer bots under `reviewer_bots` in `policy.yml` so stamp waits for their 👀 before it approves. A 👀 younger than 45 minutes holds the review for up to five minutes; their comments join the prompt when they post. Nothing re-triggers the workflow when a bot finishes, so a run that waited forever would never post a verdict. stamp ignores an older 👀 as a crashed reviewer.
+List your other reviewer bots under `reviewer_bots` in `policy.yml` so stamp waits for their 👀 before it approves. A 👀 younger than 45 minutes holds the review for up to five minutes; their comments join the prompt when they post. Nothing re-triggers the workflow when a bot finishes, so a run that waited forever would never post a verdict. stamp ignores an older 👀 as a crashed reviewer. Review services that report as a check run go under `reviewer_checks`: the bundled policy lists `Claude Code Review`, and stamp holds the same five minutes while that check run on the head is queued or in progress. The workflows grant `checks: read` for it.
 
 The `github-actions[bot]` approval counts toward required approving reviews once the Actions setting above is on. It does not satisfy "require review from Code Owners", and it should not: that rule exists so a person on the owning team looks, and stamp escalates to that person.
 
-Copy `.agents/skills/` (`writing-pr-descriptions`, `merging-prs`, `pr`) into repositories where agents open PRs. `pr` is [Matt Pocock's skill](https://github.com/mattpocock/skills), copied unchanged; `writing-pr-descriptions` uses its Merge Danger section and visuals.
+Copy `.agents/skills/` (`writing-pr-descriptions`, `merging-prs`, `pr`) into repositories where agents open PRs, or install them with `npx skills add jagreehal/stamp`. `pr` is [Matt Pocock's skill](https://github.com/mattpocock/skills), copied unchanged; `writing-pr-descriptions` uses its Merge Danger section and visuals.
 
 When a PR closes issues in its own repository, stamp passes their title and body to the reviewer inside the untrusted fence. It skips issues in other repositories, which can be private while the PR is public. The reviewer checks the diff does what they ask: a change that does the opposite of its issue is a showstopper, and a vague issue never refuses a PR on its own.
 

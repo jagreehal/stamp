@@ -34,24 +34,26 @@
     "release": "changeset publish"
   },
   "dependencies": {
-    "@ai-sdk/amazon-bedrock": "5.0.109",
-    "@ai-sdk/anthropic": "4.0.75",
-    "@ai-sdk/groq": "4.0.60",
-    "@ai-sdk/mistral": "4.0.63",
-    "@ai-sdk/openai": "4.0.87",
-    "@ai-sdk/openai-compatible": "3.0.65",
-    "ai": "7.0.131",
-    "autotel": "8.0.0",
-    "autotel-bedrock": "2.0.0",
-    "autotel-genai": "0.15.3",
-    "yaml": "^2.6.0",
-    "zod": "^4.0.0"
+    "@ai-sdk/amazon-bedrock": "5.0.118",
+    "@ai-sdk/anthropic": "4.0.82",
+    "@ai-sdk/groq": "4.0.63",
+    "@ai-sdk/mistral": "4.0.66",
+    "@ai-sdk/openai": "4.0.96",
+    "@ai-sdk/openai-compatible": "3.0.71",
+    "@aws-sdk/credential-provider-node": "^3.972.86",
+    "ai": "7.0.143",
+    "autotel": "8.2.1",
+    "autotel-bedrock": "2.0.1",
+    "autotel-genai": "0.16.2",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.3",
-    "@oxlint/plugins": "1.78.0",
-    "@types/bun": "^1.2.0",
-    "oxlint": "1.78.0",
-    "typescript": "^5.7.0"
+    "@oxlint/plugins": "1.88.0",
+    "@types/bun": "^1.4.3",
+    "executable-stories-bun": "^0.1.0",
+    "oxlint": "1.88.0",
+    "typescript": "^7.0.2"
   }
 }

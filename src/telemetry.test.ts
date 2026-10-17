@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { z } from "zod";
 import { egressDecisions, egressRefusals } from "./isolated-cli.ts";
+import { reviewMeasurements, type RunRecord } from "./llm.ts";
 
 const OtlpAttribute = z.object({ key: z.string(), value: z.object({ stringValue: z.string().optional(), arrayValue: z.object({ values: z.array(z.object({ stringValue: z.string() })) }).optional() }) });
 
@@ -77,4 +78,14 @@ test("egress decisions are counts by kind, never the hosts or names a reviewer c
   expect(egressRefusals([decisions, undefined])).toBe("2 to another host, 1 with another TLS name, 1 from outside the review network");
   expect(JSON.stringify(decisions) + egressRefusals([decisions])).not.toContain(secret);
   expect(egressRefusals([egressDecisions("allow api.openai.com:443")])).toBe("");
+});
+
+test("garden measurements distinguish unknown and partial prices from a review that made no model call", () => {
+  const run: RunRecord = { model: "model", steps: 1, toolCalls: 2, failedToolCalls: 0, inputTokens: 100, outputTokens: 20, cacheReadTokens: 0, costUsd: 0.5, durationMs: 1000, forcedVerdict: false, limits: "tokens:1000" };
+
+  expect(reviewMeasurements([run, run], false)).toMatchObject({ "stamp.cost_usd": 1, "stamp.cost_complete": true, "stamp.reviewers": 2, "stamp.tool_calls": 4, "stamp.input_tokens": 200, "stamp.output_tokens": 40 });
+  expect(reviewMeasurements([run, { ...run, costUsd: null }], false)).toMatchObject({ "stamp.cost_usd": 0.5, "stamp.cost_complete": false });
+  expect(reviewMeasurements([undefined], false)).toMatchObject({ "stamp.cost_usd": undefined, "stamp.cost_complete": false, "stamp.tool_calls": undefined });
+  expect(reviewMeasurements([], false)).toMatchObject({ "stamp.cost_usd": 0, "stamp.cost_complete": true, "stamp.reviewers": 0 });
+  expect(reviewMeasurements([], true)).toMatchObject({ "stamp.cost_usd": undefined, "stamp.cost_complete": false });
 });
