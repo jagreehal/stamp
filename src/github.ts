@@ -368,7 +368,7 @@ export function postVerdict(pr: PR, verdict: Verdict, body: string, opts: PostOp
 
 /** Deterministic redaction of anything that could be a credential before it reaches GitHub. */
 export function scrub(text: string): string {
-  const keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "TYPESAFE_API_KEY", "OTEL_EXPORTER_OTLP_HEADERS", "STAMP_SLACK_WEBHOOK"];
+  const keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "TYPESAFE_API_KEY", "OTEL_EXPORTER_OTLP_HEADERS", "STAMP_SLACK_WEBHOOK", "STAMP_NOTIFY_WEBHOOK", "STAMP_API_KEY", "DEEPSEEK_API_KEY"];
 
   const values = keys.flatMap((k) => {
     const v = process.env[k];
@@ -433,15 +433,18 @@ export function sweepTargets(reviews: ReviewRecord[], botLogin: string, liveHead
  * an approval standing over code nobody reviewed. A comment cannot be dismissed on GitHub and grants
  * nothing, so a stale one is logged and left.
  */
-export function reconcilePosted(pr: PR, reviewId: number, verdict: Verdict, opts: PostOptions): void {
-  if (unchanged(pr, opts.cwd) && !newerVerdictExists(pr, opts)) return;
+/** Returns true when the verdict just posted is still current; false when it went stale (and an approval was dismissed). */
+export function reconcilePosted(pr: PR, reviewId: number, verdict: Verdict, opts: PostOptions): boolean {
+  if (unchanged(pr, opts.cwd) && !newerVerdictExists(pr, opts)) return true;
 
   if (verdict !== "APPROVED") {
     console.log("the comment just posted is stale; it grants nothing and stays");
 
-    return;
+    return false;
   }
 
   console.log("dismissing the approval just posted");
   gh(["api", "-X", "PUT", `repos/${pr.repo}/pulls/${pr.number}/reviews/${reviewId}/dismissals`, "-f", "message=Superseded while stamp was posting"], opts.cwd);
+
+  return false;
 }

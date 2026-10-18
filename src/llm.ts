@@ -9,7 +9,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createGroq } from "@ai-sdk/groq";
 import { createMistral } from "@ai-sdk/mistral";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { gateway, generateText, hasToolCall, stepCountIs, tool, type LanguageModel, type ModelMessage, type StepResult, type ToolSet } from "ai";
+import { createGateway, gateway, generateText, hasToolCall, stepCountIs, tool, type LanguageModel, type ModelMessage, type StepResult, type ToolSet } from "ai";
 import type { runWithSpan, Span, SpanStatusCode } from "autotel";
 import { BEDROCK_PRICING } from "autotel-bedrock";
 import { estimateLLMCost, registerModelPricing } from "autotel-genai/cost";
@@ -49,7 +49,7 @@ function loadPricing(): void {
   pricingLoadedFor = process.env.STAMP_PRICING;
 }
 
-const PROVIDERS = ["anthropic", "bedrock", "opencode", "opencode-go", "openrouter", "groq", "mistral", "gateway"] as const;
+const PROVIDERS = ["anthropic", "bedrock", "opencode", "opencode-go", "openrouter", "groq", "mistral", "deepseek", "gateway"] as const;
 
 type Provider = (typeof PROVIDERS)[number];
 
@@ -72,7 +72,26 @@ export function anthropicBaseURL(raw = process.env.ANTHROPIC_BASE_URL): string |
 }
 
 /** Every variable a provider reads its credentials or endpoint from. The workflow template passes each one. */
-export const PROVIDER_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"];
+export const PROVIDER_ENV = ["STAMP_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "DEEPSEEK_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"];
+
+const KEY_ENV: Record<Exclude<Provider, "bedrock">, string> = {
+  anthropic: "ANTHROPIC_API_KEY",
+  opencode: "OPENCODE_API_KEY",
+  "opencode-go": "OPENCODE_API_KEY",
+  openrouter: "OPENROUTER_API_KEY",
+  groq: "GROQ_API_KEY",
+  mistral: "MISTRAL_API_KEY",
+  deepseek: "DEEPSEEK_API_KEY",
+  gateway: "AI_GATEWAY_API_KEY",
+};
+
+/**
+ * The key for the provider STAMP_MODEL names: STAMP_API_KEY when set, so a repository holds one secret
+ * whatever the provider, else the provider's own variable. Bedrock has none: it uses the AWS credential chain.
+ */
+export function apiKeyFor(provider: Provider, env: Record<string, string | undefined> = process.env): string | undefined {
+  return provider === "bedrock" ? undefined : env.STAMP_API_KEY || env[KEY_ENV[provider]];
+}
 
 const OPENCODE = { opencode: "https://opencode.ai/zen/v1", "opencode-go": "https://opencode.ai/zen/go/v1" } as const;
 
@@ -86,6 +105,7 @@ export function languageModel(id: string, session: string): LanguageModel {
   for (const k of PROVIDER_ENV) if (process.env[k] === "") delete process.env[k];
   const { provider, model } = parseModelId(id);
   const headers = { "x-opencode-session": session, "User-Agent": "stamp (pr-review)" };
+  const apiKey = apiKeyFor(provider);
 
   switch (provider) {
     case "bedrock": {
@@ -100,7 +120,6 @@ export function languageModel(id: string, session: string): LanguageModel {
     case "opencode":
     case "opencode-go": {
       const baseURL = OPENCODE[provider];
-      const apiKey = process.env.OPENCODE_API_KEY;
 
       if (/^(gpt|grok)-/.test(model)) return createOpenAI({ baseURL, apiKey, headers }).responses(model);
 
@@ -110,15 +129,17 @@ export function languageModel(id: string, session: string): LanguageModel {
     }
 
     case "openrouter":
-      return createOpenAICompatible({ name: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKey: process.env.OPENROUTER_API_KEY, headers })(model);
+      return createOpenAICompatible({ name: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKey, headers })(model);
     case "groq":
-      return createGroq({ headers })(model);
+      return createGroq({ apiKey, headers })(model);
     case "mistral":
-      return createMistral({ headers })(model);
+      return createMistral({ apiKey, headers })(model);
+    case "deepseek":
+      return createOpenAICompatible({ name: "deepseek", baseURL: "https://api.deepseek.com/v1", apiKey, headers })(model);
     case "gateway":
-      return gateway(model);
+      return apiKey ? createGateway({ apiKey })(model) : gateway(model);
     case "anthropic":
-      return createAnthropic({ baseURL: anthropicBaseURL(), headers })(model);
+      return createAnthropic({ baseURL: anthropicBaseURL(), apiKey, headers })(model);
   }
 }
 

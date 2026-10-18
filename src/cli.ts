@@ -12,6 +12,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, writeFil
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
+import { notify, notifyOn, slackEscape } from "./notify.ts";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
 import { callTimeout, checkRuns, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
 import {
@@ -87,8 +88,9 @@ if (positionals[0] === "init") {
     console.log(`created ${rel}`);
   }
 
-  console.log("\nNext: add the ANTHROPIC_API_KEY secret, enable 'Allow GitHub Actions to create and approve pull requests', merge.");
+  console.log("\nNext: add your provider key as the STAMP_API_KEY secret (and STAMP_MODEL as a variable unless you use claude-opus-5), enable 'Allow GitHub Actions to create and approve pull requests', merge.");
   console.log("Optional digest: add the STAMP_SLACK_WEBHOOK secret; the digest stays off without it.");
+  console.log("Optional alerts: add the STAMP_NOTIFY_WEBHOOK secret (Slack or any JSON endpoint) for refused, escalated and failed reviews.");
   process.exit(0);
 }
 
@@ -298,12 +300,13 @@ for (const m of rules.missing) console.error(`rule pack not found (default branc
 
 const scrutiny = [...scrutinyFlags(policy, pr.files.map((f) => f.filename)), ...suppressionFlags(pr.diff), ...testMarkerFlags(pr.diff), ...incidentFlags(pr.issues ?? []), ...rules.flags];
 
-// Jev risk signals: advisory, before the reviewer, skipped without TYPESAFE_API_KEY. A failure here
-// loses a signal, not the review, so it is logged and the run goes on without it.
+// Jev risk signals: advisory, before the reviewer, skipped without TYPESAFE_API_KEY and on a dry run (which
+// promises gates only, nothing sent out). A failure here loses a signal, not the review, so it is logged and
+// the run goes on without it.
 let signals: Signals | null = null;
 
 try {
-  signals = gateVerdict === "PASSED" ? await riskSignals(pr) : null;
+  signals = gateVerdict === "PASSED" && !opts["dry-run"] ? await riskSignals(pr) : null;
 } catch (e) {
   console.error(`risk signals unavailable: ${e instanceof Error ? e.message : e}`);
 }
@@ -462,7 +465,11 @@ if (opts.post) {
   // PR is still what we reviewed.
   dismissOwnApprovals(prNumber, me, repoRoot, { keep: posted, olderThan: STARTED });
 
-  if (posted !== null) reconcilePosted(pr, posted, verdict, post);
+  // A verdict that went stale while posting belongs to a newer run or head: it notifies nobody.
+  if (posted !== null && reconcilePosted(pr, posted, verdict, post)) {
+    const url = `${process.env.GITHUB_SERVER_URL || "https://github.com"}/${pr.repo}/pull/${pr.number}`;
+    await notify(process.env.STAMP_NOTIFY_WEBHOOK, { event: "stamp.verdict", repo: pr.repo, pr: pr.number, url, title: pr.title, head_sha: pr.headSha, verdict, held: gateVerdict === "DENIED", reason: scrub(body) }, notifyOn(process.env.STAMP_NOTIFY_ON));
+  }
 }
 
 const measurements = reviewMeasurements([llm, opinion].flatMap((r) => r ? [r.run] : []), verdict === "ERROR");
@@ -654,8 +661,7 @@ async function runDigest(): Promise<void> {
   const since = new Date(Date.now() - hours * 3600_000).toISOString();
   const bot = process.env.STAMP_BOT_LOGIN || whoami();
   const repo = repoSlug(repoRoot);
-  // Titles and summaries are PR-authored; Slack reads <...> as links and mentions (<!channel>).
-  const esc = (t: string) => t.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  const esc = slackEscape; // titles and summaries are PR-authored
   const items: string[] = [];
 
   for (const pr of mergedPRs(repoRoot)) {

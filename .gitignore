@@ -3,3 +3,7 @@ node_modules
 .claude/
 *.tgz
 .executable-stories/
+
+# Documentation build output
+docs/.astro/
+docs/dist/

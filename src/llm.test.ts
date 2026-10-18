@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import { anthropicBaseURL, DEFAULT_GUARD, guardRules, parseModelId, reviewWithTools, summarizeRun, timeoutMs } from "./llm.ts";
+import { anthropicBaseURL, apiKeyFor, DEFAULT_GUARD, guardRules, parseModelId, reviewWithTools, summarizeRun, timeoutMs } from "./llm.ts";
 
 const Verdict = z.object({ verdict: z.enum(["APPROVE", "REFUSE", "ESCALATE"]), reasoning: z.string() });
 
@@ -36,8 +36,17 @@ describe("model ids", () => {
     expect(parseModelId("openrouter:moonshotai/kimi-k3")).toEqual({ provider: "openrouter", model: "moonshotai/kimi-k3" });
     expect(parseModelId("groq:openai/gpt-oss-120b")).toEqual({ provider: "groq", model: "openai/gpt-oss-120b" });
     expect(parseModelId("mistral:mistral-small-latest")).toEqual({ provider: "mistral", model: "mistral-small-latest" });
+    expect(parseModelId("deepseek:deepseek-flash")).toEqual({ provider: "deepseek", model: "deepseek-flash" });
     expect(parseModelId("claude-opus-5")).toEqual({ provider: "anthropic", model: "claude-opus-5" });
     expect(parseModelId("qwen3.8-max")).toEqual({ provider: "anthropic", model: "qwen3.8-max" });
+  });
+
+  test("STAMP_API_KEY is the key for whichever provider the model names; the provider's own variable is the fallback", () => {
+    expect(apiKeyFor("deepseek", { STAMP_API_KEY: "one", DEEPSEEK_API_KEY: "own" })).toBe("one");
+    expect(apiKeyFor("deepseek", { DEEPSEEK_API_KEY: "own" })).toBe("own");
+    expect(apiKeyFor("opencode-go", { OPENCODE_API_KEY: "oc" })).toBe("oc");
+    expect(apiKeyFor("groq", { STAMP_API_KEY: "", GROQ_API_KEY: "g" })).toBe("g");
+    expect(apiKeyFor("bedrock", { STAMP_API_KEY: "one" })).toBeUndefined(); // the AWS credential chain
   });
 
   test("ANTHROPIC_BASE_URL keeps working in the Anthropic SDK's form, without /v1", () => {

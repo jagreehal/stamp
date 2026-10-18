@@ -42,7 +42,7 @@ deny:
   deps_toolchain:
     description: Lockfiles and toolchain/build files. Manifests (package.json) without a lockfile change are flagged for the reviewer instead.
     match:
-      paths: ['pnpm-lock\.yaml', 'package-lock\.json', 'yarn\.lock', 'bun\.lock', 'uv\.lock', 'poetry\.lock', 'Cargo\.lock', 'go\.sum', 'requirements[-\w]*\.(txt|in)', 'Makefile', '\.tool-versions', '\.nvmrc']
+      paths: ['pnpm-lock\.yaml', 'package-lock\.json', 'yarn\.lock', 'bun\.lock', 'uv\.lock', 'poetry\.lock', 'Cargo\.lock', 'Gemfile\.lock', 'go\.sum', 'requirements[-\w]*\.(txt|in)', 'Makefile', '\.tool-versions', '\.nvmrc']
   stamp_policy:
     description: stamp's own policy, engine, and gate inputs. The gate cannot approve edits to itself.
     match:
