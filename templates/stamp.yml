@@ -1,8 +1,9 @@
 # stamp: approve-first PR review. Installed by `bunx @jagreehal/stamp init`.
 #
 # One-time repo settings:
-#   - the key for your model's provider as a secret (see STAMP_MODEL below), and STAMP_MODEL as a variable
-#     when it is not claude-opus-5 on Anthropic
+#   - your provider's key as the STAMP_API_KEY secret, and STAMP_MODEL (provider:model, e.g.
+#     deepseek:deepseek-flash) as a variable when it is not claude-opus-5 on Anthropic. Keep settings like
+#     STAMP_MODEL in variables: GitHub masks a secret's value everywhere in the logs.
 #   - Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"
 #     (without it the approval posts but does not satisfy a required-reviews rule)
 name: stamp
@@ -61,7 +62,7 @@ jobs:
       #   with:
       #     role-to-assume: ${{ vars.AWS_ROLE_ARN }}
       #     aws-region: ${{ vars.AWS_REGION }}
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0: pinned, this job holds model keys
       - run: bunx "@jagreehal/stamp@$STAMP_VERSION" "$PR" --post --json "$RUNNER_TEMP/stamp.json"
         env:
           PR: ${{ github.event.pull_request.number || github.event.issue.number }}
@@ -78,8 +79,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}         # opencode-go:, opencode:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}     # openrouter:
+          STAMP_API_KEY: ${{ secrets.STAMP_API_KEY }}               # one key for whichever provider STAMP_MODEL names
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}                 # groq:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}           # mistral:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}         # deepseek:
           AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}     # gateway: (Vercel AI Gateway)
           AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }} # bedrock: with an API key; or leave empty and use OIDC (step above)
           AWS_REGION: ${{ vars.AWS_REGION }}                        # bedrock:
@@ -96,6 +99,8 @@ jobs:
           STAMP_CODEX_MODEL: ${{ vars.STAMP_CODEX_MODEL }}
           STAMP_CLAUDE_MODEL: ${{ vars.STAMP_CLAUDE_MODEL }} # empty = Claude Code's default
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }} # optional: Jev risk signals before the review
+          STAMP_NOTIFY_WEBHOOK: ${{ secrets.STAMP_NOTIFY_WEBHOOK }} # optional: Slack Incoming Webhook or any URL that takes JSON
+          STAMP_NOTIFY_ON: ${{ vars.STAMP_NOTIFY_ON }}               # empty = REFUSED,ESCALATE,ERROR; add APPROVED for every verdict
           # STAMP_LABEL: stamp                               # label mode: review only PRs carrying the label
       - uses: actions/upload-artifact@v4
         if: always()

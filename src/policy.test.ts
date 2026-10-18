@@ -63,6 +63,7 @@ describe("deny-list", () => {
   });
   test("lockfiles deny, manifests only flag", () => {
     expect(denyCategories(policy, ["pnpm-lock.yaml"])).toEqual(["deps_toolchain"]);
+    expect(denyCategories(policy, ["Gemfile.lock"])).toEqual(["deps_toolchain"]);
     expect(denyCategories(policy, ["package.json"])).toEqual([]);
     expect(manifestsWithoutLockfile(["package.json", "src/a.ts"])).toEqual(["package.json"]);
     expect(manifestsWithoutLockfile(["package.json", "pnpm-lock.yaml"])).toEqual([]);

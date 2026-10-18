@@ -31,7 +31,11 @@
     "lint": "oxlint src",
     "changeset": "changeset",
     "version-packages": "changeset version",
-    "release": "changeset publish"
+    "release": "changeset publish",
+    "docs:dev": "bun run --cwd docs dev",
+    "docs:build": "bun run docs:check && bun run --cwd docs build && bun docs/scripts/check-built.ts",
+    "docs:check": "bun docs/scripts/check.ts",
+    "docs:preview": "bun run --cwd docs preview"
   },
   "dependencies": {
     "@ai-sdk/amazon-bedrock": "5.0.118",
