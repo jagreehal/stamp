@@ -1,5 +1,25 @@
 # @jagreehal/stamp
 
+## 0.4.0
+
+### Minor Changes
+
+- 184c513: - `STAMP_NOTIFY_WEBHOOK` posts each refused, escalated or failed review to Slack or any JSON endpoint. `STAMP_NOTIFY_ON` picks the verdicts, and a PR the gates hold reads as needing a person.
+  - `STAMP_API_KEY` holds the key for whichever provider `STAMP_MODEL` names, so a repository keeps one secret.
+  - The `deepseek:` provider reviews through DeepSeek's API.
+  - A dry run checks the gates and calls no outside service.
+  - `Gemfile.lock` joins the lockfiles in `deps_toolchain`.
+  - The workflow templates pin `setup-bun` to a commit.
+  - A documentation site covers setup, policy, backends and operations.
+- a972673: - A `telemetry` gate holds a PR that writes a credential or a whole request's headers, body or cookies into a log or span, before the model runs.
+  - The observability rule pack grows to thirteen rules covering traces across every boundary, trace-linked logs, errors with their cause, request identifiers, alertable metrics, and safe telemetry startup and shutdown.
+- 7edf202: - A `tests` gate holds a PR for a person when it deletes a test file or adds a skip or only marker to a test.
+  - `stories:` in policy.yml shows the reviewer the executable-stories report your CI uploads, matched to the commit its tests ran on.
+  - `reviewer_checks` holds the review while a listed check run, such as Claude Code Review, is running. `review_agents` covers `REVIEW.md`.
+  - Bedrock signs requests through the AWS credential chain when `AWS_BEARER_TOKEN_BEDROCK` is unset, so `AWS_PROFILE` and SSO work.
+  - The `stamp.review` span carries the base SHA, the CI run, usage counts and `stamp.cost_complete`.
+  - Updated the AI SDK providers, autotel, zod and yaml.
+
 ## 0.3.0
 
 ### Minor Changes
