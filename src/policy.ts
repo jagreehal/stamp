@@ -620,6 +620,54 @@ export function addedSecrets(diff: string): string[] {
   return [...found];
 }
 
+// A call that writes telemetry: a span attribute or event, or a logger method. The receiver names a logger
+// (`log`, `logger`, `requestLog`, `console`) or a span (`span`, `rootSpan`), so a Map's `.set(`, a
+// catalog's `.set(` or an emitter's `.error(` is not one.
+const TELEMETRY_CALL_RE = /(?:\bsetAttributes?|\.addEvent|\b(?:log|logger|console|span|\w+(?:Log|Logger|Span))\s*\.\s*(?:set|info|warn|error|debug|trace|fatal|log|child))\s*\(/;
+
+// A credential or card field by name, as an object key (`{ password }`, `apiKey:`, `'authorization':`) or as
+// the attribute name a setAttribute call writes. The name ends at a word boundary, so `passwordReset`,
+// `password_hash` and `tokens` are other fields. A word inside a log message is prose, not a key.
+const SECRET_FIELD = String.raw`(?:password|passwd|secret|client_?secret|authorization|cookie|api_?key|private_?key|access_?token|refresh_?token|id_?token|session_?token|card_?number|cvv|cvc|ssn)`;
+
+const SECRET_KEY_RES = [
+  new RegExp(String.raw`[{,]\s*(?:["'\`][\w.-]*?)?\b(${SECRET_FIELD})\b["'\`]?\s*[:,}]`, "i"),
+  new RegExp(String.raw`setAttribute\s*\(\s*["'\`][\w.-]*?\b(${SECRET_FIELD})["'\`]`, "i"),
+];
+
+// A whole request's headers, body or cookies: every header is an Authorization or Cookie waiting to happen.
+// A single field (`req.headers['x-request-id']`, `req.body.orderId`) is bounded and fine.
+const WHOLE_REQUEST_RE = /\b((?:req|request|c\.req|ctx\.request)\.(?:headers|body|cookies)\b(?!\s*[.[(?])|c\.req\.header\(\s*\))/;
+
+const JS_RE = /\.(?:[cm]?[jt]sx?)$/i;
+
+/**
+ * Credentials and whole requests the diff writes into logs or spans, as "path: what". Telemetry is copied to
+ * vendors, kept for weeks and read by people who could not see the request, so a leak there is not fixed by
+ * rotating a key. JS and TS source only, tests aside: the shapes are JavaScript's, and a test asserting on
+ * redaction names the field on purpose. Added lines only, like the secrets gate.
+ */
+export function telemetryLeaks(diff: string): string[] {
+  const found = new Set<string>();
+
+  for (const [file, added] of addedLines(diff)) {
+    if (!JS_RE.test(file) || isTest(file)) continue;
+    const raw = added.slice(1);
+    const call = TELEMETRY_CALL_RE.exec(codeOnly(file, raw));
+
+    if (!call) continue;
+    const rest = raw.slice(call.index);
+    const key = SECRET_KEY_RES.map((re) => re.exec(rest)?.[1]).find(Boolean);
+    const whole = WHOLE_REQUEST_RE.exec(codeOnly(file, rest))?.[1];
+
+    if (key) found.add(`${file}: ${key.toLowerCase()} written to telemetry`);
+
+    if (whole) found.add(`${file}: ${whole.replace(/\s+/g, "")} written to telemetry`);
+  }
+
+  return [...found];
+}
+
 // Markers that switch a test off, or narrow a run to one: JS/TS, pytest/unittest, Go, Rust, JUnit. A
 // conditional skip (`skipIf`, `mark.skipif`) is left to the reviewer: it is usually an environment guard.
 // Any .skip or .only access counts, so a call split across lines (`test\n  .skip(`) or a parameterized form
@@ -822,6 +870,12 @@ export function runGates(policy: Policy, pr: PRMeta): GateRun {
   const secrets = pr.diff ? addedSecrets(pr.diff) : [];
 
   gates.push({ gate: "secrets", passed: secrets.length === 0, message: secrets.length ? `credential added in ${secrets.join("; ")}` : "no credentials in the diff" });
+
+  // Telemetry outlives the request and leaves the team's hands, so a credential or a whole request written
+  // into a log or span denies before the model, the same as a committed key.
+  const leaks = pr.diff ? telemetryLeaks(pr.diff) : [];
+
+  gates.push({ gate: "telemetry", passed: leaks.length === 0, message: leaks.length ? `sensitive data in telemetry: ${leaks.join("; ")}` : "no credentials or whole requests in logs or spans" });
 
   // A green run over a deleted or skipped test proves nothing, and no reviewer paragraph should be able to
   // argue otherwise, so this denies before the model. Rewritten assertions stay with the reviewer.

@@ -33,6 +33,15 @@ rules:
 
 A pack can live in an organisation's policy repository, pinned to a full commit: `github:owner/repo/<path>@<sha>`. stamp reads it through gh at that commit, and only when that commit is on the policy repository's default branch (GitHub serves fork commits through the parent repository too), so the shepherd pack that carries the lens and the stamp policy that gates on it name the same file. A branch or tag is rejected, since it can move. A private policy repository needs the workflow's `GH_TOKEN` to be a token that can read it; the default `GITHUB_TOKEN` reads only this repository, and a pack it cannot read is skipped with a warning. No PR in this repository can edit a pinned pack, so it is not part of the stamp_policy deny check; changing it means moving the pin, which edits `.stamp/policy.yml`.
 
-The observability pack checks that outbound calls carry a span or log, that errors keep their cause, that logs are structured and free of secrets and personal data, that dropped data is counted, that labels stay bounded, and that a user-facing change emits a signal.
+The observability pack asks whether an on-call engineer could debug the change in production from its telemetry alone. Its thirteen rules check that:
+
+- every entry point and outbound call has a span, and trace context survives services, queues and background work
+- errors keep their cause, and logs are structured and tied to the trace
+- handlers record the identifiers that find a request, and telemetry carries no secrets or personal data
+- dropped data is counted, names and labels stay bounded, and new dependencies and jobs emit what an alert needs
+- user-facing changes emit a signal, and renamed telemetry is called out
+- telemetry setup can neither crash the app nor lose its buffer on exit, and sampling and redaction keep what the team relies on
+
+For production observability, use `on_break: refuse`. Each rule names the code that breaks it, so a break is a blind spot the next incident falls into, and the author fixes it before approval rather than after. The `telemetry` gate already refuses credentials and whole requests written into logs or spans, before the model runs.
 
 stamp reads each pack from the default branch, like policy, so a PR cannot write the rules it is judged by. A pack path must stay inside the repository. A pack missing from the default branch is skipped with a warning. Each pack that applies becomes a `rules:<name>` scrutiny flag: the reviewer sees the rules and the files, a flagged PR brings in the second reviewer when one is configured, and the evidence bundle and trace record it. A pack's rules reach the reviewer as trusted context that can only add checks: the prompt says nothing in a pack approves a change, waives a gate or loosens the guidance. Because the text is trusted, a PR that edits the file a configured pack is read from, wherever it lives, counts as editing stamp's policy: the deny-list refuses it and a human reviews it.
