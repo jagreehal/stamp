@@ -30,6 +30,7 @@ import {
   sizeWithinBudgets,
   substantiveSize,
   suppressionFlags,
+  telemetryLeaks,
   testMarkerFlags,
   weakenedTests,
   incidentFlags,
@@ -420,6 +421,42 @@ test("weakenedTests decodes paths Git quotes", () => {
   const diff = ['diff --git "a/src/caf\\303\\251.test.ts" "b/src/caf\\303\\251.test.ts"', '--- "a/src/caf\\303\\251.test.ts"', '+++ "b/src/caf\\303\\251.test.ts"', "@@ -1 +1 @@", "+test.skip('x', () => {});"].join("\n");
 
   expect(weakenedTests([], diff)).toEqual(["src/café.test.ts: .skip"]);
+});
+
+test("telemetryLeaks flags credentials and whole requests written to logs or spans", () => {
+  const diff = [
+    ...fileDiff(
+      "src/routes/login.ts",
+      "+  log.info({ userId, password });",
+      "+  span.setAttribute('http.request.header.authorization', auth);",
+      "+  requestLog.set({ headers: req.headers });",
+      "+  logger.debug(c.req.header());",
+    ),
+    ...fileDiff(
+      "src/routes/ok.ts",
+      "+  log.info('password reset requested', { userId });", // prose, not a key
+      "+  log.set({ passwordReset: true, tokens: 42, password_hash_algo: 'argon2' });", // other fields
+      "+  log.set({ requestId: req.headers['x-request-id'], orderId: req.body.orderId });", // one bounded field
+      "+  cache.set({ password });", // not telemetry
+      "-  log.info({ password });", // removed
+    ),
+    ...fileDiff("src/routes/login.test.ts", "+  log.info({ password });"), // a redaction test names the field
+    ...fileDiff("docs/logging.md", "+log.info({ password })"),
+  ].join("\n");
+
+  expect(telemetryLeaks(diff)).toEqual([
+    "src/routes/login.ts: password written to telemetry",
+    "src/routes/login.ts: authorization written to telemetry",
+    "src/routes/login.ts: req.headers written to telemetry",
+    "src/routes/login.ts: c.req.header() written to telemetry",
+  ]);
+});
+
+test("the telemetry gate denies on its own, before the model", () => {
+  const r = gates({ ...ready, files: [f("src/a.ts")], diff: fileDiff("src/a.ts", "+console.log(req.body);").join("\n") });
+
+  expect(r.gates.find((g) => g.gate === "telemetry")).toEqual({ gate: "telemetry", passed: false, message: "sensitive data in telemetry: src/a.ts: req.body written to telemetry" });
+  expect(gates({ ...ready, files: [f("src/a.ts")], diff: fileDiff("src/a.ts", "+log.info({ orderId });").join("\n") }).gates.find((g) => g.gate === "telemetry")?.passed).toBe(true);
 });
 
 test("the tests gate denies on its own, before the model", () => {
@@ -1139,6 +1176,11 @@ describe("team rule packs", () => {
     expect(flags[0]!.instruction).not.toContain("## Fix");
     expect(flags[0]!.instruction).toEndWith("REFUSE when the diff breaks one of these rules, and name the rule id.");
     expect(ruleFlags(p, ["docs/a.md"], read).flags).toEqual([]);
+  });
+
+  test("the bundled pack's rules reach the reviewer whole, under the cap the instruction is cut at", () => {
+    expect(reviewSection(pack).length).toBeLessThanOrEqual(6000);
+    expect(reviewSection(pack)).toEndWith("Why: the telemetry a team relied on is gone and nothing says so.");
   });
 
   test("a pack missing from the default branch is reported and skipped; escalate is the default", () => {
