@@ -49,7 +49,7 @@ function loadPricing(): void {
   pricingLoadedFor = process.env.STAMP_PRICING;
 }
 
-const PROVIDERS = ["anthropic", "bedrock", "opencode", "opencode-go", "openrouter", "groq", "mistral", "deepseek", "gateway"] as const;
+const PROVIDERS = ["anthropic", "bedrock", "openai", "opencode", "opencode-go", "openrouter", "groq", "mistral", "deepseek", "gateway", "compatible"] as const;
 
 type Provider = (typeof PROVIDERS)[number];
 
@@ -72,10 +72,13 @@ export function anthropicBaseURL(raw = process.env.ANTHROPIC_BASE_URL): string |
 }
 
 /** Every variable a provider reads its credentials or endpoint from. The workflow template passes each one. */
-export const PROVIDER_ENV = ["STAMP_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "DEEPSEEK_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"];
+export const PROVIDER_ENV = ["STAMP_API_KEY", "STAMP_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "DEEPSEEK_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"];
 
-const KEY_ENV: Record<Exclude<Provider, "bedrock">, string> = {
+const KEY_ENV: Record<Provider, string> = {
   anthropic: "ANTHROPIC_API_KEY",
+  bedrock: "AWS_BEARER_TOKEN_BEDROCK",
+  openai: "OPENAI_API_KEY",
+  compatible: "STAMP_API_KEY", // any OpenAI-compatible endpoint: its key is STAMP_API_KEY
   opencode: "OPENCODE_API_KEY",
   "opencode-go": "OPENCODE_API_KEY",
   openrouter: "OPENROUTER_API_KEY",
@@ -87,11 +90,15 @@ const KEY_ENV: Record<Exclude<Provider, "bedrock">, string> = {
 
 /**
  * The key for the provider STAMP_MODEL names: STAMP_API_KEY when set, so a repository holds one secret
- * whatever the provider, else the provider's own variable. Bedrock has none: it uses the AWS credential chain.
+ * whatever the provider, else the provider's own variable. On Bedrock the key is a Bedrock API key (bearer
+ * token); with neither set, Bedrock signs through the AWS credential chain, which is how OIDC works.
  */
 export function apiKeyFor(provider: Provider, env: Record<string, string | undefined> = process.env): string | undefined {
-  return provider === "bedrock" ? undefined : env.STAMP_API_KEY || env[KEY_ENV[provider]];
+  return env.STAMP_API_KEY || env[KEY_ENV[provider]];
 }
+
+/** How stamp authenticates to Bedrock: a bearer API key when it has one, else SigV4 from the credential chain. */
+type BedrockAuth = { credentialProvider: ReturnType<typeof defaultProvider>; apiKey?: string };
 
 const OPENCODE = { opencode: "https://opencode.ai/zen/v1", "opencode-go": "https://opencode.ai/zen/go/v1" } as const;
 
@@ -109,9 +116,12 @@ export function languageModel(id: string, session: string): LanguageModel {
 
   switch (provider) {
     case "bedrock": {
-      // AWS_BEARER_TOKEN_BEDROCK wins when set. Otherwise SigV4 through the AWS credential chain: environment
-      // keys (what an OIDC step exports), then AWS_PROFILE, SSO and instance roles. The region stays AWS_REGION.
-      const aws = { credentialProvider: defaultProvider() };
+      // A Bedrock API key (STAMP_API_KEY or AWS_BEARER_TOKEN_BEDROCK) wins when set. Otherwise SigV4 through the
+      // AWS credential chain: environment keys (what an OIDC step exports), then AWS_PROFILE, SSO and instance
+      // roles. The region stays AWS_REGION.
+      const aws: BedrockAuth = { credentialProvider: defaultProvider() };
+
+      if (apiKey) aws.apiKey = apiKey;
 
       // Claude on Bedrock through InvokeModel (prompt caching, native features); everything else through Converse.
       return model.includes("anthropic.") ? createBedrockAnthropic(aws)(model) : createAmazonBedrock(aws)(model);
@@ -126,6 +136,17 @@ export function languageModel(id: string, session: string): LanguageModel {
       if (model.startsWith("claude-")) return createAnthropic({ baseURL, apiKey, headers })(model);
 
       return createOpenAICompatible({ name: provider, baseURL, apiKey, headers })(model);
+    }
+
+    case "openai":
+      return createOpenAI({ apiKey, headers }).responses(model);
+    case "compatible": {
+      // Any OpenAI-compatible endpoint: Azure OpenAI, xAI, Together, Fireworks, LiteLLM, vLLM, Ollama.
+      const baseURL = process.env.STAMP_BASE_URL;
+
+      if (!baseURL) throw new Error("compatible: models need STAMP_BASE_URL, the endpoint's OpenAI-compatible base URL (https://host/v1)");
+
+      return createOpenAICompatible({ name: "compatible", baseURL, apiKey, headers })(model);
     }
 
     case "openrouter":
@@ -269,6 +290,18 @@ const SUBMIT = "submit_verdict";
 const MAX_STEPS = 40;
 
 /**
+ * The output-token ceiling for one model call: STAMP_MAX_OUTPUT_TOKENS when set, else 16k, or 10k for Amazon
+ * Nova, which refuses a request above its 10k limit outright. A verdict needs far less; the room is for reasoning.
+ */
+export function maxOutputTokens(modelId: string, env: Record<string, string | undefined> = process.env): number {
+  const set = Number(env.STAMP_MAX_OUTPUT_TOKENS);
+
+  if (Number.isInteger(set) && set > 0) return set;
+
+  return /(^|[:.])amazon\.nova-/.test(modelId) ? 10_000 : 16_000;
+}
+
+/**
  * Run the review loop and return the submitted verdict. A model that answers in prose instead gets one
  * follow-up call that must be submit_verdict. A guard rule that fires aborts the run and throws, so the
  * caller reports ERROR and nothing is approved.
@@ -326,7 +359,7 @@ export async function reviewWithTools<T>(o: Options<T>): Promise<ToolReview<T>> 
   };
 
   const instructions = { role: "system" as const, content: o.system, providerOptions: { anthropic: { cacheControl: { type: "ephemeral" as const } } } };
-  const common = { model, instructions, tools, maxOutputTokens: 16_000, abortSignal, onStepFinish };
+  const common = { model, instructions, tools, maxOutputTokens: maxOutputTokens(o.modelId), abortSignal, onStepFinish };
 
   const guardError = () =>
     new Error(`review stopped: ${timer?.aborted && !guard.stopped ? `timed out after ${rule(limits, "timeout")?.slice("timeout:".length)}` : guard.violations.map((v) => v.message).join("; ")}`);

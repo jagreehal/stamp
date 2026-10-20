@@ -38,6 +38,34 @@ rules:
 
 Replace the repository, path and SHA; give Stamp's `gh` identity read access to the pack repository. Keep the `## Review` section in the supported rule format. Read the team-rules section in [policy and gates](/stamp/configuration/policy/#team-rules) for trust and failure handling.
 
+## Review a polyglot repository
+
+Compose shepherd's stack packs in `.shepherd/config.yml` and let stamp read them:
+
+```yaml
+# .stamp/policy.yml: add to your existing policy
+rules_from:
+  shepherd:
+    on_break: escalate
+```
+
+```yaml
+# .shepherd/config.yml
+extends:
+  - github:jagreehal/shepherd/packs/nextjs.yml@<sha>   # React and Next.js
+  - github:jagreehal/shepherd/packs/go.yml@<sha>
+  - github:jagreehal/shepherd/packs/rust.yml@<sha>
+  - github:jagreehal/shepherd/packs/java.yml@<sha>
+  - github:jagreehal/shepherd/packs/dotnet.yml@<sha>
+lenses:
+  go:
+    applies_to: ['services/**/*.go']
+  rust:
+    gate: refuse
+```
+
+Each pack brings one lens scoped to its files. The repository entries narrow `go` to the services directory and make every `rust` rule refuse. Replace `<sha>` with a commit on jagreehal/shepherd's main branch.
+
 ## Change a size limit
 
 Edit `size_gate` in the generated policy, and keep any configured override ceilings at or above the new global limits. A size exemption changes the counted size, not whether Stamp reviews the file. Ask a maintainer to review the policy change.

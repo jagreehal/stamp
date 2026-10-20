@@ -22,7 +22,7 @@ Stamp reads `.stamp/policy.yml` from the default branch. If that branch has no p
 
 Keep `deny.stamp_policy`: the schema requires that category so the gate cannot approve its own policy edits. Keep the generated protections when you customise other categories. A lighter tier still receives model review.
 
-Deny and scrutiny path patterns are regexes, not globs. Use single-quoted YAML strings for regex backslashes. `rules.<name>.applies_to` uses globs. Read [gates and tiers](/stamp/configuration/policy/) for the matching rules and bundled categories.
+Deny and scrutiny path patterns are regexes, not globs. Use single-quoted YAML strings for regex backslashes. `rules.<name>.applies_to` uses globs, and `only` and `disable` use globs over rule ids. Read [gates and tiers](/stamp/configuration/policy/) for the matching rules and bundled categories.
 
 ## Optional fields
 
@@ -43,10 +43,15 @@ Deny and scrutiny path patterns are regexes, not globs. Use single-quoted YAML s
 | `scrutiny.<name>.description` | Optional text | Explain the scrutiny category |
 | `reviewer_bots` | Empty list | Bot logins whose recent review reactions Stamp waits for |
 | `reviewer_checks` | Empty list | Check-run names Stamp waits for while queued or running |
+| `long_lived_branches` | `main`, `master`, `develop`, `release`, `release/*`, `staging` | Branch globs a PR is branched from or merged into. A PR whose commits mostly sit on one of these, other than its base, is denied with a retarget command. An empty list turns the check off |
 | `rules` | Empty map | Team rule packs, keyed by a lowercase name (`a-z`, digits, `-`) |
 | `rules.<name>.skill` | Required string | Repository-relative skill path or `github:owner/repo/path@<full-sha>` |
 | `rules.<name>.applies_to` | All changed files | Globs selecting files for a rule pack |
-| `rules.<name>.on_break` | `escalate` | `refuse`, `escalate`, or `note` |
+| `rules.<name>.on_break` | `escalate` | `refuse`, `escalate`, or `note`, for rules without a severity tag |
+| `rules.<name>.only` | All rules | Rule id globs to keep |
+| `rules.<name>.disable` | No rules | Rule id globs to drop |
+| `rules_from` | Absent | Build rule packs from another tool's config |
+| `rules_from.shepherd.on_break` | `escalate` | `on_break` for shepherd lenses that set no `gate` |
 
 Both override ceilings must be present when `overrides` is set, and each must cover the global limit. When you configure familiarity, provide the strong and moderate thresholds together. Familiarity and test evidence remain advisory; they cannot override gates.
 
@@ -58,6 +63,7 @@ Both override ceilings must be present when `overrides` is set, and each must co
 | `.stamp/review-guidance.md` | Instructions for the scoped model review |
 | `.stamp/steering.md` | Optional repository-specific review steering |
 | Configured rule-pack `SKILL.md` | Team rules from its `## Review` section |
+| `.shepherd/config.yml` | Lenses read as rule packs when `rules_from.shepherd` is set |
 | `AGENT_APPROVALS.md` | Folder size grants, within the policy ceilings |
 | `CODEOWNERS` | Advisory ownership context |
 

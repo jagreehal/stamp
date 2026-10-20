@@ -63,13 +63,13 @@ const Pull = z.object({
   draft: z.boolean(),
   mergeable_state: z.string(),
   labels: z.array(z.object({ name: z.string() })),
-  head: z.object({ sha: z.string(), repo: z.object({ full_name: z.string() }).nullable() }),
+  head: z.object({ ref: z.string().default(""), sha: z.string(), repo: z.object({ full_name: z.string() }).nullable() }),
   base: z.object({ ref: z.string(), sha: z.string(), repo: z.object({ full_name: z.string() }) }),
 });
 
 const File = z.object({ filename: z.string(), previous_filename: z.string().optional(), additions: z.number(), deletions: z.number(), status: z.string() });
 
-const ReviewRow = z.object({ id: z.number(), user: Login, state: z.string(), body: z.string(), commit_id: z.string() });
+const ReviewRow = z.object({ id: z.number(), user: Login, state: z.string(), body: z.string(), commit_id: z.string(), author_association: z.string().optional() });
 
 const ThreadPage = z.object({
   data: z.object({
@@ -132,6 +132,7 @@ export type PR = {
   isDraft: boolean;
   mergeable: string;
   baseRef: string;
+  headRef: string;
   defaultBranch: string;
   headSha: string;
   baseSha: string;
@@ -145,6 +146,8 @@ export type PR = {
   /** Issues the PR closes, from GitHub's closing references. Context, never assurance; an `incident` label only tightens the review. */
   issues?: LinkedIssue[];
   diff: string;
+  /** Set when the review covers only this PR's change over an open stacked parent: files, commits and diff are that delta. */
+  stack?: { parent: number; parentHead: string };
 };
 
 export type LinkedIssue = { ref: string; title: string; body: string; labels: string[] };
@@ -214,6 +217,7 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
     isDraft: view.draft,
     mergeable: view.mergeable_state === "dirty" ? "CONFLICTING" : "MERGEABLE",
     baseRef: view.base.ref,
+    headRef: view.head.ref,
     defaultBranch: repo.defaultBranchRef.name,
     headSha,
     baseSha: view.base.sha,
@@ -316,6 +320,30 @@ const startedAfter = (r: ReviewRecord, iso: string) => {
 
   return started !== undefined && started > iso;
 };
+
+const Compare = z.object({ files: z.array(File).default([]), commits: z.array(CommitRow) });
+
+/**
+ * The files and commits of from...to, through the compare API, with its unified diff. The API lists at most 300
+ * files, so a fuller list is null: the caller reviews the whole PR instead.
+ */
+export function compareDelta(repo: string, from: string, to: string, cwd: string): Pick<PR, "files" | "commits" | "diff"> | null {
+  const c = Compare.parse(JSON.parse(gh(["api", `repos/${repo}/compare/${from}...${to}`], cwd)));
+
+  if (c.files.length >= 300) return null;
+
+  return {
+    files: c.files.map((f) => ({ filename: f.filename, previousFilename: f.previous_filename, additions: f.additions, deletions: f.deletions, status: f.status })),
+    commits: c.commits.map((x) => ({ sha: x.sha, message: x.commit.message })),
+    diff: compareDiff(repo, from, to, cwd),
+  };
+}
+
+const OpenPR = z.object({ number: z.number(), headRefOid: z.string(), isCrossRepository: z.boolean() });
+
+/** Open PRs into `base` whose head lives in this repository: the candidates for a stacked parent. */
+export const openPRsInto = (base: string, cwd: string) =>
+  call(z.array(OpenPR), ["pr", "list", "--state", "open", "--base", base, "--limit", "100", "--json", "number,headRefOid,isCrossRepository"], cwd).filter((p) => !p.isCrossRepository);
 
 /** Unified diff of base...head on immutable SHAs, via the compare API. Throws on any gh failure. */
 export const compareDiff = (repo: string, baseSha: string, headSha: string, cwd: string) =>

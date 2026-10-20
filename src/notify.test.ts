@@ -76,7 +76,7 @@ describe("stale verdicts", () => {
 
   const pr: PR = {
     repo: "acme/api", number: 7, title: "t", body: "", author: "dev", authorAssociation: "MEMBER", isFork: false, isDraft: false,
-    mergeable: "MERGEABLE", baseRef: "main", defaultBranch: "main", headSha: HEAD, baseSha: BASE, labels: [], files: [], reviews: [],
+    mergeable: "MERGEABLE", baseRef: "main", headRef: "feat", defaultBranch: "main", headSha: HEAD, baseSha: BASE, labels: [], files: [], reviews: [],
     inline: [], discussion: [], reactions: [], commits: [], diff: "",
   };
 

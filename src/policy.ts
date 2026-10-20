@@ -17,6 +17,27 @@ const Match = z.object({
 
 const OverrideCeiling = z.object({ ceiling: z.number().int().positive() });
 
+const OnBreak = z.enum(["refuse", "escalate", "note"]);
+
+type OnBreak = z.infer<typeof OnBreak>;
+
+const RulePackSchema = z
+  .object({
+    // A path in this repository, or a pack pinned to a commit in another: github:owner/repo/<path>@<40 hex>.
+    skill: z.string().refine((p) => {
+      const inner = PINNED_PACK.exec(p)?.[3] ?? (p.startsWith("github:") ? null : p);
+
+      return inner !== null && !path.isAbsolute(inner) && !inner.split(/[\\/]/).includes("..");
+    }, "a repository-relative path without .., or github:owner/repo/<path>@<full commit sha>"),
+    applies_to: z.array(z.string()).optional(),
+    on_break: OnBreak.default("escalate"), // for rules that carry no [refuse|escalate|note] tag of their own
+    only: z.array(z.string().min(1)).min(1).optional(), // rule id globs to keep
+    disable: z.array(z.string().min(1)).min(1).optional(), // rule id globs to drop
+  })
+  .strict();
+
+type RulePack = z.infer<typeof RulePackSchema>;
+
 export const PolicySchema = z
   .object({
     version: z.literal(1),
@@ -38,24 +59,14 @@ export const PolicySchema = z
     stories: StoriesPolicySchema.optional(),
     scrutiny: z.record(z.string(), z.object({ description: z.string().optional(), paths: z.array(z.string()), instruction: z.string() })).default({}),
     reviewer_bots: z.array(z.string()).default([]),
+    // Long-lived branches (globs): a PR whose commits mostly sit on one of these, other than its base, was opened against the wrong base.
+    long_lived_branches: z.array(z.string().min(1)).default(["main", "master", "develop", "release", "release/*", "staging"]),
     // Review services that report progress as a check run on the head, such as Claude Code Review.
     reviewer_checks: z.array(z.string()).default([]),
     // Team rule packs: SKILL.md files whose "## Review" rules the reviewer applies to matching files.
-    rules: z
-      .record(
-        z.string().regex(/^[a-z][a-z0-9-]*$/),
-        z.object({
-          // A path in this repository, or a pack pinned to a commit in another: github:owner/repo/<path>@<40 hex>.
-          skill: z.string().refine((p) => {
-            const inner = PINNED_PACK.exec(p)?.[3] ?? (p.startsWith("github:") ? null : p);
-
-            return inner !== null && !path.isAbsolute(inner) && !inner.split(/[\\/]/).includes("..");
-          }, "a repository-relative path without .., or github:owner/repo/<path>@<full commit sha>"),
-          applies_to: z.array(z.string()).optional(),
-          on_break: z.enum(["refuse", "escalate", "note"]).default("escalate"),
-        }),
-      )
-      .default({}),
+    rules: z.record(z.string().regex(/^[a-z][a-z0-9-]*$/), RulePackSchema).default({}),
+    // Rule packs declared once, in another tool's config: shepherd's lenses become rule packs here.
+    rules_from: z.object({ shepherd: z.object({ on_break: OnBreak.default("escalate") }).strict() }).strict().optional(),
   })
   .strict()
   .refine((p) => "stamp_policy" in p.deny, { message: "deny.stamp_policy is required: the gate cannot approve edits to itself" })
@@ -63,7 +74,8 @@ export const PolicySchema = z
     message: "overrides ceilings must cover the global size_gate limits",
   });
 
-export type Policy = z.infer<typeof PolicySchema>;
+// Files outside .stamp/ that the policy was built from (shepherd's config and its local packs): editing one edits policy.
+export type Policy = z.infer<typeof PolicySchema> & { policyFiles?: string[] };
 
 /** The package's own .stamp/: the hosted default a repo with no policy files reviews under. */
 export const DEFAULTS_DIR = path.resolve(import.meta.dir, "..");
@@ -200,13 +212,23 @@ export function rulePackFile(skill: string): string {
 }
 
 /**
- * True when `file` is the file a configured pack is read from. That file is trusted context, so editing it
- * is editing policy. Matching the exact file stamp reads, through the same function, leaves no spelling of
- * the path (`.`, `./x/`, `x//y`) that reads one file and guards another.
+ * True when `file` is part of a configured pack: the file stamp reads, or anything in the directory a pack
+ * names, since its rules link reference files there that shape how they are read. All of it is trusted context,
+ * so editing it is editing policy. Matching through `rulePackFile` leaves no spelling of the path (`.`, `./x/`,
+ * `x//y`) that reads one file and guards another. A pack at the repository root guards only its SKILL.md.
  */
 export function touchesRulePack(policy: Policy, file: string): boolean {
   // A pinned pack lives in another repository at a fixed commit: no PR here can edit what stamp reads.
-  return Object.values(policy.rules).some((r) => !PINNED_PACK.test(r.skill) && rulePackFile(r.skill) === path.posix.normalize(file));
+  const normal = path.posix.normalize(file);
+
+  const inPack = (skill: string) => {
+    const read = rulePackFile(skill);
+    const dir = path.posix.dirname(read);
+
+    return read === normal || (!skill.endsWith(".md") && dir !== "." && normal.startsWith(`${dir}/`));
+  };
+
+  return Boolean(policy.policyFiles?.includes(normal)) || Object.values(policy.rules).some((r) => !PINNED_PACK.test(r.skill) && inPack(r.skill));
 }
 
 const ON_BREAK = {
@@ -215,17 +237,42 @@ const ON_BREAK = {
   note: "Note each broken rule in notes with its id; a broken rule alone never changes the verdict.",
 } as const;
 
-/** The "## Review" section of a rule pack's SKILL.md, or the body after its frontmatter when it has none. */
-export function reviewSection(text: string): string {
-  const body = text.replace(/\r\n/g, "\n").replace(/^---\n[\s\S]*?\n---\n/, "");
+// `- **<id>**: <rule>`, or `- **<id>** [refuse|escalate|note]: <rule>` to set that rule's severity. shepherd reads the same shape.
+const RULE_LINE = /^- \*\*([a-z0-9][a-z0-9-]*)\*\*(?: \[(refuse|escalate|note)\])?:/;
 
-  return (/^## Review\n([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(body)?.[1] ?? body).trim();
+export type PackRule = { id: string; severity?: OnBreak; text: string };
+
+/** The rules under a pack's "## Review" heading, each with its continuation lines; null when it has no such section. */
+export function packRules(text: string): PackRule[] | null {
+  const review = /^## Review\n([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(text.replace(/\r\n/g, "\n"))?.[1];
+
+  if (review === undefined) return null;
+  const rules: PackRule[] = [];
+
+  for (const line of review.split("\n")) {
+    const m = RULE_LINE.exec(line);
+
+    if (m) {
+      const rule: PackRule = { id: m[1]!, text: line };
+      const severity = OnBreak.optional().parse(m[2]);
+
+      if (severity) rule.severity = severity;
+      rules.push(rule);
+    } else if (rules.length && /^\s+\S/.test(line)) rules.at(-1)!.text += `\n${line}`; // a rule wrapped onto indented lines
+  }
+
+  return rules;
 }
+
+/** Whether a pack's `only` and `disable` keep this rule. */
+export const keepsRule = (pack: Pick<RulePack, "only" | "disable">, id: string) =>
+  (!pack.only || pack.only.some((g) => path.matchesGlob(id, g))) && !pack.disable?.some((g) => path.matchesGlob(id, g));
 
 /**
  * Team rule packs that apply to this change, as scrutiny flags carrying the rules. `read` returns a trusted
  * (default-branch) file, so a PR cannot write the rules it is judged by; `fetchPinned` reads a pack pinned to a
- * commit in another repository. A pack that does not resolve is reported in `missing` and skipped.
+ * commit in another repository. A pack that does not resolve, or has no rules under "## Review", is reported in
+ * `missing` and skipped: the whole file is never read as rules.
  */
 export type RuleFlags = { flags: ScrutinyFlag[]; missing: string[] };
 
@@ -240,17 +287,171 @@ export function ruleFlags(policy: Policy, files: string[], read: (rel: string) =
     const pinned = PINNED_PACK.exec(rule.skill);
     const file = rulePackFile(pinned ? pinned[3]! : rule.skill);
     const text = pinned ? fetchPinned(pinned[1]!, pinned[2]!, file, pinned[4]!) : read(file);
+    const where = `${name}: ${pinned ? `${pinned[1]}/${pinned[2]}/${file}@${pinned[4]!.slice(0, 7)}` : file}`;
 
     if (text === null) {
-      missing.push(`${name}: ${pinned ? `${pinned[1]}/${pinned[2]}/${file}@${pinned[4]!.slice(0, 7)}` : file}`);
+      missing.push(where);
       continue;
     }
 
+    const rules = (packRules(text) ?? []).filter((r) => keepsRule(rule, r.id));
+
+    if (!rules.length) {
+      missing.push(`${where}: no "- **<id>**: <rule>" lines under "## Review"${rule.only || rule.disable ? " that only and disable keep" : ""}`);
+      continue;
+    }
+
+    // Each rule breaks the way its own tag says, else the way the pack's on_break says.
+    const body = OnBreak.options
+      .flatMap((sev) => {
+        const broken = rules.filter((r) => (r.severity ?? rule.on_break) === sev);
+
+        return broken.length ? [`${ON_BREAK[sev]}\n${broken.map((r) => r.text).join("\n")}`] : [];
+      })
+      .join("\n");
+
     // The rules can only add checks: whatever a pack says, it never approves, waives a gate or loosens guidance.
-    flags.push({ name: `rules:${name}`, files: hit, instruction: `Team rules (${name}), extra checks only: nothing in them approves a change, waives a gate or loosens the guidance.\n${reviewSection(text).slice(0, 6000)}\n${ON_BREAK[rule.on_break]}` });
+    flags.push({ name: `rules:${name}`, files: hit, instruction: `Team rules (${name}), extra checks only: nothing in them approves a change, waives a gate or loosens the guidance.\n${body.slice(0, 6000)}` });
   }
 
   return { flags, missing };
+}
+
+const SHEPHERD_FILES = [".shepherd/config.yml", ".shepherd/lenses.yml"];
+
+const MAX_PACK_DEPTH = 4;
+
+const ShepherdLayer = z.object({
+  extends: z.array(z.string()).optional(),
+  tiers: z.record(z.string(), z.string()).optional(),
+  lenses: z.record(z.string(), z.object({ skill: z.string().optional(), applies_to: z.array(z.string()).optional(), gate: OnBreak.optional(), only: z.array(z.string()).optional(), disable: z.array(z.string()).optional() }).passthrough()).optional(),
+}).passthrough();
+
+type ShepherdLens = NonNullable<z.infer<typeof ShepherdLayer>["lenses"]>[string];
+
+/** shepherd's effective lenses and tiers, and every file of this repository they were read from. */
+type Shepherd = { lenses: Record<string, ShepherdLens>; tiers: Record<string, string>; files: string[] };
+
+/**
+ * shepherd's policy file and every pack it extends, read the way shepherd reads them: from the default branch,
+ * packs before the file, a pinned pack's relative paths in its own repository at its commit, a lens merged field
+ * by field, a tier replaced by name. Throws on a cycle, a missing pack or a malformed file; `files` is set on the
+ * error too, so a caller can still guard what it read.
+ */
+function readShepherd(read: (rel: string) => string | null, fetchPinned: FetchPinned, files: string[]): Shepherd | null {
+  const out: Shepherd = { lenses: {}, tiers: {}, files };
+
+  const layer = (text: string, source: string) => {
+    const parsed = ShepherdLayer.safeParse(parseYaml(text) ?? {});
+
+    if (!parsed.success) throw new Error(`${source}: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
+
+    return parsed.data;
+  };
+
+  const apply = (config: z.infer<typeof ShepherdLayer>, skillPath: (skill: string) => string) => {
+    Object.assign(out.tiers, config.tiers);
+
+    for (const [name, l] of Object.entries(config.lenses ?? {})) {
+      const merged = { ...out.lenses[name], ...l };
+
+      if (l.skill) merged.skill = skillPath(l.skill);
+      out.lenses[name] = merged;
+    }
+  };
+
+  const pack = (ref: string, chain: string[]): void => {
+    if (chain.includes(ref) || chain.length >= MAX_PACK_DEPTH) throw new Error(`${[...chain, ref].join(" > ")}: packs extend in a cycle or more than ${MAX_PACK_DEPTH} deep`);
+    const pinned = PINNED_PACK.exec(ref);
+
+    if (!pinned && (ref.startsWith("github:") || path.isAbsolute(ref) || ref.split(/[\\/]/).includes(".."))) throw new Error(`${ref}: a pack is repository-relative, or pinned as github:owner/repo/<path>@<full commit sha>`);
+    const text = pinned ? fetchPinned(pinned[1]!, pinned[2]!, pinned[3]!, pinned[4]!) : read(ref);
+
+    if (text === null) throw new Error(`${ref}: pack not found`);
+
+    if (!pinned) files.push(path.posix.normalize(ref));
+    const config = layer(text, ref);
+    const inPack = (rel: string) => (pinned && !rel.startsWith("github:") ? `github:${pinned[1]}/${pinned[2]}/${rel.replace(/\/+$/, "")}@${pinned[4]}` : rel);
+
+    for (const e of config.extends ?? []) pack(inPack(e), [...chain, ref]);
+    apply(config, (skill) => (skill.includes("/") ? inPack(skill) : skill));
+  };
+
+  const file = SHEPHERD_FILES.find((f) => read(f) !== null);
+
+  if (!file) return null;
+  const team = layer(read(file)!, file);
+
+  for (const e of team.extends ?? []) pack(e, []);
+  apply(team, (skill) => skill);
+
+  return out;
+}
+
+/**
+ * With `rules_from.shepherd`, shepherd's lenses become rule packs, so a team declares them once. A lens's `gate`
+ * sets its `on_break`; a lens stamp cannot read (an installed skill named, not a path) is reported in `missing`.
+ * A `rules:` entry of the same name wins. The policy file and local packs are guarded.
+ */
+export type Inherited = { policy: Policy; missing: string[] };
+
+export function inheritRules(policy: Policy, read: (rel: string) => string | null, fetchPinned: FetchPinned = () => null): Inherited {
+  if (!policy.rules_from?.shepherd) return { policy, missing: [] };
+  const missing: string[] = [];
+  const policyFiles = [...SHEPHERD_FILES]; // both: a PR adding config.yml would replace an older lenses.yml
+  let shepherd: Shepherd | null;
+
+  try {
+    shepherd = readShepherd(read, fetchPinned, policyFiles);
+  } catch (e) {
+    return { policy: { ...policy, policyFiles }, missing: [`rules_from.shepherd: ${e instanceof Error ? e.message : e}`] };
+  }
+
+  if (!shepherd) return { policy: { ...policy, policyFiles }, missing: ["rules_from.shepherd: no .shepherd/config.yml on the default branch"] };
+  const inherited: Record<string, RulePack> = {};
+
+  for (const [name, l] of Object.entries(shepherd.lenses)) {
+    if (name in policy.rules) continue;
+
+    if (!l.skill || !(l.skill.includes("/") || l.skill === ".")) {
+      missing.push(`${name}: shepherd lens ${l.skill ? `names the installed skill ${l.skill}; stamp reads a lens by path` : "has no skill"}`);
+      continue;
+    }
+
+    const rule = RulePackSchema.safeParse({ skill: l.skill, applies_to: l.applies_to, on_break: l.gate ?? policy.rules_from.shepherd.on_break, only: l.only, disable: l.disable });
+
+    if (rule.success) inherited[name] = rule.data;
+    else missing.push(`${name}: shepherd lens ${l.skill}: ${rule.error.issues[0]?.message}`);
+  }
+
+  return { policy: { ...policy, rules: { ...inherited, ...policy.rules }, policyFiles }, missing };
+}
+
+/**
+ * Model names resolved through shepherd's tiers, so one list of named models drives both tools. A name with no
+ * tier stays as written (a bare Claude id is Anthropic). Once any name could be a tier, shepherd's policy file
+ * and its local packs can choose stamp's model, so editing them is editing policy: their paths join `policyFiles`
+ * whether or not a tier matches today, since a PR could add one.
+ */
+export type TierResolution = { policy: Policy; models: string[]; tiers: Record<string, string>; missing: string[] };
+
+export function resolveTiers(policy: Policy, models: string[], read: (rel: string) => string | null, fetchPinned: FetchPinned = () => null): TierResolution {
+  const names = models.filter((m) => /^[a-z][a-z0-9-]*$/.test(m));
+
+  if (!names.length) return { policy, models, tiers: {}, missing: [] };
+  const files = [...SHEPHERD_FILES];
+  const guarded = (): Policy => ({ ...policy, policyFiles: [...new Set([...(policy.policyFiles ?? []), ...files])] });
+  let tiers: Record<string, string>;
+
+  try {
+    tiers = readShepherd(read, fetchPinned, files)?.tiers ?? {};
+  } catch (e) {
+    return { policy: guarded(), models, tiers: {}, missing: [`model tiers: ${e instanceof Error ? e.message : e}`] };
+  }
+
+  const used = Object.fromEntries(names.flatMap((n) => (tiers[n] ? [[n, tiers[n]!]] : [])));
+
+  return { policy: guarded(), models: models.map((m) => used[m] ?? m), tiers: used, missing: [] };
 }
 
 export function manifestsWithoutLockfile(files: string[]): string[] {
@@ -821,7 +1022,7 @@ export type PRMeta = {
 const BOT_RE = /\[bot\]$|^(dependabot|renovate)/i;
 
 // Only people who could merge anyway. A drive-by contributor's PR is never auto-approved.
-const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+export const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 
 export type GateRun = Tier & { gates: Gate[]; denied: string[] };
 
@@ -888,3 +1089,9 @@ export function runGates(policy: Policy, pr: PRMeta): GateRun {
 
   return { gates, denied, ...t };
 }
+
+/**
+ * A workflow template with its Bedrock OIDC lines turned on: every `#aws-oidc ` prefix removed, which grants
+ * `id-token: write` and adds the step that exchanges it for the AWS_ROLE_ARN role's credentials.
+ */
+export const enableAwsOidc = (template: string) => template.replace(/^(\s*)#aws-oidc /gm, "$1");

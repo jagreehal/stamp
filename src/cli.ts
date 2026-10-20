@@ -8,19 +8,20 @@
 // in-flight reviewer bots) → familiarity → LLM review → verdict → post → sweep.
 // The verdict is the output; --post puts it on GitHub as a real approval or a comment.
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { notify, notifyOn, slackEscape } from "./notify.ts";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
-import { callTimeout, checkRuns, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
+import { callTimeout, checkRuns, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
 import {
   DEFAULTS_DIR,
   detectOwnership,
   inFlightBots,
   inFlightChecks,
   loadGuidance,
+  enableAwsOidc,
   loadPolicy,
   manifestScriptEdits,
   manifestsWithoutLockfile,
@@ -30,7 +31,9 @@ import {
   runGates,
   incidentFlags,
   ruleFlags,
-  type FetchPinned,
+  type Inherited,
+  inheritRules,
+  resolveTiers,
   scrutinyFlags,
   suppressionFlags,
   testMarkerFlags,
@@ -42,8 +45,9 @@ import {
 import { tryRetainApproval, type RetentionResult } from "./retention.ts";
 import { beginReviewSpan, endReviewSpan, inReviewSpan, reviewMeasurements, summarizeRun, type ReviewAttributes } from "./llm.ts";
 import { egressRefusals } from "./isolated-cli.ts";
-import { BACKENDS, combine, review, secondOpinionNeeded, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
+import { type Backend, BACKENDS, combine, MODEL, review, secondOpinionNeeded, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
+import { approvedOn, stackedParent, wrongBase, type StackDeps, type WrongBase } from "./stack.ts";
 import { ghStoryDeps, loadStoryEvidence, storyEvidenceRecord, type StoryEvidence } from "./stories.ts";
 
 const VERSION = "0.1.0";
@@ -65,6 +69,7 @@ const { values: opts, positionals } = parseArgs({
     json: { type: "string" },
     verbose: { type: "boolean", short: "v", default: false },
     since: { type: "string" }, // digest: lookback in hours, default 24
+    "aws-oidc": { type: "boolean", default: false }, // init: Bedrock through OIDC in the workflows
   },
 });
 
@@ -84,11 +89,14 @@ if (positionals[0] === "init") {
     }
 
     mkdirSync(path.dirname(dest), { recursive: true });
-    copyFileSync(src, dest);
+
+    if (opts["aws-oidc"] && rel.startsWith(".github")) writeFileSync(dest, enableAwsOidc(readFileSync(src, "utf8")));
+    else copyFileSync(src, dest);
     console.log(`created ${rel}`);
   }
 
-  console.log("\nNext: add your provider key as the STAMP_API_KEY secret (and STAMP_MODEL as a variable unless you use claude-opus-5), enable 'Allow GitHub Actions to create and approve pull requests', merge.");
+  if (opts["aws-oidc"]) console.log("\nBedrock through OIDC: set the AWS_ROLE_ARN, AWS_REGION and STAMP_MODEL (bedrock:<id>) variables, leave STAMP_API_KEY empty, enable 'Allow GitHub Actions to create and approve pull requests', merge.");
+  else console.log("\nNext: add your provider key as the STAMP_API_KEY secret (and STAMP_MODEL as a variable unless you use claude-opus-5), enable 'Allow GitHub Actions to create and approve pull requests', merge.");
   console.log("Optional digest: add the STAMP_SLACK_WEBHOOK secret; the digest stays off without it.");
   console.log("Optional alerts: add the STAMP_NOTIFY_WEBHOOK secret (Slack or any JSON endpoint) for refused, escalated and failed reviews.");
   process.exit(0);
@@ -164,7 +172,7 @@ if (opts.post) {
           fetchRefs(early);
           const trustedRef = `origin/${early.defaultBranch}`;
 
-          return gatesFor(early, loadPolicy(repoRoot, trustedRef), trustedRef).gated.gates.every((g) => g.passed);
+          return gatesFor(early, trustedPolicy(trustedRef).policy, trustedRef).gated.gates.every((g) => g.passed);
         });
       });
     }
@@ -224,7 +232,9 @@ try {
 
 const trustedRef = `origin/${pr.defaultBranch}`;
 
-const policy = loadPolicy(repoRoot, trustedRef);
+const { policy, missing: inherited, backends } = trustedPolicy(trustedRef);
+
+for (const [i, b] of backends.entries()) if (b !== BACKENDS[i]) console.log(`backend ${BACKENDS[i] === "api" ? `api (${MODEL})` : BACKENDS[i]}: tier → ${b}`);
 
 // Reviewer bots leave 👀 while they work and swap it for a verdict when they post; their findings
 // belong in the prompt, so hold for them. Bounded, and never terminal: nothing re-triggers the
@@ -266,37 +276,37 @@ const codeowners = [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"].map((
 
 const ownership = codeowners !== null ? detectOwnership(parseCodeowners(codeowners), pr.files.map((f) => f.filename), pr.author) : undefined;
 
+// Stacked PRs and wrong bases, from git ancestry alone. A failure here reviews the whole PR, as before.
+let misbased: WrongBase | null = null;
+
+try {
+  if (!ensureFullHistory(repoRoot)) throw new Error("shallow history");
+  misbased = wrongBase(pr, policy.long_lived_branches, stackDeps());
+  const parent = misbased ? null : stackedParent(pr, openPRsInto(pr.baseRef, repoRoot), stackDeps());
+  const delta = parent && compareDelta(pr.repo, parent.parentHead, pr.headSha, repoRoot);
+
+  if (parent && !delta) console.log(`stacked on #${parent.parent}, but the delta lists 300+ files: reviewing the whole PR`);
+
+  if (parent && delta) {
+    pr = { ...pr, ...delta, stack: parent };
+    console.log(`stacked on #${parent.parent} (${parent.parentHead.slice(0, 7)}): reviewing this PR's ${delta.commits.length} commit(s) over it`);
+  }
+} catch (e) {
+  console.error(`stack detection unavailable, reviewing the whole PR: ${e instanceof Error ? e.message.split("\n")[0] : e}`);
+}
+
 const { manifests, sizeBudgets, gated } = gatesFor(pr, policy, trustedRef);
+
+// A wrong base denies before the model runs: the review would judge other people's commits.
+if (misbased) gated.gates.push({ gate: "base", passed: false, message: `${misbased.on} of ${misbased.total} commits are already on ${misbased.branch}: this looks like it should target ${misbased.branch} (gh pr edit ${pr.number} --base ${misbased.branch})` });
 
 const gateVerdict = gated.gates.every((g) => g.passed) ? "PASSED" : "DENIED";
 
 const flags = titleFlags(policy, pr.title, gated.denied);
 
-// A pinned pack in another repository comes through gh, so a private one needs a GH_TOKEN that can read it.
-// GitHub serves any commit in a fork network through the parent repository, so the commit must also be on the
-// pack repository's default branch: otherwise a pin could name a commit someone pushed to a fork.
-const fetchPinned: FetchPinned = (owner, repo, file, sha) => {
-  const api = (...args: string[]) => execFileSync("gh", ["api", ...args], { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: callTimeout() }).trim();
-
-  try {
-    const branch = api(`repos/${owner}/${repo}`, "--jq", ".default_branch");
-    const status = api(`repos/${owner}/${repo}/compare/${branch}...${sha}`, "--jq", ".status");
-
-    if (status !== "behind" && status !== "identical") {
-      console.error(`rule pack ${owner}/${repo}@${sha.slice(0, 7)}: that commit is not on ${branch}, so it is not trusted`);
-
-      return null;
-    }
-
-    return api("-H", "Accept: application/vnd.github.raw", `repos/${owner}/${repo}/contents/${file}?ref=${sha}`);
-  } catch {
-    return null;
-  }
-};
-
 const rules = ruleFlags(policy, pr.files.map((f) => f.filename), (rel) => readTrusted(repoRoot, rel, trustedRef), fetchPinned);
 
-for (const m of rules.missing) console.error(`rule pack not found (default branch, or the pinned repository and commit), skipped: ${m}`);
+for (const m of [...inherited, ...rules.missing]) console.error(`rule pack skipped (not on the default branch or the pinned commit, or no rules under ## Review): ${m}`);
 
 const scrutiny = [...scrutinyFlags(policy, pr.files.map((f) => f.filename)), ...suppressionFlags(pr.diff), ...testMarkerFlags(pr.diff), ...incidentFlags(pr.issues ?? []), ...rules.flags];
 
@@ -373,9 +383,11 @@ if (opts["dry-run"]) {
   process.exit(gateVerdict === "PASSED" ? 0 : 1);
 } else if (gateVerdict === "DENIED") {
   verdict = "REFUSED";
-  body = `Gates denied: ${gated.gates.filter((g) => !g.passed).map((g) => g.message).join("; ")}. A human reviewer has to take it from here.`;
+  const failed = gated.gates.filter((g) => !g.passed);
+
+  body = failed.every((g) => g.gate === "base") ? `Not reviewed: ${failed[0]!.message}. Retarget it and stamp reviews the PR's own change.` : `Gates denied: ${failed.map((g) => g.message).join("; ")}. A human reviewer has to take it from here.`;
 } else {
-  const [primary, second] = BACKENDS;
+  const [primary, second] = backends;
 
   const input = {
     pr,
@@ -414,6 +426,12 @@ if (opts["dry-run"]) {
   }
 }
 
+// A stacked PR's approval waits on its parent: merged first, it would land the parent's code with it.
+if (verdict === "APPROVED" && pr.stack && !parentApproved(pr.repo, pr.stack)) {
+  verdict = "ESCALATE";
+  body = `This PR's own change passes review. Approval waits on #${pr.stack.parent}, the PR it is stacked on, which is not approved on its current head (${pr.stack.parentHead.slice(0, 7)}): merged first, this PR would land #${pr.stack.parent}'s code too. Comment \`/stamp\` here once #${pr.stack.parent} is approved or merged.\n\n${body}`;
+}
+
 console.log(scrub(`\n${verdict}: ${body}`));
 
 if (llm?.issues.length) console.log(scrub(llm.issues.map((i) => `  - ${i}`).join("\n")));
@@ -447,7 +465,7 @@ const evidence = {
   stories: storyEvidenceRecord(stories),
   size_overrides: [...folderGrants("max_files", sizeBudgets.file_scopes), ...folderGrants("max_lines", sizeBudgets.line_scopes)],
   retention: { status: "dismissed" as const, reason: retention.reason },
-  backends: BACKENDS,
+  backends,
   llm,
   opinion,
   verdict,
@@ -480,7 +498,7 @@ await endReviewSpan(
     "stamp.tier": [gated.tier, gated.sub].filter(Boolean).join(" / "),
     "stamp.gates.failed": gated.gates.filter((g) => !g.passed).map((g) => g.gate),
     "stamp.denied": gated.denied,
-    "stamp.backends": BACKENDS,
+    "stamp.backends": backends,
     "stamp.title_flags": flags,
     "stamp.scrutiny": scrutiny.map((s) => s.name),
     "stamp.signal_flags": signalFlags,
@@ -497,6 +515,65 @@ await endReviewSpan(
 );
 
 process.exit(verdict === "APPROVED" ? 0 : 1);
+
+// A pinned pack in another repository comes through gh, so a private one needs a GH_TOKEN that can read it.
+// GitHub serves any commit in a fork network through the parent repository, so the commit must also be on the
+// pack repository's default branch: otherwise a pin could name a commit someone pushed to a fork.
+function fetchPinned(owner: string, repo: string, file: string, sha: string): string | null {
+  const api = (...args: string[]) => execFileSync("gh", ["api", ...args], { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: callTimeout() }).trim();
+
+  try {
+    const branch = api(`repos/${owner}/${repo}`, "--jq", ".default_branch");
+    const status = api(`repos/${owner}/${repo}/compare/${branch}...${sha}`, "--jq", ".status");
+
+    if (status !== "behind" && status !== "identical") {
+      console.error(`rule pack ${owner}/${repo}@${sha.slice(0, 7)}: that commit is not on ${branch}, so it is not trusted`);
+
+      return null;
+    }
+
+    return api("-H", "Accept: application/vnd.github.raw", `repos/${owner}/${repo}/contents/${file}?ref=${sha}`);
+  } catch {
+    return null;
+  }
+}
+
+/** Whether a stacked parent is approved on its current head; false when its reviews cannot be read. */
+function parentApproved(repo: string, stack: { parent: number; parentHead: string }): boolean {
+  try {
+    return approvedOn(listReviews(repo, stack.parent, repoRoot), stack.parentHead, me);
+  } catch {
+    return false;
+  }
+}
+
+/** Git ancestry for stack detection, on the fetched refs. A function, so the module-level review code above can call it. */
+function stackDeps(): StackDeps {
+  return {
+    commits: (head, base) => git("rev-list", "--topo-order", head, `^${base}`).split("\n").filter(Boolean),
+    notOn: (head, base, branch) => Number(git("rev-list", "--count", head, `^${base}`, `^refs/remotes/origin/${branch}`)),
+    branches: () => git(...GH_CREDENTIALS, "ls-remote", "--heads", "origin").split("\n").flatMap((l) => l.split("\trefs/heads/")[1] ?? []),
+    fetch: (branches) => void git(...GH_CREDENTIALS, "fetch", "-q", "origin", ...branches.map((b) => `+refs/heads/${b}:refs/remotes/origin/${b}`)),
+  };
+}
+
+/**
+ * The trusted policy, with any rule packs it inherits from shepherd's config resolved into `rules`, and the
+ * backends with every tier name (in STAMP_MODEL or STAMP_BACKENDS) resolved through shepherd's tiers.
+ */
+function trustedPolicy(ref: string): Inherited & { backends: Backend[] } {
+  const read = (rel: string) => readTrusted(repoRoot, rel, ref);
+  const inherited = inheritRules(loadPolicy(repoRoot, ref), read, fetchPinned);
+  // The model each backend names: api's is STAMP_MODEL; claude and codex are CLIs, never tiers.
+  const wanted = BACKENDS.map((b) => (b === "api" ? MODEL : b === "claude" || b === "codex" ? "" : b));
+  const tiers = resolveTiers(inherited.policy, wanted, read, fetchPinned);
+  const backends = BACKENDS.map((b, i) => (tiers.models[i] === wanted[i] ? b : tiers.models[i]!));
+  // A bare name that is no tier and no Claude id names nothing stamp can call.
+  const unresolved = wanted.filter((w) => /^[a-z][a-z0-9-]*$/.test(w) && !tiers.tiers[w] && !w.startsWith("claude-"));
+
+  return { policy: tiers.policy, missing: [...inherited.missing, ...tiers.missing, ...unresolved.map((w) => `no shepherd tier named ${w}`)], backends };
+}
+
 
 function whoami(): string {
   try {
@@ -573,13 +650,14 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed |
     "| gate | result |",
     "|---|---|",
     ...gates.map((g) => `| ${g.gate} | ${g.passed ? "✓" : "✗"} ${g.message} |`),
-    `| reviewer | ${llm?.run ? summarizeRun(llm.run) : BACKENDS[0]}${llm ? ` → ${llm.verdict}` : ""} |`,
+    `| reviewer | ${llm?.run ? summarizeRun(llm.run) : backends[0]}${llm ? ` → ${llm.verdict}` : ""} |`,
     ...(opinion ? [`| second opinion | ${opinion.run ? summarizeRun(opinion.run) : opinion.backend} → ${opinion.verdict} (${opinion.risk} risk) |`] : []),
     "",
-    `stamp ${VERSION} · head \`${pr.headSha.slice(0, 7)}\` · base \`${pr.baseRef}@${pr.baseSha.slice(0, 7)}\` · policy \`${policySource(`origin/${pr.defaultBranch}`).policy}\` · risk ${llm?.risk ?? "n/a"}`,
+    `stamp ${VERSION} · head \`${pr.headSha.slice(0, 7)}\` · base \`${pr.baseRef}@${pr.baseSha.slice(0, 7)}\`${pr.stack ? ` · stacked on #${pr.stack.parent} \`${pr.stack.parentHead.slice(0, 7)}\`` : ""} · policy \`${policySource(`origin/${pr.defaultBranch}`).policy}\` · risk ${llm?.risk ?? "n/a"}`,
     "</details>",
     runMarker(STARTED),
-    reviewedMarker(pr.headSha, pr.baseSha),
+    // A delta review records the parent's head as its base, so retention never keeps it on the whole PR's diff.
+    reviewedMarker(pr.headSha, pr.stack?.parentHead ?? pr.baseSha),
   );
 
   return parts.join("\n").replace(/!\[([^\]]*)\]\(/g, "[image: $1]("); // no auto-fetched images: a markdown image is an exfil channel
@@ -636,7 +714,7 @@ function fetchRefs(pr: PR): void {
 function gatesFor(pr: PR, policy: Policy, trustedRef: string) {
   const manifests = manifestsWithoutLockfile(pr.files.map((f) => f.filename));
   const sizeBudgets = resolveSizeOverrides(policy, pr.files.map((f) => f.filename), (rel) => readTrusted(repoRoot, rel, trustedRef));
-  const gated = runGates(policy, { ...pr, manifestScriptEdits: manifestScriptEdits(repoRoot, pr.baseSha, pr.headSha, manifests), sizeBudgets });
+  const gated = runGates(policy, { ...pr, manifestScriptEdits: manifestScriptEdits(repoRoot, pr.stack?.parentHead ?? pr.baseSha, pr.headSha, manifests), sizeBudgets });
 
   return { manifests, sizeBudgets, gated };
 }

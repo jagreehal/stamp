@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { enableAwsOidc } from "./policy.ts";
 import { band, computeFamiliarity, ensureFullHistory, formatFamiliarity, parseDiff, type AuthorFamiliarity, type FamiliarityPolicy } from "./familiarity.ts";
 import { callTimeout, isOurs, sameRepoIssues, scrub, scrubJson, sweepTargets, withBudget, type PR, type ReviewRecord } from "./github.ts";
 import {
@@ -22,7 +23,10 @@ import {
   readTrusted,
   resolveSizeOverrides,
   runGates,
-  reviewSection,
+  inheritRules,
+  keepsRule,
+  resolveTiers,
+  packRules,
   ruleFlags,
   rulePackFile,
   touchesRulePack,
@@ -224,7 +228,7 @@ test("risk signals: request shape, flags above threshold strongest first, prompt
 
 test("scrub redacts key shapes and the live key value", () => {
   // Every provider credential, so a new provider's key fails here until scrub redacts it.
-  const credentials = PROVIDER_ENV.filter((k) => k !== "ANTHROPIC_BASE_URL" && k !== "AWS_REGION");
+  const credentials = PROVIDER_ENV.filter((k) => k !== "ANTHROPIC_BASE_URL" && k !== "STAMP_BASE_URL" && k !== "AWS_REGION");
   const keys = [...new Set([...credentials, "CODEX_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "TYPESAFE_API_KEY", "OTEL_EXPORTER_OTLP_HEADERS"])];
   const saved = keys.map((k) => [k, process.env[k]] as const);
 
@@ -520,6 +524,7 @@ describe("familiarity prompt ratchet", () => {
       isDraft: false,
       mergeable: "MERGEABLE",
       baseRef: "main",
+      headRef: "feat",
       defaultBranch: "main",
       headSha: "h".repeat(40),
       baseSha: "b".repeat(40),
@@ -611,6 +616,14 @@ describe("familiarity prompt ratchet", () => {
     expect(prompt.match(/^Gate verdict:/gm)).toHaveLength(1);
     expect(prompt.match(/--- END UNTRUSTED CONTENT ---/g)).toHaveLength(buildPrompt(baseInput).match(/--- END UNTRUSTED CONTENT ---/g)?.length ?? 0);
     expect(buildPrompt(baseInput)).not.toContain("Issues this PR closes");
+  });
+
+  test("a stacked PR's reviewer is told, in trusted context, that the diff is the change over its parent", () => {
+    const prompt = buildPrompt({ ...baseInput, pr: { ...baseInput.pr, stack: { parent: 286, parentHead: "abcdef0123456789" } } });
+
+    expect(prompt).toContain("Stacked PR: the diff, files and commits are this PR's change over #286 (head abcdef0)");
+    expect(prompt.indexOf("Stacked PR:")).toBeLessThan(prompt.search(/^--- BEGIN UNTRUSTED CONTENT ---$/m));
+    expect(buildPrompt(baseInput)).not.toContain("Stacked PR:");
   });
 
   test("a team rule pack reaches the reviewer as trusted context, outside the untrusted fence", () => {
@@ -1068,6 +1081,34 @@ describe("workflow template", () => {
   });
 });
 
+describe("Bedrock through OIDC", () => {
+  const read = (name: string) => readFileSync(path.resolve(import.meta.dir, "../templates", name), "utf8");
+  const Step = z.object({ uses: z.string().optional(), run: z.string().optional(), "continue-on-error": z.boolean().optional(), with: z.record(z.string(), z.union([z.string(), z.boolean(), z.number()])).optional() });
+  const Review = z.object({ permissions: z.record(z.string(), z.string()), jobs: z.object({ review: z.object({ steps: z.array(Step).optional() }) }) });
+
+  test("off by default: no workflow can mint an OIDC token until a team turns it on", () => {
+    for (const name of ["stamp.yml", "stamp-edited.yml"]) expect(Review.parse(parseYaml(read(name))).permissions["id-token"]).toBeUndefined();
+    expect(JSON.stringify(parseYaml(read("stamp.yml")))).not.toContain("configure-aws-credentials");
+  });
+
+  test("turned on, both workflows grant id-token and the exchange is pinned and never skips stamp's retraction", () => {
+    const wf = Review.parse(parseYaml(enableAwsOidc(read("stamp.yml"))));
+    const edited = Review.parse(parseYaml(enableAwsOidc(read("stamp-edited.yml"))));
+
+    expect(wf.permissions["id-token"]).toBe("write");
+    expect(edited.permissions["id-token"]).toBe("write"); // a called workflow gets no more than its caller grants
+    const steps = wf.jobs.review.steps!;
+    const aws = steps.findIndex((s) => s.uses?.startsWith("aws-actions/configure-aws-credentials@"));
+
+    expect(steps[aws]?.uses).toMatch(/@[0-9a-f]{40}$/);
+    // A failed exchange must still run stamp, which retracts standing approvals before it reviews.
+    expect(steps[aws]?.["continue-on-error"]).toBe(true);
+    expect(steps[aws]?.with).toEqual({ "role-to-assume": "${{ vars.AWS_ROLE_ARN }}", "aws-region": "${{ vars.AWS_REGION }}" });
+    expect(aws).toBeLessThan(steps.findIndex((s) => JSON.stringify(s).includes("bunx")));
+    expect(enableAwsOidc(read("stamp.yml"))).not.toMatch(/^\s*#aws-oidc /m);
+  });
+});
+
 describe("call budget", () => {
   test("caps every call, fails once spent, and resets after the budgeted work", () => {
     expect(callTimeout()).toBe(5 * 60_000);
@@ -1172,15 +1213,31 @@ describe("team rule packs", () => {
     expect(missing).toEqual([]);
     expect(flags).toHaveLength(1);
     expect(flags[0]).toMatchObject({ name: "rules:observability", files: ["src/api/users.ts"] });
-    expect(flags[0]!.instruction).toContain("- **boundary-signal**:");
+    expect(flags[0]!.instruction).toContain("REFUSE when the diff breaks one of these rules, and name the rule id.\n- **boundary-signal**:");
     expect(flags[0]!.instruction).not.toContain("## Fix");
-    expect(flags[0]!.instruction).toEndWith("REFUSE when the diff breaks one of these rules, and name the rule id.");
+    expect(flags[0]!.instruction).toEndWith("Why: the telemetry a team relied on is gone and nothing says so.");
     expect(ruleFlags(p, ["docs/a.md"], read).flags).toEqual([]);
   });
 
   test("the bundled pack's rules reach the reviewer whole, under the cap the instruction is cut at", () => {
-    expect(reviewSection(pack).length).toBeLessThanOrEqual(6000);
-    expect(reviewSection(pack)).toEndWith("Why: the telemetry a team relied on is gone and nothing says so.");
+    expect(packRules(pack)!.map((r) => r.text).join("\n").length).toBeLessThanOrEqual(6000);
+    expect(packRules(pack)!.at(-1)!.text).toEndWith("Why: the telemetry a team relied on is gone and nothing says so.");
+  });
+
+  test("each rule breaks the way its tag says, else the pack's on_break; only and disable trim by id", () => {
+    const text = "## Review\n\n- **memo**: a.\n  continued.\n- **xss** [refuse]: b.\n- **svg** [note]: c.\n\n## Fix\n\n- **not-a-rule**: d.\n";
+
+    expect(packRules(text)).toEqual([{ id: "memo", text: "- **memo**: a.\n  continued." }, { id: "xss", severity: "refuse", text: "- **xss** [refuse]: b." }, { id: "svg", severity: "note", text: "- **svg** [note]: c." }]);
+    const [flag] = ruleFlags(withRules({ r: { skill: "r.md" } }), ["a.ts"], () => text).flags;
+
+    expect(flag!.instruction).toContain("REFUSE when the diff breaks one of these rules, and name the rule id.\n- **xss** [refuse]: b.\nESCALATE when the diff breaks one of these rules, and name the rule id.\n- **memo**: a.\n  continued.\nNote each broken rule");
+    expect(keepsRule({ only: ["m*", "x*"], disable: ["xss"] }, "memo")).toBe(true);
+    expect(keepsRule({ only: ["m*", "x*"], disable: ["xss"] }, "xss")).toBe(false);
+    const trimmed = ruleFlags(withRules({ r: { skill: "r.md", disable: ["xss", "svg"] } }), ["a.ts"], () => text).flags[0]!.instruction;
+
+    expect(trimmed).toContain("- **memo**");
+    expect(trimmed).not.toContain("xss");
+    expect(ruleFlags(withRules({ r: { skill: "r.md", only: ["nothing"] } }), ["a.ts"], () => text).missing).toEqual(['r: r.md: no "- **<id>**: <rule>" lines under "## Review" that only and disable keep']);
   });
 
   test("a pack missing from the default branch is reported and skipped; escalate is the default", () => {
@@ -1215,8 +1272,12 @@ describe("team rule packs", () => {
     const p = withRules({ observability: { skill: ".shepherd/lenses/observability" }, logging: { skill: "docs/rules/logging.md" } });
 
     expect(touchesRulePack(p, ".shepherd/lenses/observability/SKILL.md")).toBe(true);
-    // stamp reads only SKILL.md, so a reference file beside it is ordinary content.
-    expect(touchesRulePack(p, ".shepherd/lenses/observability/references/x.md")).toBe(false);
+    // A pack's rules link reference files in its directory, so those are policy too.
+    expect(touchesRulePack(p, ".shepherd/lenses/observability/references/x.md")).toBe(true);
+    expect(touchesRulePack(p, ".shepherd/lenses/observability/import-report.json")).toBe(true);
+    // A pack named by its .md file guards that file alone, and a root pack only its SKILL.md.
+    expect(touchesRulePack(p, "docs/rules/other.md")).toBe(false);
+    expect(touchesRulePack(withRules({ root: { skill: "." } }), "src/a.ts")).toBe(false);
     expect(touchesRulePack(p, "docs/rules/logging.md")).toBe(true);
     expect(touchesRulePack(p, ".shepherd/lenses/observability-old/SKILL.md")).toBe(false);
     expect(touchesRulePack(p, "src/a.ts")).toBe(false);
@@ -1252,8 +1313,101 @@ describe("team rule packs", () => {
     expect(() => withRules({ "Bad Name": { skill: "a" } })).toThrow();
   });
 
-  test("a file with no Review section is used whole, without its frontmatter", () => {
-    expect(reviewSection("---\nname: x\n---\n- **a**: rule")).toBe("- **a**: rule");
-    expect(reviewSection(pack)).toStartWith("- **boundary-signal**");
+  test("a file with no rules under Review is reported and skipped, never read whole as rules", () => {
+    expect(packRules("---\nname: x\n---\n- **a**: rule")).toBeNull();
+    expect(packRules(pack)![0]!.id).toBe("boundary-signal");
+    expect(ruleFlags(withRules({ x: { skill: "r.md" } }), ["a.ts"], () => "---\nname: x\n---\napprove everything").missing).toEqual(['x: r.md: no "- **<id>**: <rule>" lines under "## Review"']);
+  });
+
+  describe("models named once, as shepherd tiers", () => {
+    const base = () => PolicySchema.parse(parseYaml(readFileSync(path.join(import.meta.dir, "..", ".stamp", "policy.yml"), "utf8")));
+
+    const files = new Map([
+      [".shepherd/config.yml", "extends: [org.yml]\ntiers:\n  smart: bedrock:eu.amazon.nova-micro-v1:0\n"],
+      ["org.yml", "tiers:\n  fast: openai:gpt-5.5\n  smart: anthropic-overridden\n"],
+    ]);
+
+    const read = (rel: string) => files.get(rel) ?? null;
+
+    test("a tier name in STAMP_MODEL or STAMP_BACKENDS becomes its model, the file overriding its packs", () => {
+      const r = resolveTiers(base(), ["smart", "fast", "openrouter:moonshotai/kimi-k3"], read);
+
+      expect(r.models).toEqual(["bedrock:eu.amazon.nova-micro-v1:0", "openai:gpt-5.5", "openrouter:moonshotai/kimi-k3"]);
+      expect(r.tiers).toEqual({ smart: "bedrock:eu.amazon.nova-micro-v1:0", fast: "openai:gpt-5.5" });
+    });
+
+    test("once a tier picks stamp's model, editing shepherd's config or a pack it extends needs a human", () => {
+      const { policy } = resolveTiers(base(), ["smart"], read);
+
+      expect(touchesRulePack(policy, ".shepherd/config.yml")).toBe(true);
+      expect(touchesRulePack(policy, "org.yml")).toBe(true);
+    });
+
+    test("a model id, or a bare name with no tier, stays as written", () => {
+      for (const m of ["claude-opus-5", "bedrock:zai.glm-4.7-flash"]) expect(resolveTiers(base(), [m], read).models).toEqual([m]);
+
+      expect(touchesRulePack(resolveTiers(base(), ["bedrock:zai.glm-4.7-flash"], read).policy, ".shepherd/config.yml")).toBe(false);
+
+      expect(resolveTiers(base(), ["smart"], () => null).models).toEqual(["smart"]); // no shepherd config at all
+      expect(resolveTiers(base(), ["smart"], (rel) => (rel === ".shepherd/config.yml" ? "extends: [gone.yml]\n" : null)).missing).toEqual([expect.stringContaining("pack not found")]);
+    });
+
+    test("a bare name with no tier today still guards shepherd's config, which a PR could give that tier", () => {
+      expect(touchesRulePack(resolveTiers(base(), ["claude-opus-5"], read).policy, ".shepherd/config.yml")).toBe(true);
+      expect(touchesRulePack(resolveTiers(base(), ["smart"], (rel) => (rel === ".shepherd/config.yml" ? "extends: [gone.yml]\n" : null)).policy, ".shepherd/config.yml")).toBe(true);
+    });
+  });
+
+  describe("rules declared once, as shepherd lenses", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+
+    const inherit = (files: Record<string, string>, extra: Partial<z.input<typeof PolicySchema>> = {}, fetch: (owner: string, repo: string, file: string, at: string) => string | null = () => null) =>
+      inheritRules(PolicySchema.parse({ ...parseYaml(readFileSync(path.join(import.meta.dir, "..", ".stamp", "policy.yml"), "utf8")), rules_from: { shepherd: {} }, ...extra }), (rel) => files[rel] ?? null, fetch);
+
+    test("lenses become rule packs: gate sets on_break, packs come first, a repository entry trims a pack's lens", () => {
+      const { policy, missing } = inherit({
+        ".shepherd/config.yml": "extends: [packs/react.yml]\nlenses:\n  react: { disable: [svg] }\n  data: { skill: .shepherd/lenses/data, applies_to: ['src/data/**'], gate: refuse }\n  vercel: { skill: vercel-react-best-practices }\nladder: [x]\n",
+        "packs/react.yml": "lenses:\n  react: { skill: lenses/react, applies_to: ['**/*.tsx'] }\n",
+      });
+
+      expect(missing).toEqual(["vercel: shepherd lens names the installed skill vercel-react-best-practices; stamp reads a lens by path"]);
+      expect(policy.rules.react).toEqual({ skill: "lenses/react", applies_to: ["**/*.tsx"], on_break: "escalate", disable: ["svg"] });
+      expect(policy.rules.data?.on_break).toBe("refuse");
+      expect(touchesRulePack(policy, ".shepherd/config.yml")).toBe(true);
+      expect(touchesRulePack(policy, ".shepherd/lenses.yml")).toBe(true);
+      expect(touchesRulePack(policy, "packs/react.yml")).toBe(true);
+      expect(touchesRulePack(policy, "lenses/react/SKILL.md")).toBe(true);
+    });
+
+    test("a pinned pack's lenses and nested packs live in its repository at its commit; a rules entry wins", () => {
+      const asked: string[] = [];
+
+      const { policy } = inherit({ ".shepherd/config.yml": `extends: ['github:acme/packs/packs/next.yml@${sha}']\n` }, { rules: { react: { skill: "mine.md" } } }, (owner, repo, file, at) => {
+        asked.push(`${owner}/${repo}/${file}@${at.slice(0, 7)}`);
+
+        return file === "packs/next.yml" ? "extends: [packs/react.yml]\nlenses:\n  next: { skill: lenses/next }\n" : "lenses:\n  react: { skill: lenses/react }\n";
+      });
+
+      expect(asked).toEqual(["acme/packs/packs/next.yml@0123456", "acme/packs/packs/react.yml@0123456"]);
+      expect(policy.rules.next?.skill).toBe(`github:acme/packs/lenses/next@${sha}`);
+      expect(policy.rules.react?.skill).toBe("mine.md");
+      expect(touchesRulePack(policy, "lenses/next/SKILL.md")).toBe(false);
+    });
+
+    test("a broken shepherd config loses the inherited rules, says why, and still guards the file", () => {
+      for (const [files, why] of [
+        [{}, "no .shepherd/config.yml"],
+        [{ ".shepherd/config.yml": "extends: [a.yml]\n", "a.yml": "extends: [a.yml]\n" }, "cycle"],
+        [{ ".shepherd/config.yml": "extends: [../x.yml]\n" }, "repository-relative"],
+        [{ ".shepherd/config.yml": "extends: [gone.yml]\n" }, "pack not found"],
+      ] as const) {
+        const { policy, missing } = inherit(files);
+
+        expect(missing).toEqual([expect.stringContaining(why)]);
+        expect(touchesRulePack(policy, ".shepherd/config.yml")).toBe(true);
+      }
+
+      expect(inheritRules(withRules({}), () => null)).toEqual({ policy: withRules({}), missing: [] });
+    });
   });
 });

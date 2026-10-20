@@ -19,6 +19,7 @@ const pr: PR = {
   isDraft: false,
   mergeable: "MERGEABLE",
   baseRef: "main",
+  headRef: "feat",
   defaultBranch: "main",
   headSha: "0000000",
   baseSha: "0000000",
