@@ -13,7 +13,8 @@ export const MODEL = process.env.STAMP_MODEL || "claude-opus-5"; // the api back
 // api: STAMP_MODEL through the AI SDK, on any provider (`bedrock:zai.glm-4.7-flash`, `opencode-go:kimi-k3`,
 // a bare Claude id for Anthropic). A `provider:model` entry is the api backend on that model. claude / codex:
 // a pinned coding-agent CLI inside a private Docker container, with only its own credential. Same prompt, same verdict schema, same gates either way.
-const Backend = z.union([z.enum(["api", "claude", "codex"]), z.string().regex(/^[a-z][a-z-]*:\S+$/, "a backend is api, claude, codex, or provider:model")]);
+// A bare name other than those three is a tier from shepherd's config, resolved on the default branch (resolveTiers).
+const Backend = z.union([z.enum(["api", "claude", "codex"]), z.string().regex(/^[a-z][a-z-]*:\S+$|^[a-z][a-z0-9-]*$/, "a backend is api, claude, codex, provider:model, or a shepherd tier name")]);
 
 export type Backend = z.infer<typeof Backend>;
 
@@ -183,6 +184,8 @@ export function buildPrompt(input: ReviewInput): string {
   const constraints: string[] = [];
 
   if (input.gateVerdict === "DENIED") constraints.push("Gates DENIED this PR. Your verdict MUST be REFUSE or ESCALATE.");
+
+  if (pr.stack) constraints.push(`Stacked PR: the diff, files and commits are this PR's change over #${pr.stack.parent} (head ${pr.stack.parentHead.slice(0, 7)}), the open PR it is stacked on. #${pr.stack.parent}'s change is reviewed in #${pr.stack.parent}. Judge this change; read the parent's code in the checkout for context.`);
 
   if (input.tier.startsWith("T0")) constraints.push("T0: docs/tests/config only. Confirm or flag concerns.");
 

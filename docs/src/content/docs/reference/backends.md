@@ -21,16 +21,18 @@ flowchart LR
     CX --> P3[api.openai.com]
 ```
 
-`STAMP_MODEL` is `provider:model`, or a bare Claude id for Anthropic. An unknown prefix is read as part of an Anthropic model id. The `api` backend gives the model three tools confined to the checkout, `read_file`, `grep` and `glob`, and the model ends by calling `submit_verdict`.
+`STAMP_MODEL` is `provider:model`, a bare Claude id for Anthropic, or a tier name from shepherd's `.shepherd/config.yml` (see below). An unknown prefix is read as part of an Anthropic model id. The `api` backend gives the model three tools confined to the checkout, `read_file`, `grep` and `glob`, and the model ends by calling `submit_verdict`.
 
-One secret covers every provider: put the key in `STAMP_API_KEY` and Stamp sends it to whichever provider `STAMP_MODEL` names. The provider's own variable in the table below is the fallback when `STAMP_API_KEY` is unset. Bedrock ignores `STAMP_API_KEY` and uses its own credentials.
+One secret covers every provider: put the key in `STAMP_API_KEY` and Stamp sends it to whichever provider `STAMP_MODEL` names. The provider's own variable in the table below is the fallback when `STAMP_API_KEY` is unset. On Bedrock the key is a Bedrock API key; with no key set, Bedrock signs with AWS credentials instead (OIDC, see below).
 
 Set `STAMP_MODEL` and `STAMP_BACKEND` as repository variables, not secrets. GitHub masks a secret's value everywhere in the logs, so a secret `STAMP_BACKEND=api` would turn every "api" in the log into `***`.
 
 | `STAMP_MODEL` | Provider | Key |
 | ------------- | -------- | --- |
 | `claude-opus-5` (no prefix) | Anthropic, or any endpoint in `ANTHROPIC_BASE_URL` | `STAMP_API_KEY` or `ANTHROPIC_API_KEY` |
-| `bedrock:zai.glm-4.7-flash`, `bedrock:us.anthropic.claude-sonnet-5-5` | Amazon Bedrock (Claude through InvokeModel, the rest through Converse) | `AWS_BEARER_TOKEN_BEDROCK`, or any AWS credentials (OIDC, `AWS_PROFILE`, SSO, an instance role), and `AWS_REGION`; never `STAMP_API_KEY` |
+| `bedrock:zai.glm-4.7-flash`, `bedrock:us.anthropic.claude-sonnet-5-5` | Amazon Bedrock (Claude through InvokeModel, the rest through Converse) | a Bedrock API key in `STAMP_API_KEY` or `AWS_BEARER_TOKEN_BEDROCK`, or with neither set, any AWS credentials (OIDC, `AWS_PROFILE`, SSO, an instance role); and `AWS_REGION` |
+| `openai:gpt-5.5` | OpenAI API (Responses) | `STAMP_API_KEY` or `OPENAI_API_KEY` |
+| `compatible:<model>` | Any OpenAI-compatible endpoint named by `STAMP_BASE_URL`: Azure OpenAI, xAI, Together, Fireworks, LiteLLM, vLLM, Ollama | `STAMP_API_KEY` |
 | `opencode-go:kimi-k3`, `opencode:claude-sonnet-5-5` | OpenCode Go and Zen | `STAMP_API_KEY` or `OPENCODE_API_KEY` |
 | `openrouter:moonshotai/kimi-k3` | OpenRouter | `STAMP_API_KEY` or `OPENROUTER_API_KEY` |
 | `groq:openai/gpt-oss-120b` | Groq | `STAMP_API_KEY` or `GROQ_API_KEY` |
@@ -41,7 +43,7 @@ Set `STAMP_MODEL` and `STAMP_BACKEND` as repository variables, not secrets. GitH
 ```bash
 STAMP_MODEL=deepseek:deepseek-flash   STAMP_API_KEY=...
 STAMP_MODEL=claude-opus-5                       ANTHROPIC_API_KEY=sk-ant-...
-STAMP_MODEL=bedrock:zai.glm-4.7-flash           AWS_BEARER_TOKEN_BEDROCK=...  AWS_REGION=eu-west-1
+STAMP_MODEL=bedrock:zai.glm-4.7-flash           STAMP_API_KEY=<Bedrock API key>  AWS_REGION=eu-west-1
 STAMP_MODEL=opencode-go:deepseek-v4-flash       OPENCODE_API_KEY=...
 STAMP_MODEL=openrouter:moonshotai/kimi-k3       OPENROUTER_API_KEY=...
 STAMP_MODEL=groq:openai/gpt-oss-120b            GROQ_API_KEY=...
@@ -49,6 +51,33 @@ STAMP_MODEL=mistral:mistral-small-latest        MISTRAL_API_KEY=...
 STAMP_BACKEND=claude                            # CLAUDE_CODE_OAUTH_TOKEN required
 STAMP_BACKEND=codex                             # CODEX_API_KEY or OPENAI_API_KEY required
 ```
+
+### Name models once with shepherd's tiers
+
+A team that runs shepherd names its models once, in `.shepherd/config.yml` or an organisation pack it extends:
+
+```yaml
+tiers:
+  fast: openai:gpt-5.5-mini
+  smart: bedrock:eu.anthropic.claude-sonnet-4-6
+```
+
+Then `STAMP_MODEL=smart`, or `STAMP_BACKENDS=smart,fast` for a second opinion, reviews on those models; shepherd's reviewers and fixers use the same names. Switching provider changes the tier, not the workflow. Stamp reads the tiers from the default branch. A bare name with no tier stays a model id, so `claude-opus-5` keeps meaning Anthropic. Whenever `STAMP_MODEL` or `STAMP_BACKENDS` holds a bare name, a PR that edits `.shepherd/config.yml`, or a pack it extends in this repository, is denied as `stamp_policy`: adding or changing a tier there would change the model that approves later PRs.
+
+### Bedrock in GitHub Actions
+
+Set `STAMP_MODEL` (`bedrock:<model or inference profile id>`) and `AWS_REGION` as repository variables, then pick one way to authenticate:
+
+| | API key | OIDC |
+| --- | --- | --- |
+| Install | `stamp init` | `stamp init --aws-oidc`, or remove every `#aws-oidc ` prefix in `stamp.yml` and `stamp-edited.yml` |
+| Secret | `STAMP_API_KEY`: a Bedrock API key | none |
+| Variables | `STAMP_MODEL`, `AWS_REGION` | `STAMP_MODEL`, `AWS_REGION`, `AWS_ROLE_ARN` |
+| AWS side | a key allowed to invoke the model | a role whose trust policy accepts the repository's `pull_request` runs and its default branch (a `/stamp` comment runs there), allowed `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` |
+
+Under OIDC leave `STAMP_API_KEY` empty: a key wins over the role. The OIDC step uses `continue-on-error`, so a failed exchange still lets stamp retract its standing approvals; the review then ends in ERROR. A run from a fork gets no OIDC token, and stamp refuses fork PRs anyway.
+
+The role needs nothing beyond invoking models. With a cross-region inference profile such as `eu.anthropic.claude-sonnet-4-6`, grant the profile in the role's region and the foundation model in every region the profile routes to. Claude models also need the account's one-time Anthropic use case form in the Bedrock console; until then Bedrock answers "Model use case details have not been submitted".
 
 ## Isolated CLI reviewers
 

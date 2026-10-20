@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import { anthropicBaseURL, apiKeyFor, DEFAULT_GUARD, guardRules, parseModelId, reviewWithTools, summarizeRun, timeoutMs } from "./llm.ts";
+import { anthropicBaseURL, apiKeyFor, languageModel, maxOutputTokens, DEFAULT_GUARD, guardRules, parseModelId, reviewWithTools, summarizeRun, timeoutMs } from "./llm.ts";
 
 const Verdict = z.object({ verdict: z.enum(["APPROVE", "REFUSE", "ESCALATE"]), reasoning: z.string() });
 
@@ -46,7 +46,10 @@ describe("model ids", () => {
     expect(apiKeyFor("deepseek", { DEEPSEEK_API_KEY: "own" })).toBe("own");
     expect(apiKeyFor("opencode-go", { OPENCODE_API_KEY: "oc" })).toBe("oc");
     expect(apiKeyFor("groq", { STAMP_API_KEY: "", GROQ_API_KEY: "g" })).toBe("g");
-    expect(apiKeyFor("bedrock", { STAMP_API_KEY: "one" })).toBeUndefined(); // the AWS credential chain
+    // Bedrock: an API key from either variable, else nothing, so the AWS credential chain (OIDC) signs.
+    expect(apiKeyFor("bedrock", { STAMP_API_KEY: "one" })).toBe("one");
+    expect(apiKeyFor("bedrock", { AWS_BEARER_TOKEN_BEDROCK: "bt" })).toBe("bt");
+    expect(apiKeyFor("bedrock", { AWS_ACCESS_KEY_ID: "AKIA", AWS_SECRET_ACCESS_KEY: "s" })).toBeUndefined();
   });
 
   test("ANTHROPIC_BASE_URL keeps working in the Anthropic SDK's form, without /v1", () => {
@@ -158,3 +161,30 @@ describe("limits", () => {
   });
 });
 
+test("the output ceiling fits the model: Nova's 10k limit, 16k elsewhere, STAMP_MAX_OUTPUT_TOKENS over both", () => {
+  expect(maxOutputTokens("bedrock:eu.amazon.nova-micro-v1:0", {})).toBe(10_000);
+  expect(maxOutputTokens("bedrock:amazon.nova-lite-v1:0", {})).toBe(10_000);
+  expect(maxOutputTokens("bedrock:zai.glm-4.7-flash", {})).toBe(16_000);
+  expect(maxOutputTokens("claude-opus-5", { STAMP_MAX_OUTPUT_TOKENS: "4000" })).toBe(4000);
+  expect(maxOutputTokens("claude-opus-5", { STAMP_MAX_OUTPUT_TOKENS: "lots" })).toBe(16_000);
+});
+
+test("openai: is the OpenAI API, and compatible: reaches any OpenAI-compatible endpoint named by STAMP_BASE_URL", () => {
+  const saved = process.env.STAMP_BASE_URL;
+
+  try {
+    delete process.env.STAMP_BASE_URL;
+    const Built = z.object({ provider: z.string(), modelId: z.string() });
+
+    expect(Built.parse(languageModel("openai:gpt-5.5", "s")).provider).toBe("openai.responses");
+    expect(() => languageModel("compatible:grok-5", "s")).toThrow("STAMP_BASE_URL");
+    process.env.STAMP_BASE_URL = "https://api.x.ai/v1";
+    const m = Built.parse(languageModel("compatible:grok-5", "s"));
+
+    expect(m.provider).toBe("compatible.chat");
+    expect(m.modelId).toBe("grok-5");
+  } finally {
+    if (saved === undefined) delete process.env.STAMP_BASE_URL;
+    else process.env.STAMP_BASE_URL = saved;
+  }
+});

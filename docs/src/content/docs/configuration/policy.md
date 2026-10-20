@@ -60,7 +60,7 @@ These categories carry a high blast radius even in a small diff:
 | **billing**        | billing, payment, stripe, invoice, pricing                                                  |
 | **public_api**     | openapi, api_schema, swagger, public_api                                                    |
 | **deps_toolchain** | lockfiles, `requirements*.txt`, Makefile, `.nvmrc`, `.tool-versions`                        |
-| **stamp_policy**   | `.stamp/`, `stamp/src/`, CODEOWNERS, `AGENT_APPROVALS.md`, a configured rule pack's file    |
+| **stamp_policy**   | `.stamp/`, `stamp/src/`, CODEOWNERS, `AGENT_APPROVALS.md`, a configured rule pack's file and every file in its directory (the reference files its rules link), shepherd's config and local packs with `rules_from` or a bare model name (a possible tier) |
 
 ```mermaid
 flowchart TD
@@ -104,7 +104,7 @@ The shipped `review_agents` group covers what review and fix agents follow on la
 
 ## Team rules
 
-Read [Team rules](/stamp/configuration/rule-packs/).
+Read [Team rules](/stamp/configuration/rule-packs/). With `rules_from.shepherd`, stamp builds rule packs from shepherd's lenses, so a team declares them once.
 
 ## Size ceiling
 

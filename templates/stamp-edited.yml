@@ -16,6 +16,7 @@ permissions:
   # stamp.yml reads the test-evidence artifact, and a called workflow gets no more than its caller grants.
   actions: read
   checks: read
+  #aws-oidc id-token: write # stamp.yml's Bedrock OIDC step: a called workflow gets no more than its caller grants
 
 jobs:
   review:

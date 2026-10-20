@@ -6,7 +6,7 @@ Run commands from a clone of the repository you want to review. Use `bunx @jagre
 
 | Command | Purpose | Writes or cost |
 | --- | --- | --- |
-| `stamp init` | Create policy, guidance and workflow files | Writes missing local files; keeps existing ones |
+| `stamp init [--aws-oidc]` | Create policy, guidance and workflow files; `--aws-oidc` writes the workflows with Bedrock through OIDC turned on | Writes missing local files; keeps existing ones |
 | `stamp rule <name>` | Copy a bundled team rule pack | Writes missing local rule file |
 | `stamp <pr> --dry-run` | Run deterministic gates | GitHub reads only: no reviewer call, no Jev risk signals, no posted review |
 | `stamp <pr>` | Review a PR through the selected backend | GitHub reads and model usage; no posted review |

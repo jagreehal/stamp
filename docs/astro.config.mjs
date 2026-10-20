@@ -61,6 +61,10 @@ export default defineConfig({
       {
         "label": "Read CI test evidence",
         "slug": "guides/test-evidence"
+      },
+      {
+        "label": "Stacked PRs and wrong bases",
+        "slug": "guides/stacked-prs"
       }
     ]
   },

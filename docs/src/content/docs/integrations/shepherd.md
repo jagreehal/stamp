@@ -13,4 +13,6 @@ In Stamp label mode, Shepherd applies the label once per head. Without a label, 
 
 Shepherd's automated comments can post through the author's account. Stamp labels those as automated context, rather than counting them as independent review assurance. Shared rule packs can steer the reviewer and fixer while each tool keeps its own permissions.
 
+Declare lenses once. Set `rules_from: { shepherd: {} }` in `.stamp/policy.yml` and stamp reads shepherd's lenses, packs included, as rule packs. A lens's `gate` sets how stamp treats a broken rule. Read [declare lenses once](/stamp/configuration/rule-packs/#declare-lenses-once-with-shepherd).
+
 Read [Shepherd's setup guide](https://github.com/jagreehal/shepherd/blob/main/docs/src/content/docs/start/quickstart.md) and [shared lenses](https://github.com/jagreehal/shepherd/blob/main/docs/src/content/docs/configuration/lenses.md).
