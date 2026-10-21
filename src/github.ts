@@ -285,6 +285,18 @@ export const GH_CREDENTIALS = ["-c", "credential.helper=", "-c", "credential.hel
 
 export const runMarker = (started: string) => `<!-- stamp-run:${started} -->`;
 
+/** Text with no HTML comment delimiter left, nested ones (`<!<!---->--`) included. */
+export function withoutComments(text: string): string {
+  let out = text;
+
+  for (let before = ""; before !== out; ) {
+    before = out;
+    out = out.replace(/<!--|-->/g, "");
+  }
+
+  return out;
+}
+
 // The full SHAs a review covered. Approval retention compares diffs on exactly these.
 const REVIEWED_MARKER = /<!-- stamp-reviewed:head=([0-9a-f]+);base=([0-9a-f]+) -->/;
 
@@ -296,7 +308,8 @@ export type ReviewRecord = z.infer<typeof ReviewRow>;
 
 /** The head and base one of our reviews covered, from its marker; null for a review posted before the marker existed. */
 export function reviewedShas(r: ReviewRecord): { head: string; base: string } | null {
-  const m = REVIEWED_MARKER.exec(r.body);
+  // The last marker: stamp writes it after the review text, so text above it cannot stand in for it.
+  const m = [...r.body.matchAll(new RegExp(REVIEWED_MARKER, "g"))].at(-1);
 
   // SAFETY: both capture groups in REVIEWED_MARKER are mandatory, so a match fills them.
   return m ? { head: m[1]!, base: m[2]! } : null;
@@ -316,7 +329,8 @@ export const isOurs = (r: ReviewRecord, botLogin: string) => r.user.login === bo
 
 /** Whether the run that posted `r` started after `iso`: the later-started run owns the newer verdict. */
 const startedAfter = (r: ReviewRecord, iso: string) => {
-  const started = RUN_MARKER.exec(r.body)?.[1];
+  // The last marker, as for the reviewed marker: stamp writes it after the review text.
+  const started = [...r.body.matchAll(new RegExp(RUN_MARKER, "g"))].at(-1)?.[1];
 
   return started !== undefined && started > iso;
 };
