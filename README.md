@@ -25,7 +25,7 @@ To install the repository workflow:
 bunx @jagreehal/stamp init
 ```
 
-Review the generated policy, add your model provider's key as the `STAMP_API_KEY` secret (and `STAMP_MODEL` as a repository variable for a model other than the default), configure GitHub's Actions approval setting and merge the setup. The [first-run guide](docs/src/content/docs/start/quickstart.md) covers each step and the expected first result.
+Review the generated policy and pick the reviewer model there (`model:` in `.stamp/policy.yml`, so changing it is reviewed), add your model provider's key as the `STAMP_API_KEY` secret (an environment secret with `stamp init --environment <name>` keeps it out of other workflows), configure GitHub's Actions approval setting and merge the setup. The [first-run guide](docs/src/content/docs/start/quickstart.md) covers each step and the expected first result.
 
 ## Understand the result
 

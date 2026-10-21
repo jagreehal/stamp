@@ -66,21 +66,61 @@ lenses:
 
 Each pack brings one lens scoped to its files. The repository entries narrow `go` to the services directory and make every `rust` rule refuse. Replace `<sha>` with a commit on jagreehal/shepherd's main branch.
 
+## Narrow or drop a deny category
+
+Your `deny:` list is the whole list: a category you delete stops denying. In a strict policy, to send workflow edits to the model instead of a human, take `\.github/workflows` out of `infra_cicd`:
+
+```yaml
+deny:
+  infra_cicd:
+    description: Infrastructure and deployment artifacts.
+    match:
+      any: ['terraform', 'kubernetes', 'helm']
+      paths: ['k8s', 'dockerfile', 'iam', 'deploy\.sh']
+```
+
+You can't remove `stamp_policy`: the schema requires it. The PR that edits the policy hits `stamp_policy` itself, so a maintainer approves it, and the change applies once it merges to the default branch. Run `stamp <pr> --policy-dir .stamp --dry-run` first to see which gates the new list fires on a real PR.
+
 ## Change a size limit
 
 Edit `size_gate` in the generated policy, and keep any configured override ceilings at or above the new global limits. A size exemption changes the counted size, not whether Stamp reviews the file. Ask a maintainer to review the policy change.
 
-## Complete starting policy
+## Strict starting policy
 
-This is the bundled policy, including its protected categories. The docs checker validates it with the engine's policy schema. Compare it with your repository's file before you replace a policy.
+The bundled policy denies only edits to stamp's own policy and sends everything else to the reviewer, with auth, secrets, migrations, infrastructure, billing, public API and toolchain files flagged for extra scrutiny. To send those areas to a human instead, start from the strict policy: `stamp init --strict` writes it. The docs checker validates it with the engine's policy schema.
 
 ```yaml validate-config
-# stamp merge-gate policy.
+# stamp merge-gate policy, strict: `stamp init --strict` writes this one.
+# Auth, secrets, migrations, infrastructure, billing, public API and toolchain
+# changes always go to a human.
 #
 # Read from the repository's DEFAULT BRANCH, never from the PR head, so a PR
 # cannot rewrite the policy that gates it. Patterns are regexes matched
 # case-insensitively on word boundaries. Keep them single-quoted.
 version: 1
+
+# Settings. Each is optional; a non-blank environment variable of the same meaning overrides it (STAMP_MODEL,
+# AWS_REGION, STAMP_GUARD, ...), and `stamp config` shows every value in effect and where it came from.
+# Secrets never go here. Without a price for the model, the $ budget cannot fire ("budget guard inactive").
+# model: bedrock:minimax.minimax-m2.5
+# backends: [api, bedrock:openai.gpt-oss-120b-1:0]   # primary, then a second opinion
+# pricing:
+#   minimax.minimax-m2.5: { inputPer1M: 0.3, outputPer1M: 1.2 }
+# provider: { region: eu-west-1 }                    # also base_url (compatible:) and anthropic_base_url
+# guard: { budget_usd: 2, tokens: 3m, loop: 4/12, max_tools: 80, timeout: 15m }
+# max_output_tokens: 16000
+# cli: { claude_model: claude-sonnet-5-5, codex_model: gpt-5.5 }
+# label: stamp                                        # review only PRs carrying this label
+# notify: { on: [REFUSED, ESCALATE, ERROR] }
+# telemetry: { endpoint: https://otlp.example.com, service: stamp }
+# advise_on_deny: true                                # on a gate denial, still ask the model; its findings ride on the refusal, never approve
+
+# How posted reviews look. Leave out for the defaults. Glyph keys: APPROVED, REFUSED, ESCALATE,
+# ERROR, pass, fail, fix.
+# branding:
+#   name: stamp
+#   avatar: https://example.com/logo.png
+#   emoji: { ESCALATE: ⚠️ }
 
 # T2: never AI-approved. Any changed file matching a `paths` or `any` pattern
 # denies the PR before the LLM runs. `any` and `titles` patterns also scan the
@@ -123,7 +163,7 @@ deny:
   stamp_policy:
     description: stamp's own policy, engine, and gate inputs. The gate cannot approve edits to itself.
     match:
-      paths: ['\.stamp/', 'stamp/src/', 'CODEOWNERS', 'AGENT_APPROVALS\.md']
+      paths: ['\.stamp/', 'stamp/src/', 'CODEOWNERS', 'AGENT_APPROVALS\.md', '\.github/workflows/stamp(-edited|-digest)?\.ya?ml']
 
 # T0: docs/tests/config only. Still LLM-reviewed, lighter bar.
 allow:

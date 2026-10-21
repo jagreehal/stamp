@@ -4,14 +4,16 @@ title: "Ownership and independent reviews"
 
 With a `CODEOWNERS` on the default branch (`.github/`, root or `docs/`), stamp tells the reviewer who owns each changed file and whether the author is a listed owner. That stays advisory and never gates.
 
-An author who owns what they touched counts as assurance in risky territory; a cross-team author does not, and an ESCALATE names the owning team in its next step. stamp cannot resolve team handles (`@org/team`) to members without an org read the Actions token lacks, so it reports membership as unknown and a teammate's review becomes the assurance path.
+An author who owns what they touched counts as assurance for a risk the reviewer cannot verify itself; a cross-team author does not, and an ESCALATE names the owning team in its next step. stamp cannot resolve team handles (`@org/team`) to members without an org read the Actions token lacks, so it reports membership as unknown and a teammate's review becomes the assurance path.
 
-In risky territory stamp will not approve on its own reading. It needs an APPROVED or substantive COMMENTED review from a person or a different AI reviewer on the current head.
+In risky territory the reviewer reads the risky part in full and approves when it verified the behavior and a test pins it, naming that fact under **Safe because**. When a risk stays unresolved it escalates and asks for an APPROVED or substantive COMMENTED review from a person or a different AI reviewer on the current head. A high-risk approval resting on a fact the reviewer only believes escalates automatically. To keep risky areas with a human whatever the reviewer finds, use `stamp init --strict`.
 
 ```mermaid
 flowchart LR
-    R[Risky PR] --> Q{Independent review<br/>on the current head?}
-    Q -- "human, other AI reviewer,<br/>or author who owns the code" --> OK[stamp can approve]
+    R[Risky PR] --> V{Reviewer verified the risky part<br/>and a test pins it?}
+    V -- yes --> OK[stamp can approve]
+    V -- "no: risk unresolved" --> Q{Independent review<br/>on the current head?}
+    Q -- "human, other AI reviewer,<br/>or author who owns the code" --> OK
     Q -- none --> E[ESCALATE to the owning team]
 ```
 

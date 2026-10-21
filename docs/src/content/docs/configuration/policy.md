@@ -43,24 +43,24 @@ The deny-list covers every edit to these files (`stamp_policy`), so the gate can
 | T1b-small        | ≤100  | ≤5    |                                            |
 | T1c-medium       | ≤300  | ≤15   |                                            |
 | T1d-complex      | more  | more  | Full read, still under the ceiling.        |
-| T2-never         | –     | –     | Deny-listed. A human, always.              |
+| T2-never         | –     | –     | Matches a `deny` category. A human, always. |
 
-Size sets how hard the reviewer looks. It never sets risk on its own. stamp can approve a large, well-tested refactor outside risky territory, and it refuses a five-line billing change.
+Size sets how hard the reviewer looks. It never sets risk on its own. stamp can approve a large, well-tested refactor, and under a strict policy it sends a five-line billing change to a human.
 
-## T2: never AI-approved
+## Deny and scrutiny categories
 
-These categories carry a high blast radius even in a small diff:
+A changed file that matches a `deny` category sends the PR to a human before the model runs. The bundled policy denies one category, `stamp_policy`, and flags the sensitive areas below under `scrutiny`: the reviewer reads those changes with a category-specific instruction and can approve, refuse or escalate. `stamp init --strict` writes a policy that denies all of them instead ([strict starting policy](/stamp/configuration/examples/#strict-starting-policy)).
 
-| Category           | Patterns                                                                                    |
-| ------------------ | ------------------------------------------------------------------------------------------- |
-| **auth**           | auth, login, signup, oauth, saml, sso, oidc, credential, password, 2fa, mfa, permission, …   |
-| **crypto_secrets** | crypto, encrypt, decrypt, vault, secret, api_key, private_key, certificate, `.env`, `.pem`   |
-| **migrations**     | `migrations/`, `drizzle/`, `prisma/migrations`, schema_change                               |
-| **infra_cicd**     | terraform, kubernetes, helm, k8s, dockerfile, `.github/workflows`, iam, cloudflare, `deploy.sh`, `vercel.json`, `fly.toml` |
-| **billing**        | billing, payment, stripe, invoice, pricing                                                  |
-| **public_api**     | openapi, api_schema, swagger, public_api                                                    |
-| **deps_toolchain** | lockfiles, `requirements*.txt`, Makefile, `.nvmrc`, `.tool-versions`                        |
-| **stamp_policy**   | `.stamp/`, `stamp/src/`, CODEOWNERS, `AGENT_APPROVALS.md`, a configured rule pack's file and every file in its directory (the reference files its rules link), shepherd's config and local packs with `rules_from` or a bare model name (a possible tier) |
+| Category           | Patterns                                                                                    | Bundled policy | `--strict` |
+| ------------------ | ------------------------------------------------------------------------------------------- | -------------- | ---------- |
+| **auth**           | auth, login, signup, oauth, saml, sso, oidc, credential, password, 2fa, mfa, permission, …   | scrutiny       | deny       |
+| **crypto_secrets** | crypto, encrypt, decrypt, vault, secret, api_key, private_key, certificate, `.env`, `.pem`   | scrutiny       | deny       |
+| **migrations**     | `migrations/`, `drizzle/`, `prisma/migrations`, schema_change                               | scrutiny       | deny       |
+| **infra_cicd**     | terraform, kubernetes, helm, k8s, dockerfile, `.github/workflows`, iam, cloudflare, `deploy.sh`, `vercel.json`, `fly.toml` | scrutiny | deny |
+| **billing**        | billing, payment, stripe, invoice, pricing                                                  | scrutiny       | deny       |
+| **public_api**     | openapi, api_schema, swagger, public_api                                                    | scrutiny       | deny       |
+| **deps_toolchain** | lockfiles, `requirements*.txt`, Makefile, `.nvmrc`, `.tool-versions`                        | scrutiny       | deny       |
+| **stamp_policy**   | `.stamp/`, `stamp/src/`, CODEOWNERS, `AGENT_APPROVALS.md`, stamp's workflows (`stamp.yml`, `stamp-edited.yml`, `stamp-digest.yml`: their variables override the policy), a configured rule pack's file and every file in its directory (the reference files its rules link), shepherd's config and local packs with `rules_from` or a bare model name (a possible tier) | deny | deny |
 
 ```mermaid
 flowchart TD
@@ -87,6 +87,10 @@ Two guards cover manifest scripts or hooks that execute in CI:
 - The reviewer prompt tells the model to REFUSE execution-bearing changes the scan can't name.
 
 stamp keeps manifest PRs out of the T0 fast path.
+
+### Advice on a denied PR
+
+A denial skips the model by default, so the person it hands over to sees which gate fired, not what is wrong with the change. Set `advise_on_deny: true` (or `STAMP_ADVISE_ON_DENY=true`) and stamp still asks the reviewer model, then appends its findings to the refusal under **Advisory review (cannot approve)**. The verdict stays REFUSED whatever the model says, an approval included. The run's budget, guard and timeout apply, so it costs one review per denied PR; a failed advisory call refuses without it. A PR that fails the base, secrets or prerequisites gate gets no advice: the model would judge other people's commits, send a credential to the provider, or read an outsider's checkout.
 
 ## Scrutiny paths
 
@@ -146,3 +150,22 @@ Read [Slack digest](/stamp/integrations/notifications/).
 ## Notifications
 
 Read [Notifications](/stamp/integrations/notifications/).
+
+## Branding
+
+`branding` changes how posted reviews look. Leave it out and reviews look exactly as they always have.
+
+```yaml
+branding:
+  name: Acme Review                        # the header reads "## ❌ Acme Review: REFUSED"
+  avatar: https://acme.example/logo.png    # optional; 20×20 at the start of the header
+  emoji:                                   # any subset; the rest keep their defaults
+    ESCALATE: ⚠️
+    pass: 🟢
+```
+
+The keys are every glyph stamp posts: `APPROVED` ✅, `REFUSED` ❌, `ESCALATE` 🙋, `ERROR` ⚠️, `pass` ✓ and `fail` ✗ (the gate table and the console), and `fix` 🤖 (the "Fix with a coding agent" summary). `avatar` must be an `https://` URL. stamp escapes `name`, `avatar` and every glyph, so a policy value can't add markup. A glyph is at most 16 characters with no whitespace.
+
+Stamp finds its own earlier reviews through the hidden `<!-- stamp-run:… -->` and `<!-- stamp-reviewed:… -->` markers, never the header, so branding doesn't affect retraction or approval retention. Tools that look for stamp's review should match `<!-- stamp-run:` too, not the heading text.
+
+The profile picture beside each review is the account that posts it, not anything in the review body. With the workflow's `github.token`, that's `github-actions[bot]`. To show your own logo there, post as a GitHub App: create an app with your logo as its avatar, install it on the repository with pull request read and write, mint a token in the workflow (for example with `actions/create-github-app-token`), and pass it to stamp as `GH_TOKEN`, with `STAMP_BOT_LOGIN` set to `<app-slug>[bot]`. stamp recognises its reviews from any `[bot]` account by their run marker.

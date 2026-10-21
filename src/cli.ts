@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// stamp <pr-number> [--dry-run] [--post] [--label <name>] [--json <path>] [-v]
+// stamp <pr-number> [--dry-run] [--post] [--label <name>] [--json <path>] [--policy-dir <dir>] [-v]
 // stamp init   copies .stamp/ and the workflow into the current repo
 // stamp digest [--since <hours>]   posts a Slack summary of recent stamp-approved merges
 // stamp rule <template>   copies a bundled rule pack (observability) into .stamp/rules/
@@ -7,21 +7,28 @@
 // Pipeline: (retention?) → retract stale approvals → fetch → gates → (wait for
 // in-flight reviewer bots) → familiarity → LLM review → verdict → post → sweep.
 // The verdict is the output; --post puts it on GitHub as a real approval or a comment.
+import "./env.ts"; // first: drops blank provider variables before any provider SDK module loads
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { parseArgs } from "node:util";
+import { parseArgs, type ParseArgsConfig } from "node:util";
+import { z } from "zod";
 import { notify, notifyOn, slackEscape } from "./notify.ts";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
-import { callTimeout, checkRuns, withoutComments, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
+import { callTimeout, checkRuns, effectiveAssociation, permissionOf, TRUSTED_ASSOCIATIONS, withoutComments, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
 import {
   DEFAULTS_DIR,
   detectOwnership,
   inFlightBots,
   inFlightChecks,
   loadGuidance,
-  enableAwsOidc,
+  installWorkflow,
+  workflowChoices,
+  policyWithSettings,
+  brand,
+  useLocalPolicy,
+  STAMP_VERSION,
   loadPolicy,
   manifestScriptEdits,
   manifestsWithoutLockfile,
@@ -43,16 +50,19 @@ import {
   type ScopeBudget,
 } from "./policy.ts";
 import { tryRetainApproval, type RetentionResult } from "./retention.ts";
-import { beginReviewSpan, endReviewSpan, inReviewSpan, reviewMeasurements, summarizeRun, type ReviewAttributes } from "./llm.ts";
+import { beginReviewSpan, endReviewSpan, inReviewSpan, keyEnvFor, keySource, reviewMeasurements, summarizeRun, type ReviewAttributes } from "./llm.ts";
+import { configSummary, effectiveConfig, setting, useSettings, type Settings } from "./config.ts";
 import { egressRefusals } from "./isolated-cli.ts";
-import { assured, type Backend, BACKENDS, combine, type Combined, MODEL, review, secondOpinionNeeded, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
+import { advisable, assured, type Backend, combine, type Combined, review, reviewers, secondOpinionNeeded, withAdvice, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
 import { approvedOn, stackedParent, wrongBase, type StackDeps, type WrongBase } from "./stack.ts";
 import { ghStoryDeps, loadStoryEvidence, storyEvidenceRecord, type StoryEvidence } from "./stories.ts";
 
-const VERSION = "0.1.0";
+const VERSION = STAMP_VERSION;
 
 const STARTED = new Date().toISOString(); // stamped into every posted review so concurrent runs can order themselves
+
+const CommentEvent = z.object({ comment: z.object({ user: z.object({ login: z.string() }), author_association: z.string() }) });
 
 const VERDICT_OF: Record<LLMVerdict["verdict"], Verdict> = { APPROVE: "APPROVED", REFUSE: "REFUSED", ESCALATE: "ESCALATE" };
 
@@ -60,7 +70,61 @@ const STALE_EYES_MS = 45 * 60_000; // a bot 👀 older than this is a crashed re
 
 const REVIEWER_WAIT_MS = 5 * 60_000; // how long to hold for an in-flight reviewer bot before reviewing without it
 
-const { values: opts, positionals } = parseArgs({
+const USAGE = `usage: stamp <pr-number> [--dry-run] [--post] [--label <name>] [--json <path>] [--policy-dir <dir>] [-v]
+       stamp init [--model <id>] [--region <aws-region>] [--strict] [--environment <name>] [--aws-oidc] [--digest] [--upgrade]
+       stamp config [--json] [--policy-dir <dir>]
+       stamp rule <template>
+       stamp digest [--since <hours>]`;
+
+if (process.argv.slice(2).some((a) => a === "--help" || a === "-h")) {
+  console.log(USAGE);
+  process.exit(0);
+}
+
+/** parseArgs that answers a bad option with one line and the usage (exit 2), never a stack trace. */
+function args<T extends ParseArgsConfig>(config: T) {
+  try {
+    return parseArgs(config);
+  } catch (e) {
+    if (!(e instanceof Error && "code" in e && String(e.code).startsWith("ERR_PARSE_ARGS"))) throw e;
+    console.error(`stamp: ${e.message.split(". ")[0]}\n${USAGE}`);
+    process.exit(2);
+  }
+}
+
+// `stamp config [--json] [--policy-dir <dir>]`: every effective setting and where it came from, secrets as set or
+// unset. The first thing to run when stamp does something unexpected. Parsed apart: a review's --json takes a path.
+if (process.argv[2] === "config") {
+  const { values } = args({ args: process.argv.slice(3), options: { json: { type: "boolean", default: false }, "policy-dir": { type: "string" } } });
+  const root = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
+
+  if (values["policy-dir"]) useLocalPolicy(path.resolve(values["policy-dir"]));
+  let policy: Settings = {};
+  let read = values["policy-dir"] ? `${values["policy-dir"]}, then origin/HEAD` : "origin/HEAD (git fetch first for the latest)";
+
+  try {
+    policy = loadPolicy(root);
+  } catch (e) {
+    read = `unreadable, so defaults only: ${e instanceof Error ? e.message.split("\n")[0] : e}`;
+  }
+
+  const config = effectiveConfig(policy);
+
+  if (values.json) console.log(JSON.stringify({ policy: read, ...config }, null, 2));
+  else {
+    const rows = Object.values(config.settings).map((r) => [r.key, r.value || "(unset)", r.source === "env" ? `env ${r.env}` : r.source, r.source === "env" ? "" : r.env]);
+    const width = (i: number) => Math.max(...rows.map((r) => r[i]!.length), 8);
+
+    console.log(`policy: ${read}\n`);
+
+    for (const r of [["setting", "value", "source", "override with"], ...rows]) console.log(r.map((c, i) => c.padEnd(width(i))).join("  ").trimEnd());
+    console.log(`\nsecrets (env only; values never shown)\n${Object.entries(config.secrets).map(([k, v]) => `  ${k.padEnd(28)} ${v}`).join("\n")}`);
+  }
+
+  process.exit(0);
+}
+
+const { values: opts, positionals } = args({
   allowPositionals: true,
   options: {
     "dry-run": { type: "boolean", default: false },
@@ -70,6 +134,13 @@ const { values: opts, positionals } = parseArgs({
     verbose: { type: "boolean", short: "v", default: false },
     since: { type: "string" }, // digest: lookback in hours, default 24
     "aws-oidc": { type: "boolean", default: false }, // init: Bedrock through OIDC in the workflows
+    environment: { type: "string" }, // init: the GitHub environment whose secrets the review and digest jobs read
+    model: { type: "string" }, // init: the reviewer model, written into .stamp/policy.yml
+    region: { type: "string" }, // init: the AWS region for Bedrock, written into .stamp/policy.yml
+    strict: { type: "boolean", default: false }, // init: write the policy that sends auth, secrets, migrations, infra, billing, API and toolchain changes to a human
+    digest: { type: "boolean", default: false }, // init: also write the Slack digest workflow
+    upgrade: { type: "boolean", default: false }, // init: rewrite existing workflows from this stamp's templates, keeping their choices
+    "policy-dir": { type: "string" }, // a local run: read .stamp/ files from this directory instead of the default branch
   },
 });
 
@@ -78,26 +149,46 @@ const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], { encodin
 const git = (...args: string[]) => execFileSync("git", ["-C", repoRoot, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: callTimeout() }).trim();
 
 if (positionals[0] === "init") {
-  // Existing files are never overwritten: the repo's policy is the repo's.
-  for (const rel of [".stamp/policy.yml", ".stamp/review-guidance.md", ".github/workflows/stamp.yml", ".github/workflows/stamp-edited.yml", ".github/workflows/stamp-digest.yml"]) {
+  // Existing files are kept: the repo's policy is the repo's. --upgrade rewrites the workflows only, from this
+  // stamp's templates, keeping the environment, OIDC and region each was written with unless a flag changes one.
+  const digest = opts.digest || existsSync(path.join(repoRoot, ".github/workflows/stamp-digest.yml"));
+
+  for (const rel of [".stamp/policy.yml", ".stamp/review-guidance.md", ".github/workflows/stamp.yml", ".github/workflows/stamp-edited.yml", ...(digest ? [".github/workflows/stamp-digest.yml"] : [])]) {
     const dest = path.join(repoRoot, rel);
     const src = path.join(DEFAULTS_DIR, rel.startsWith(".github") ? `templates/${path.basename(rel)}` : rel);
+    const workflow = rel.startsWith(".github");
+    const ownJob = rel.endsWith("/stamp.yml") || rel.endsWith("/stamp-digest.yml"); // stamp-edited.yml only calls stamp.yml
+
+    if (existsSync(dest) && !(workflow && opts.upgrade)) {
+      console.log(`kept    ${rel}${workflow ? " (exists): run `stamp init --upgrade` to update it" : ""}`);
+      continue;
+    }
 
     if (existsSync(dest)) {
-      console.log(`kept    ${rel}`);
+      const before = readFileSync(dest, "utf8");
+      const was = workflowChoices(before);
+      const after = installWorkflow(readFileSync(src, "utf8"), { awsOidc: opts["aws-oidc"] || was.awsOidc, environment: ownJob ? (opts.environment ?? was.environment) : was.environment, region: opts.region ?? was.region });
+
+      if (after !== before) writeFileSync(dest, after);
+      console.log(after === before ? `current ${rel}` : `upgraded ${rel} (${lineDiff(before, after)})`);
       continue;
     }
 
     mkdirSync(path.dirname(dest), { recursive: true });
 
-    if (opts["aws-oidc"] && rel.startsWith(".github")) writeFileSync(dest, enableAwsOidc(readFileSync(src, "utf8")));
+    if (rel.startsWith(".github")) writeFileSync(dest, installWorkflow(readFileSync(src, "utf8"), { awsOidc: opts["aws-oidc"], environment: ownJob ? opts.environment : undefined, region: opts.region }));
+    else if (rel === ".stamp/policy.yml") writeFileSync(dest, policyWithSettings(readFileSync(opts.strict ? path.join(DEFAULTS_DIR, "templates/policy-strict.yml") : src, "utf8"), { model: opts.model, region: opts.region }));
     else copyFileSync(src, dest);
     console.log(`created ${rel}`);
   }
 
-  if (opts["aws-oidc"]) console.log("\nBedrock through OIDC: set the AWS_ROLE_ARN, AWS_REGION and STAMP_MODEL (bedrock:<id>) variables, leave STAMP_API_KEY empty, enable 'Allow GitHub Actions to create and approve pull requests', merge.");
-  else console.log("\nNext: add your provider key as the STAMP_API_KEY secret (and STAMP_MODEL as a variable unless you use claude-opus-5), enable 'Allow GitHub Actions to create and approve pull requests', merge.");
-  console.log("Optional digest: add the STAMP_SLACK_WEBHOOK secret; the digest stays off without it.");
+  const key = opts["aws-oidc"] ? "nothing: under OIDC set the AWS_ROLE_ARN variable instead, naming a role that can invoke Bedrock" : `your provider key as the ${keyEnvFor(opts.model ?? setting("model"))} secret`;
+
+  console.log(`\nNext: add ${key}, enable 'Allow GitHub Actions to create and approve pull requests', and merge. Every other setting lives in .stamp/policy.yml${opts.model ? "" : " (set `model:` there unless you use claude-opus-5)"}; run \`stamp config\` to see what is in effect.`);
+
+  if (opts.environment) console.log(`The review${digest ? " and digest jobs run" : " job runs"} in the "${opts.environment}" environment: create it (no protection rules) and put ${digest ? "the model key and STAMP_SLACK_WEBHOOK there as environment secrets" : "the model key there as an environment secret"}, not repository secrets.`);
+  console.log(`\nStamp reads its policy from the default branch, so whoever can merge there decides what it approves. Suggested .github/CODEOWNERS entries (replace @your-team):\n\n/.stamp/    @your-team\n/.shepherd/ @your-team\n/.github/   @your-team\n\nThen turn on "Require review from Code Owners" for the default branch.\n`);
+  console.log(digest ? "Digest: add the STAMP_SLACK_WEBHOOK secret; the digest stays off without it." : "Optional digest: `stamp init --digest` adds a weekday Slack summary of stamp-approved merges (needs the STAMP_SLACK_WEBHOOK secret).");
   console.log("Optional alerts: add the STAMP_NOTIFY_WEBHOOK secret (Slack or any JSON endpoint) for refused, escalated and failed reviews.");
   process.exit(0);
 }
@@ -135,18 +226,39 @@ if (positionals[0] === "digest") {
 // A dry run never touches GitHub, whatever else was passed.
 if (opts["dry-run"]) opts.post = false;
 
+if (opts["policy-dir"]) {
+  if (opts.post) {
+    console.error("--policy-dir is for trying a policy locally; it cannot be combined with --post, which reviews only under the default branch's policy");
+    process.exit(2);
+  }
+
+  useLocalPolicy(path.resolve(opts["policy-dir"]));
+  console.log(`policy: .stamp/ files from ${opts["policy-dir"]} first, then the default branch (local run, nothing posted)`);
+}
+
 const prNumber = Number(positionals[0]);
 
 if (!prNumber) {
-  console.error("usage: stamp <pr-number> [--dry-run] [--post] [--label <name>] [--json <path>] [-v]\n       stamp init\n       stamp digest [--since <hours>]");
+  console.error(USAGE);
   process.exit(2);
+}
+
+// A `/stamp` comment counts only from someone who could merge. The workflow's `if` sees author_association
+// alone, which reads write access through a team, and a private org member, as CONTRIBUTOR, so the effective
+// permission is checked here, before anything changes: a comment never moves the head, so ignoring one strands nothing.
+if (opts.post && process.env.GITHUB_EVENT_NAME === "issue_comment" && process.env.GITHUB_EVENT_PATH) {
+  const { comment } = CommentEvent.parse(JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8")));
+  const association = effectiveAssociation(comment.author_association, () => permissionOf(repoSlug(repoRoot), comment.user.login, repoRoot));
+
+  if (!TRUSTED_ASSOCIATIONS.has(association)) {
+    console.log(`/stamp from ${comment.user.login} (${association}), who cannot merge; ignoring it`);
+    process.exit(0);
+  }
 }
 
 const me = process.env.STAMP_BOT_LOGIN || whoami(); // the login our verdicts post under; excluded from the prompt and swept for stale approvals
 
-opts.label ||= process.env.STAMP_LABEL || undefined;
-
-await beginReviewSpan(STARTED);
+opts.label ||= setting("label") || undefined; // the flag, then STAMP_LABEL; the policy's label is added once it loads
 
 let retention: RetentionResult = { kept: false, reason: "not_posting" };
 
@@ -172,7 +284,9 @@ if (opts.post) {
           fetchRefs(early);
           const trustedRef = `origin/${early.defaultBranch}`;
 
-          return gatesFor(early, trustedPolicy(trustedRef).policy, trustedRef).gated.gates.every((g) => g.passed);
+          const trusted = trustedPolicy(trustedRef).policy; // also sets the policy's label, so withdrawn() sees it
+
+          return !withdrawn(early) && gatesFor(early, trusted, trustedRef).gated.gates.every((g) => g.passed);
         });
       });
     }
@@ -188,6 +302,7 @@ if (opts.post) {
       };
 
       if (opts.json) writeFileSync(opts.json, scrubJson(evidence));
+      await beginReviewSpan(STARTED); // retention kept only after trustedPolicy loaded the policy's settings
       await endReviewSpan(reviewAttributes(retention.pr, "APPROVED", { "stamp.retention": "kept" }), false);
       process.exit(0);
     }
@@ -232,9 +347,18 @@ try {
 
 const trustedRef = `origin/${pr.defaultBranch}`;
 
-const { policy, missing: inherited, backends } = trustedPolicy(trustedRef);
+const { policy, missing: inherited, backends, summary } = trustedPolicy(trustedRef);
 
-for (const [i, b] of backends.entries()) if (b !== BACKENDS[i]) console.log(`backend ${BACKENDS[i] === "api" ? `api (${MODEL})` : BACKENDS[i]}: tier → ${b}`);
+await beginReviewSpan(STARTED); // telemetry settings may come from the policy, so the span opens here, backdated
+
+console.log(configSummary());
+
+console.log(summary);
+
+// A label from the policy is known only now: a PR without it is withdrawn here, after the dismissal, as at the top.
+const lateWithdrawal = withdrawn(pr);
+
+if (lateWithdrawal) skip(lateWithdrawal);
 
 // Reviewer bots leave 👀 while they work and swap it for a verdict when they post; their findings
 // belong in the prompt, so hold for them. Bounded, and never terminal: nothing re-triggers the
@@ -356,7 +480,9 @@ if (gateVerdict === "PASSED" && policy.stories) {
   }
 }
 
-for (const g of gated.gates) console.log(`${g.passed ? "✓" : "✗"} ${g.gate}: ${g.message}`);
+const branded = brand(policy.branding);
+
+for (const g of gated.gates) console.log(`${g.passed ? branded.pass : branded.fail} ${g.gate}: ${g.message}`);
 
 if (signals) console.log(`  risk signals: ${signalFlags.length ? signalFlags.map((f) => `${f} ${signals[f].toFixed(2)}`).join(", ") : "none flagged"}`);
 
@@ -378,6 +504,23 @@ let opinion: Opinion | null = null;
 
 let body: string;
 
+// What the model hears when it is called: whenever the gates passed, and on a denial with `advise_on_deny`.
+let advisory: Reviewed | null = null;
+
+const input = {
+  pr,
+  gates: gated.gates,
+  gateVerdict,
+  tier: [gated.tier, gated.sub].filter(Boolean).join(" / "),
+  titleFlags: flags,
+  manifests,
+  scrutiny,
+  ownership,
+  signals,
+  familiarity,
+  stories,
+} as const;
+
 if (opts["dry-run"]) {
   console.log(`gate verdict: ${gateVerdict} (dry run, no LLM call)`);
   process.exit(gateVerdict === "PASSED" ? 0 : 1);
@@ -386,22 +529,19 @@ if (opts["dry-run"]) {
   const failed = gated.gates.filter((g) => !g.passed);
 
   body = failed.every((g) => g.gate === "base") ? `Not reviewed: ${failed[0]!.message}. Retarget it and stamp reviews the PR's own change.` : `Gates denied: ${failed.map((g) => g.message).join("; ")}. A human reviewer has to take it from here.`;
+
+  // advise_on_deny: the person the refusal hands over to gets the model's findings too. The verdict comes from
+  // withAdvice, which is REFUSED whatever the model said, so no path from here reaches an approval.
+  if (/^(true|1)$/i.test(setting("advise_on_deny")) && advisable(failed)) {
+    try {
+      advisory = await inReviewSpan(() => review(backends[0]!, input, loadGuidance(repoRoot, trustedRef), exploreRoot, opts.verbose));
+      ({ verdict, body } = withAdvice(body, advisory));
+    } catch (e) {
+      console.error(`advisory review failed, refusing without it: ${String(e instanceof Error ? e.message : e).split("\n")[0]}`);
+    }
+  }
 } else {
   const [primary, second] = backends;
-
-  const input = {
-    pr,
-    gates: gated.gates,
-    gateVerdict,
-    tier: [gated.tier, gated.sub].filter(Boolean).join(" / "),
-    titleFlags: flags,
-    manifests,
-    scrutiny,
-    ownership,
-    signals,
-    familiarity,
-    stories,
-  } as const;
 
   const guidance = loadGuidance(repoRoot, trustedRef);
 
@@ -427,7 +567,10 @@ if (opts["dry-run"]) {
     body = llm.reasoning;
   } catch (e) {
     verdict = "ERROR";
-    body = `Review failed before reaching a verdict: ${String(e instanceof Error ? e.message : e).split("\n")[0]}`;
+    // An auth failure from the api backend reads as a bare "Forbidden": name the variable the key came from.
+    const via = backends.includes("api") ? ` (${setting("model")}, ${keySource(setting("model"))})` : "";
+
+    body = `Review failed before reaching a verdict: ${String(e instanceof Error ? e.message : e).split("\n")[0]}${via}`;
   }
 }
 
@@ -445,9 +588,9 @@ if (llm?.next_steps) console.log(scrub(`next: ${llm.next_steps}`));
 
 if (opinion) console.log(scrub(`second opinion (${opinion.backend}): ${opinion.verdict}, ${opinion.reasoning}`));
 
-for (const run of [llm?.run, opinion?.run]) if (run) console.log(`reviewer run: ${summarizeRun(run)}`);
+for (const run of [llm?.run, opinion?.run, advisory?.run]) if (run) console.log(`reviewer run: ${summarizeRun(run)}`);
 
-const egressDenied = egressRefusals([llm?.egress, opinion?.egress]);
+const egressDenied = egressRefusals([llm?.egress, opinion?.egress, advisory?.egress]);
 
 if (egressDenied) console.log(`reviewer egress refused: ${egressDenied}`);
 
@@ -473,6 +616,7 @@ const evidence = {
   backends,
   llm,
   opinion,
+  advisory,
   verdict,
   ...finished(),
 };
@@ -491,11 +635,11 @@ if (opts.post) {
   // A verdict that went stale while posting belongs to a newer run or head: it notifies nobody.
   if (posted !== null && reconcilePosted(pr, posted, verdict, post)) {
     const url = `${process.env.GITHUB_SERVER_URL || "https://github.com"}/${pr.repo}/pull/${pr.number}`;
-    await notify(process.env.STAMP_NOTIFY_WEBHOOK, { event: "stamp.verdict", repo: pr.repo, pr: pr.number, url, title: pr.title, head_sha: pr.headSha, verdict, held: gateVerdict === "DENIED", reason: scrub(body) }, notifyOn(process.env.STAMP_NOTIFY_ON));
+    await notify(process.env.STAMP_NOTIFY_WEBHOOK, { event: "stamp.verdict", repo: pr.repo, pr: pr.number, url, title: pr.title, head_sha: pr.headSha, verdict, held: gateVerdict === "DENIED", reason: scrub(body) }, notifyOn(setting("notify_on")));
   }
 }
 
-const measurements = reviewMeasurements([llm, opinion].flatMap((r) => r ? [r.run] : []), verdict === "ERROR");
+const measurements = reviewMeasurements([llm, opinion, advisory].flatMap((r) => r ? [r.run] : []), verdict === "ERROR");
 
 await endReviewSpan(
   reviewAttributes(pr, verdict, {
@@ -564,21 +708,26 @@ function stackDeps(): StackDeps {
 
 /**
  * The trusted policy, with any rule packs it inherits from shepherd's config resolved into `rules`, and the
- * backends with every tier name (in STAMP_MODEL or STAMP_BACKENDS) resolved through shepherd's tiers.
+ * backends with every tier name (in the `model` or `backends` setting) resolved through shepherd's tiers. Its
+ * settings become the ones every later read sees (config.ts), under any non-blank environment override.
  */
-function trustedPolicy(ref: string): Inherited & { backends: Backend[] } {
+function trustedPolicy(ref: string): Inherited & { backends: Backend[]; summary: string } {
   const read = (rel: string) => readTrusted(repoRoot, rel, ref);
   const inherited = inheritRules(loadPolicy(repoRoot, ref), read, fetchPinned);
-  // The model each backend names: api's is STAMP_MODEL; claude and codex are CLIs, never tiers.
-  const wanted = BACKENDS.map((b) => (b === "api" ? MODEL : b === "claude" || b === "codex" ? "" : b));
+
+  useSettings(inherited.policy);
+  opts.label ||= setting("label") || undefined; // the flag, then STAMP_LABEL, then the policy
+  const chosen = reviewers();
+  // The model each backend names: api's is the `model` setting; claude and codex are CLIs, never tiers.
+  const wanted = chosen.map((b) => (b === "api" ? setting("model") : b === "claude" || b === "codex" ? "" : b));
   const tiers = resolveTiers(inherited.policy, wanted, read, fetchPinned);
-  const backends = BACKENDS.map((b, i) => (tiers.models[i] === wanted[i] ? b : tiers.models[i]!));
+  const backends = chosen.map((b, i) => (tiers.models[i] === wanted[i] ? b : tiers.models[i]!));
   // A bare name that is no tier and no Claude id names nothing stamp can call.
   const unresolved = wanted.filter((w) => /^[a-z][a-z0-9-]*$/.test(w) && !tiers.tiers[w] && !w.startsWith("claude-"));
+  const summary = `reviewers: ${backends.map((b, i) => `${b === "api" ? `api (${setting("model")}, ${keySource(setting("model"))})` : b}${wanted[i] && wanted[i] !== tiers.models[i] ? ` (tier ${wanted[i]})` : ""}`).join(", ")}`;
 
-  return { policy: tiers.policy, missing: [...inherited.missing, ...tiers.missing, ...unresolved.map((w) => `no shepherd tier named ${w}`)], backends };
+  return { policy: tiers.policy, missing: [...inherited.missing, ...tiers.missing, ...unresolved.map((w) => `no shepherd tier named ${w}`)], backends, summary };
 }
-
 
 function whoami(): string {
   try {
@@ -614,7 +763,7 @@ function checkoutAtHead(sha: string): string {
  */
 function agentPrompt(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict): string[] {
   return [
-    "<details><summary>🤖 Fix with a coding agent</summary>",
+    `<details><summary>${branded.fix} Fix with a coding agent</summary>`,
     "",
     "`````markdown",
     `Address this review of PR #${pr.number}, on head ${pr.headSha.slice(0, 7)}.`,
@@ -636,8 +785,7 @@ function agentPrompt(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdic
 }
 
 function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed | null, opinion: Opinion | null, gates: Gate[]): string {
-  const icon = { APPROVED: "✅", REFUSED: "❌", ESCALATE: "🙋", ERROR: "⚠️" }[verdict];
-  const parts = [`## ${icon} stamp: ${verdict}`, "", reasoning];
+  const parts = [branded.heading(verdict), "", reasoning];
 
   if (llm?.issues.length) parts.push("", "**Issues**", ...llm.issues.map((i) => `- ${i}`));
 
@@ -659,7 +807,7 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed |
     "",
     "| gate | result |",
     "|---|---|",
-    ...gates.map((g) => `| ${g.gate} | ${g.passed ? "✓" : "✗"} ${g.message} |`),
+    ...gates.map((g) => `| ${g.gate} | ${g.passed ? branded.pass : branded.fail} ${g.message} |`),
     `| reviewer | ${llm?.run ? summarizeRun(llm.run) : backends[0]}${llm ? ` → ${llm.verdict}` : ""} |`,
     ...(opinion ? [`| second opinion | ${opinion.run ? summarizeRun(opinion.run) : opinion.backend} → ${opinion.verdict} (${opinion.risk} risk) |`] : []),
     "",
@@ -671,6 +819,15 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed |
   );
 
   return parts.join("\n").replace(/!\[([^\]]*)\]\(/g, "[image: $1]("); // no auto-fetched images: a markdown image is an exfil channel
+}
+
+/** "+a −r lines": how far an upgraded file moved, counting lines as a multiset (order ignored). */
+function lineDiff(before: string, after: string): string {
+  const count = (text: string) => text.split("\n").reduce((m, l) => m.set(l, (m.get(l) ?? 0) + 1), new Map<string, number>());
+  const [a, b] = [count(before), count(after)];
+  const extra = (x: Map<string, number>, y: Map<string, number>) => [...x].reduce((n, [l, k]) => n + Math.max(0, k - (y.get(l) ?? 0)), 0);
+
+  return `+${extra(b, a)} −${extra(a, b)} lines`;
 }
 
 /** Why the PR is out of scope for a review (trigger label missing, or a draft); null when it is in scope. */

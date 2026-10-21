@@ -30,7 +30,7 @@
     "check": "bun run lint && bun run typecheck && bun test",
     "lint": "oxlint src",
     "changeset": "changeset",
-    "version-packages": "changeset version",
+    "version-packages": "changeset version && bun tools/sync-template-version.ts",
     "release": "changeset publish",
     "docs:dev": "bun run --cwd docs dev",
     "docs:build": "bun run docs:check && bun run --cwd docs build && bun docs/scripts/check-built.ts",

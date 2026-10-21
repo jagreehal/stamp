@@ -9,7 +9,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createGroq } from "@ai-sdk/groq";
 import { createMistral } from "@ai-sdk/mistral";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { createGateway, gateway, generateText, hasToolCall, stepCountIs, tool, type LanguageModel, type ModelMessage, type StepResult, type ToolSet } from "ai";
+import { createGateway, gateway, generateText, hasToolCall, stepCountIs, tool, ToolChoiceViolationError, type LanguageModel, type ModelMessage, type StepResult, type ToolSet } from "ai";
 import type { runWithSpan, Span, SpanStatusCode } from "autotel";
 import { BEDROCK_PRICING } from "autotel-bedrock";
 import { estimateLLMCost, registerModelPricing } from "autotel-genai/cost";
@@ -18,35 +18,41 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { dropBlankProviderEnv } from "./env.ts";
+import { DEFAULT_GUARD as DEFAULT_GUARD_SETTINGS, guardShorthand, setting } from "./config.ts";
+import { Pricing } from "./policy.ts";
 
-// Prices for any model autotel's tables leave out, per million tokens:
-// STAMP_PRICING='{"kimi-k3":{"inputPer1M":3,"outputPer1M":15,"cachedInputPer1M":0.3}}'.
-const Pricing = z.record(z.string(), z.object({ inputPer1M: z.number(), outputPer1M: z.number(), cachedInputPer1M: z.number().optional() }).strict());
+export { PROVIDER_ENV } from "./env.ts";
 
 registerModelPricing(BEDROCK_PRICING);
 
 let pricingLoadedFor: string | undefined;
 
-/** Register STAMP_PRICING at review time: a malformed value fails that review as ERROR, never the CLI's startup or its retraction of a stale approval. */
+/**
+ * Register the `pricing` setting (the policy's, or STAMP_PRICING over it) at review time: a malformed value fails
+ * that review as ERROR, never the CLI's startup or its retraction of a stale approval.
+ */
 function loadPricing(): void {
-  if (pricingLoadedFor === process.env.STAMP_PRICING) return;
+  const raw = setting("pricing");
 
-  if (process.env.STAMP_PRICING) {
+  if (pricingLoadedFor === raw) return;
+
+  if (raw) {
     let json: unknown;
 
     try {
-      json = JSON.parse(process.env.STAMP_PRICING);
+      json = JSON.parse(raw);
     } catch {
-      throw new Error("STAMP_PRICING: not valid JSON");
+      throw new Error("pricing: not valid JSON");
     }
 
     const parsed = Pricing.safeParse(json);
 
-    if (!parsed.success) throw new Error(`STAMP_PRICING: ${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`);
+    if (!parsed.success) throw new Error(`pricing: ${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`);
     registerModelPricing(parsed.data);
   }
 
-  pricingLoadedFor = process.env.STAMP_PRICING;
+  pricingLoadedFor = raw;
 }
 
 const PROVIDERS = ["anthropic", "bedrock", "openai", "opencode", "opencode-go", "openrouter", "groq", "mistral", "deepseek", "gateway", "compatible"] as const;
@@ -64,15 +70,12 @@ export function parseModelId(id: string): { provider: Provider; model: string } 
 }
 
 /** ANTHROPIC_BASE_URL in the Anthropic SDK's convention (no /v1, e.g. https://opencode.ai/zen/go), as the AI SDK wants it. */
-export function anthropicBaseURL(raw = process.env.ANTHROPIC_BASE_URL): string | undefined {
+export function anthropicBaseURL(raw = setting("anthropic_base_url")): string | undefined {
   if (!raw) return undefined;
   const trimmed = raw.replace(/\/+$/, "");
 
   return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
 }
-
-/** Every variable a provider reads its credentials or endpoint from. The workflow template passes each one. */
-export const PROVIDER_ENV = ["STAMP_API_KEY", "STAMP_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENCODE_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "DEEPSEEK_API_KEY", "AI_GATEWAY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"];
 
 const KEY_ENV: Record<Provider, string> = {
   anthropic: "ANTHROPIC_API_KEY",
@@ -88,6 +91,9 @@ const KEY_ENV: Record<Provider, string> = {
   gateway: "AI_GATEWAY_API_KEY",
 };
 
+/** The secret a model id's provider reads its key from: what `stamp init` asks for. */
+export const keyEnvFor = (modelId: string): string => KEY_ENV[parseModelId(modelId).provider];
+
 /**
  * The key for the provider STAMP_MODEL names: STAMP_API_KEY when set, so a repository holds one secret
  * whatever the provider, else the provider's own variable. On Bedrock the key is a Bedrock API key (bearer
@@ -97,8 +103,23 @@ export function apiKeyFor(provider: Provider, env: Record<string, string | undef
   return env.STAMP_API_KEY || env[KEY_ENV[provider]];
 }
 
+/**
+ * Where a model's key comes from, by variable name only, for the run log. STAMP_API_KEY set beside the provider's
+ * own variable wins over it, so the log says so: a stale STAMP_API_KEY otherwise reads as the provider refusing.
+ */
+export function keySource(modelId: string, env: Record<string, string | undefined> = process.env): string {
+  const { provider } = parseModelId(modelId);
+  const own = KEY_ENV[provider];
+
+  if (env.STAMP_API_KEY) return own !== "STAMP_API_KEY" && env[own] ? `key from STAMP_API_KEY, over ${own}` : "key from STAMP_API_KEY";
+
+  if (env[own]) return `key from ${own}`;
+
+  return provider === "bedrock" ? "AWS credential chain" : `no key: set ${own} or STAMP_API_KEY`;
+}
+
 /** How stamp authenticates to Bedrock: a bearer API key when it has one, else SigV4 from the credential chain. */
-type BedrockAuth = { credentialProvider: ReturnType<typeof defaultProvider>; apiKey?: string };
+type BedrockAuth = { credentialProvider: ReturnType<typeof defaultProvider>; apiKey?: string; region?: string };
 
 const OPENCODE = { opencode: "https://opencode.ai/zen/v1", "opencode-go": "https://opencode.ai/zen/go/v1" } as const;
 
@@ -107,9 +128,7 @@ const OPENCODE = { opencode: "https://opencode.ai/zen/v1", "opencode-go": "https
  * requires `x-opencode-session`); other hosts ignore the header.
  */
 export function languageModel(id: string, session: string): LanguageModel {
-  // A workflow passes an unset secret or variable as "", which providers read as a value: a blank
-  // AWS_BEARER_TOKEN_BEDROCK would replace the OIDC credentials with an empty key.
-  for (const k of PROVIDER_ENV) if (process.env[k] === "") delete process.env[k];
+  dropBlankProviderEnv(); // again here, for callers other than cli.ts (tests, smoke-live)
   const { provider, model } = parseModelId(id);
   const headers = { "x-opencode-session": session, "User-Agent": "stamp (pr-review)" };
   const apiKey = apiKeyFor(provider);
@@ -118,8 +137,8 @@ export function languageModel(id: string, session: string): LanguageModel {
     case "bedrock": {
       // A Bedrock API key (STAMP_API_KEY or AWS_BEARER_TOKEN_BEDROCK) wins when set. Otherwise SigV4 through the
       // AWS credential chain: environment keys (what an OIDC step exports), then AWS_PROFILE, SSO and instance
-      // roles. The region stays AWS_REGION.
-      const aws: BedrockAuth = { credentialProvider: defaultProvider() };
+      // roles. The region is the `provider.region` setting (AWS_REGION over it), else the SDK's own lookup.
+      const aws: BedrockAuth = { credentialProvider: defaultProvider(), region: setting("region") || undefined };
 
       if (apiKey) aws.apiKey = apiKey;
 
@@ -142,9 +161,9 @@ export function languageModel(id: string, session: string): LanguageModel {
       return createOpenAI({ apiKey, headers }).responses(model);
     case "compatible": {
       // Any OpenAI-compatible endpoint: Azure OpenAI, xAI, Together, Fireworks, LiteLLM, vLLM, Ollama.
-      const baseURL = process.env.STAMP_BASE_URL;
+      const baseURL = setting("base_url");
 
-      if (!baseURL) throw new Error("compatible: models need STAMP_BASE_URL, the endpoint's OpenAI-compatible base URL (https://host/v1)");
+      if (!baseURL) throw new Error("compatible: models need provider.base_url in .stamp/policy.yml (or STAMP_BASE_URL), the endpoint's OpenAI-compatible base URL (https://host/v1)");
 
       return createOpenAICompatible({ name: "compatible", baseURL, apiKey, headers })(model);
     }
@@ -242,11 +261,11 @@ export const summarizeRun = (run: RunRecord) =>
   `${run.model} · ${run.toolCalls} tool call${run.toolCalls === 1 ? "" : "s"} · ${run.costUsd === null ? `unpriced, ${tokenCap(run.limits) ?? "no token cap"}` : `$${run.costUsd.toFixed(4)}`} · ${(run.durationMs / 1000).toFixed(1)}s`;
 
 /**
- * Limits for one review, in autotel's guard shorthand (STAMP_GUARD replaces them): a cost ceiling, a token
+ * Limits for one review, in autotel's guard shorthand (the `guard` setting replaces them): a cost ceiling, a token
  * ceiling that still holds when the model has no price, spin-loop and tool-call limits, and a wall-clock
  * timeout that also aborts a model call in flight.
  */
-export const DEFAULT_GUARD = "budget:$2,tokens:3m,loop:4/12,max-tools:80,timeout:15m";
+export const DEFAULT_GUARD = guardShorthand(DEFAULT_GUARD_SETTINGS);
 
 /** The token ceiling an unpriced model falls back to when the rules set a dollar budget and no token ceiling. */
 const UNPRICED_TOKEN_CAP = "tokens:3m";
@@ -293,8 +312,8 @@ const MAX_STEPS = 40;
  * The output-token ceiling for one model call: STAMP_MAX_OUTPUT_TOKENS when set, else 16k, or 10k for Amazon
  * Nova, which refuses a request above its 10k limit outright. A verdict needs far less; the room is for reasoning.
  */
-export function maxOutputTokens(modelId: string, env: Record<string, string | undefined> = process.env): number {
-  const set = Number(env.STAMP_MAX_OUTPUT_TOKENS);
+export function maxOutputTokens(modelId: string, configured = setting("max_output_tokens")): number {
+  const set = Number(configured);
 
   if (Number.isInteger(set) && set > 0) return set;
 
@@ -312,7 +331,11 @@ export async function reviewWithTools<T>(o: Options<T>): Promise<ToolReview<T>> 
   const started = Date.now();
   const { model: pricedAs } = parseModelId(o.modelId);
   const model = o.model ?? languageModel(o.modelId, o.session);
-  const limits = guardRules(o.guard ?? (process.env.STAMP_GUARD || DEFAULT_GUARD), estimateLLMCost(pricedAs, { inputTokens: 1, outputTokens: 1 }) !== undefined);
+  const rules = o.guard ?? setting("guard");
+  const priced = estimateLLMCost(pricedAs, { inputTokens: 1, outputTokens: 1 }) !== undefined;
+
+  if (!priced && (rule(rules, "budget") || rule(rules, "cost"))) console.error(`budget guard inactive: no price for ${o.modelId}; set pricing in .stamp/policy.yml or STAMP_PRICING (the token ceiling still holds)`);
+  const limits = guardRules(rules, priced);
   const guard = createGenAiGuard({ rules: parseGuardRules(limits), onStop: "abort" });
   const deadline = timeoutMs(limits);
   const timer = deadline === null ? null : AbortSignal.timeout(deadline);
@@ -372,11 +395,21 @@ export async function reviewWithTools<T>(o: Options<T>): Promise<ToolReview<T>> 
 
     if (first.finishReason === "content-filter") return { output: null, text, refused: true, run: { ...run, durationMs: Date.now() - started } };
 
-    if (output === null) {
-      const messages: ModelMessage[] = [{ role: "user", content: o.prompt }, ...first.response.messages, { role: "user", content: `Call ${SUBMIT} now with your verdict.` }];
-      const forced = await generateText({ ...common, messages, toolChoice: { type: "tool", toolName: SUBMIT }, stopWhen: stepCountIs(1) });
+    // A model that answers in prose gets a follow-up that must be submit_verdict. Some models answer that in prose
+    // too (the SDK throws ToolChoiceViolationError), so they get one more, asked for any tool call, before ERROR.
+    const messages: ModelMessage[] = [{ role: "user", content: o.prompt }, ...first.response.messages, { role: "user", content: `Call ${SUBMIT} now with your verdict. Do not answer in prose.` }];
+
+    for (const toolChoice of [{ type: "tool", toolName: SUBMIT } as const, "required" as const]) {
+      if (output !== null) break;
       run.forcedVerdict = true;
-      text = forced.text || text;
+
+      try {
+        text = (await generateText({ ...common, messages, toolChoice, stopWhen: stepCountIs(1) })).text || text;
+      } catch (e) {
+        if (toolChoice === "required" || !ToolChoiceViolationError.isInstance(e)) throw e;
+
+        if (o.verbose) console.error(`  ${o.modelId} ignored the ${SUBMIT} tool choice; asking once more`);
+      }
     }
 
     if (stopped()) throw guardError();
@@ -396,11 +429,14 @@ let telemetry: Promise<{ shutdown: () => Promise<void> }> | null = null;
  * call, tokens, cost). Without one, the OpenTelemetry SDK is never loaded.
  */
 export async function startTelemetry(): Promise<void> {
-  if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT) return;
+  const endpoint = setting("telemetry_endpoint");
+
+  if (!endpoint) return;
+  process.env.OTEL_EXPORTER_OTLP_ENDPOINT = endpoint; // the OTLP exporter reads it from the environment
 
   telemetry ??= (async () => {
     const [{ init, shutdown }, { registerTelemetry }, { autotelTelemetry }, { bedrockProviderAttributes }] = await Promise.all([import("autotel"), import("ai"), import("autotel-genai/observer"), import("autotel-bedrock")]);
-    init({ service: process.env.OTEL_SERVICE_NAME || "stamp" });
+    init({ service: setting("telemetry_service") });
     registerTelemetry(autotelTelemetry({ pricing: BEDROCK_PRICING, providerAttributes: bedrockProviderAttributes }));
 
     return { shutdown };
@@ -419,10 +455,11 @@ let reviewSpan: ReviewSpan | null = null;
 
 /**
  * Open the `stamp.review` span for this run, backdated to its start, when an OTLP endpoint is configured.
+ * Call it after the trusted policy loads, so a policy-only endpoint and the policy's service name count.
  * Model and tool spans from the review nest under it; its attributes are set once, at the verdict.
  */
 export async function beginReviewSpan(started: string): Promise<void> {
-  if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT) return;
+  if (reviewSpan || !setting("telemetry_endpoint")) return;
   await startTelemetry();
   const { getTracer, runWithSpan, SpanStatusCode } = await import("autotel");
 

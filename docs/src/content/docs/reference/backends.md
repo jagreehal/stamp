@@ -6,7 +6,7 @@ title: "Backends, providers and isolation"
 
 | `STAMP_BACKEND` | Runs the review through | Auth | Model |
 | --------------- | ----------------------- | ---- | ----- |
-| `api` (default) | The AI SDK, on any provider below | `STAMP_API_KEY`, or that provider's own key | `STAMP_MODEL`, default `claude-opus-5` |
+| `api` (default) | The AI SDK, on any provider below | `STAMP_API_KEY`, or that provider's own key | `model` in `.stamp/policy.yml` (`STAMP_MODEL` overrides), default `claude-opus-5` |
 | `claude`        | Claude Code, headless (`claude -p`) | `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`, in an isolated container | `STAMP_CLAUDE_MODEL`, default Claude Code's |
 | `codex`         | Codex, headless (`codex exec`) | `CODEX_API_KEY` or `OPENAI_API_KEY`, in an isolated container | `STAMP_CODEX_MODEL`, default Codex's |
 
@@ -21,16 +21,16 @@ flowchart LR
     CX --> P3[api.openai.com]
 ```
 
-`STAMP_MODEL` is `provider:model`, a bare Claude id for Anthropic, or a tier name from shepherd's `.shepherd/config.yml` (see below). An unknown prefix is read as part of an Anthropic model id. The `api` backend gives the model three tools confined to the checkout, `read_file`, `grep` and `glob`, and the model ends by calling `submit_verdict`.
+The `model` setting (`model:` in `.stamp/policy.yml`, or `STAMP_MODEL` over it) is `provider:model`, a bare Claude id for Anthropic, or a tier name from shepherd's `.shepherd/config.yml` (see below). An unknown prefix is read as part of an Anthropic model id. The `api` backend gives the model three tools confined to the checkout, `read_file`, `grep` and `glob`, and the model ends by calling `submit_verdict`.
 
-One secret covers every provider: put the key in `STAMP_API_KEY` and Stamp sends it to whichever provider `STAMP_MODEL` names. The provider's own variable in the table below is the fallback when `STAMP_API_KEY` is unset. On Bedrock the key is a Bedrock API key; with no key set, Bedrock signs with AWS credentials instead (OIDC, see below).
+One secret covers every provider: put the key in `STAMP_API_KEY` and Stamp sends it to whichever provider `model` names. The provider's own variable in the table below is the fallback when `STAMP_API_KEY` is unset. On Bedrock the key is a Bedrock API key; with no key set, Bedrock signs with AWS credentials instead (OIDC, see below).
 
-Set `STAMP_MODEL` and `STAMP_BACKEND` as repository variables, not secrets. GitHub masks a secret's value everywhere in the logs, so a secret `STAMP_BACKEND=api` would turn every "api" in the log into `***`.
+Set `model` and `backends` in `.stamp/policy.yml`. If you override one with a variable, use a repository variable, not a secret: GitHub masks a secret's value everywhere in the logs, so a secret `STAMP_BACKEND=api` would turn every "api" in the log into `***`.
 
-| `STAMP_MODEL` | Provider | Key |
+| `model` | Provider | Key |
 | ------------- | -------- | --- |
 | `claude-opus-5` (no prefix) | Anthropic, or any endpoint in `ANTHROPIC_BASE_URL` | `STAMP_API_KEY` or `ANTHROPIC_API_KEY` |
-| `bedrock:zai.glm-4.7-flash`, `bedrock:us.anthropic.claude-sonnet-5-5` | Amazon Bedrock (Claude through InvokeModel, the rest through Converse) | a Bedrock API key in `STAMP_API_KEY` or `AWS_BEARER_TOKEN_BEDROCK`, or with neither set, any AWS credentials (OIDC, `AWS_PROFILE`, SSO, an instance role); and `AWS_REGION` |
+| `bedrock:minimax.minimax-m2.5`, `bedrock:us.anthropic.claude-sonnet-5-5` | Amazon Bedrock (Claude through InvokeModel, the rest through Converse) | a Bedrock API key in `STAMP_API_KEY` or `AWS_BEARER_TOKEN_BEDROCK`, or with neither set, any AWS credentials (OIDC, `AWS_PROFILE`, SSO, an instance role); and `provider.region` (or `AWS_REGION`) |
 | `openai:gpt-5.5` | OpenAI API (Responses) | `STAMP_API_KEY` or `OPENAI_API_KEY` |
 | `compatible:<model>` | Any OpenAI-compatible endpoint named by `STAMP_BASE_URL`: Azure OpenAI, xAI, Together, Fireworks, LiteLLM, vLLM, Ollama | `STAMP_API_KEY` |
 | `opencode-go:kimi-k3`, `opencode:claude-sonnet-5-5` | OpenCode Go and Zen | `STAMP_API_KEY` or `OPENCODE_API_KEY` |
@@ -40,10 +40,12 @@ Set `STAMP_MODEL` and `STAMP_BACKEND` as repository variables, not secrets. GitH
 | `deepseek:deepseek-flash` | DeepSeek (OpenAI-compatible, `api.deepseek.com`) | `STAMP_API_KEY` or `DEEPSEEK_API_KEY` |
 | `gateway:anthropic/claude-sonnet-5.5` | Vercel AI Gateway | `STAMP_API_KEY` or `AI_GATEWAY_API_KEY` |
 
+For a quick local try, the variables override the policy:
+
 ```bash
 STAMP_MODEL=deepseek:deepseek-flash   STAMP_API_KEY=...
 STAMP_MODEL=claude-opus-5                       ANTHROPIC_API_KEY=sk-ant-...
-STAMP_MODEL=bedrock:zai.glm-4.7-flash           STAMP_API_KEY=<Bedrock API key>  AWS_REGION=eu-west-1
+STAMP_MODEL=bedrock:minimax.minimax-m2.5        STAMP_API_KEY=<Bedrock API key>  AWS_REGION=eu-west-1
 STAMP_MODEL=opencode-go:deepseek-v4-flash       OPENCODE_API_KEY=...
 STAMP_MODEL=openrouter:moonshotai/kimi-k3       OPENROUTER_API_KEY=...
 STAMP_MODEL=groq:openai/gpt-oss-120b            GROQ_API_KEY=...
@@ -62,18 +64,20 @@ tiers:
   smart: bedrock:eu.anthropic.claude-sonnet-4-6
 ```
 
-Then `STAMP_MODEL=smart`, or `STAMP_BACKENDS=smart,fast` for a second opinion, reviews on those models; shepherd's reviewers and fixers use the same names. Switching provider changes the tier, not the workflow. Stamp reads the tiers from the default branch. A bare name with no tier stays a model id, so `claude-opus-5` keeps meaning Anthropic. Whenever `STAMP_MODEL` or `STAMP_BACKENDS` holds a bare name, a PR that edits `.shepherd/config.yml`, or a pack it extends in this repository, is denied as `stamp_policy`: adding or changing a tier there would change the model that approves later PRs.
+Then `model: smart`, or `backends: [smart, fast]` for a second opinion, reviews on those models; shepherd's reviewers and fixers use the same names. Switching provider changes the tier, not the workflow. Stamp reads the tiers from the default branch. A bare name with no tier stays a model id, so `claude-opus-5` keeps meaning Anthropic. Whenever `model` or `backends` holds a bare name, a PR that edits `.shepherd/config.yml`, or a pack it extends in this repository, is denied as `stamp_policy`: adding or changing a tier there would change the model that approves later PRs.
 
 ### Bedrock in GitHub Actions
 
-Set `STAMP_MODEL` (`bedrock:<model or inference profile id>`) and `AWS_REGION` as repository variables, then pick one way to authenticate:
+Set `model: bedrock:<model or inference profile id>` and `provider: { region: <region> }` in `.stamp/policy.yml` (`stamp init --model … --region …` writes both), then pick one way to authenticate:
 
 | | API key | OIDC |
 | --- | --- | --- |
 | Install | `stamp init` | `stamp init --aws-oidc`, or remove every `#aws-oidc ` prefix in `stamp.yml` and `stamp-edited.yml` |
 | Secret | `STAMP_API_KEY`: a Bedrock API key | none |
-| Variables | `STAMP_MODEL`, `AWS_REGION` | `STAMP_MODEL`, `AWS_REGION`, `AWS_ROLE_ARN` |
+| Variables | none | `AWS_ROLE_ARN` (`stamp init --region` writes the region into the OIDC step; `AWS_REGION` overrides it) |
 | AWS side | a key allowed to invoke the model | a role whose trust policy accepts the repository's `pull_request` runs and its default branch (a `/stamp` comment runs there), allowed `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` |
+
+Under OIDC every step of the review job can mint a token, and its subject is `repo:<owner>/<repo>:pull_request` for a PR run or `repo:<owner>/<repo>:ref:refs/heads/<default>` for a `/stamp` comment or a `workflow_run`. That token can assume **any** AWS role whose trust policy matches it: a deploy role that trusts the whole repository or organisation, or every ref, is reachable from the review job too. Before turning OIDC on, audit the roles that trust GitHub. Better, run the job in a dedicated environment (`stamp init --aws-oidc --environment ai-review`): its token subject becomes `repo:<owner>/<repo>:environment:ai-review`, so give the Bedrock role a trust policy that accepts only that subject, and check that no other role trusts `environment:*`. Until then, a Bedrock API key in an environment secret keeps the job unable to mint a token at all.
 
 Under OIDC leave `STAMP_API_KEY` empty: a key wins over the role. The OIDC step uses `continue-on-error`, so a failed exchange still lets stamp retract its standing approvals; the review then ends in ERROR. A run from a fork gets no OIDC token, and stamp refuses fork PRs anyway.
 
@@ -141,7 +145,7 @@ The `api` backend runs its repository-confined tools in-process and needs no Doc
 
 Every `api` review runs under `STAMP_GUARD`, written in autotel's rule shorthand. The default is `budget:$2,tokens:3m,loop:4/12,max-tools:80,timeout:15m`: a cost ceiling, a token ceiling, a spin-loop rule (the same call 4 times in 12), a tool-call cap, and a timeout that also cuts off a model call in flight. A rule that fires ends the review as ERROR. A model without a price keeps its token ceiling; give it a price with `STAMP_PRICING='{"kimi-k3":{"inputPer1M":3,"outputPer1M":15}}'`.
 
-The mechanics table names the model, its tool calls, the cost and the time (`bedrock:zai.glm-4.7-flash · 9 tool calls · $0.0042 · 6.2s`). The `--json` evidence carries the full run record: steps, tool calls and failures, tokens, cost and the limits it ran under. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and each run also becomes a trace. One `stamp.review` span covers the run from start to verdict, and the `gen_ai.*` spans, one per model call and tool call, nest under it. Its attributes make one wide event per review, so you can chart approval rates, refusal reasons and ERROR runs by repository:
+The mechanics table names the model, its tool calls, the cost and the time (`bedrock:minimax.minimax-m2.5 · 9 tool calls · $0.0042 · 6.2s`). The `--json` evidence carries the full run record: steps, tool calls and failures, tokens, cost and the limits it ran under. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and each run also becomes a trace. One `stamp.review` span covers the run from start to verdict, and the `gen_ai.*` spans, one per model call and tool call, nest under it. Its attributes make one wide event per review, so you can chart approval rates, refusal reasons and ERROR runs by repository:
 
 | Attribute | Holds |
 | --- | --- |
@@ -167,7 +171,7 @@ On a comment-only diff, Claude Code grepped the source before approving. Codex o
 
 ```bash
 STAMP_BACKENDS=claude,codex
-STAMP_BACKENDS=bedrock:zai.glm-4.7-flash,openrouter:moonshotai/kimi-k3   # two api models from different families
+STAMP_BACKENDS=bedrock:minimax.minimax-m2.5,openrouter:moonshotai/kimi-k3   # two api models from different families
 ```
 
 
@@ -185,7 +189,7 @@ flowchart TD
 
 The first backend reviews every PR. The second runs when the first approves something above plain low risk: a risk above `low`, or a title, scrutiny, manifest or Jev flag. It never sees the first verdict.
 
-When both approve, stamp approves and lists the second verdict in the mechanics table as the independent assurance risky territory asks for. When they disagree, stamp posts ESCALATE with both reasonings, the dissenter's issues and its next step. A plainly low-risk PR costs one call.
+When both approve, stamp approves and lists the second verdict in the mechanics table as independent assurance. When they disagree, stamp posts ESCALATE with both reasonings, the dissenter's issues and its next step. A plainly low-risk PR costs one call.
 
 Across 146 real PRs, four commercial reviewers never flagged the same line, and 93% of findings came from one tool alone. Two models from different families miss different things.
 

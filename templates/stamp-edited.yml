@@ -13,6 +13,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: read # a called workflow gets no more than its caller grants
   # stamp.yml reads the test-evidence artifact, and a called workflow gets no more than its caller grants.
   actions: read
   checks: read

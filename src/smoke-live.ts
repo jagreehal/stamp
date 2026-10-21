@@ -3,7 +3,7 @@
 //   ANTHROPIC_API_KEY=... bun run src/smoke-live.ts
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { BACKENDS, review } from "./reviewer.ts";
+import { review, reviewers } from "./reviewer.ts";
 import type { PR } from "./github.ts";
 
 const root = path.resolve(import.meta.dir, "..");
@@ -41,7 +41,7 @@ const pr: PR = {
 };
 
 const verdict = await review(
-  BACKENDS[0]!,
+  reviewers()[0]!,
   {
     pr,
     gates: [

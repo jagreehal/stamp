@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import { anthropicBaseURL, apiKeyFor, languageModel, maxOutputTokens, DEFAULT_GUARD, guardRules, parseModelId, reviewWithTools, summarizeRun, timeoutMs } from "./llm.ts";
+import { anthropicBaseURL, apiKeyFor, keySource, languageModel, maxOutputTokens, DEFAULT_GUARD, guardRules, parseModelId, reviewWithTools, summarizeRun, timeoutMs } from "./llm.ts";
 
 const Verdict = z.object({ verdict: z.enum(["APPROVE", "REFUSE", "ESCALATE"]), reasoning: z.string() });
 
@@ -50,12 +50,26 @@ describe("model ids", () => {
     expect(apiKeyFor("bedrock", { STAMP_API_KEY: "one" })).toBe("one");
     expect(apiKeyFor("bedrock", { AWS_BEARER_TOKEN_BEDROCK: "bt" })).toBe("bt");
     expect(apiKeyFor("bedrock", { AWS_ACCESS_KEY_ID: "AKIA", AWS_SECRET_ACCESS_KEY: "s" })).toBeUndefined();
+    // The run log names the variable, never its value, and says when STAMP_API_KEY wins over the provider's own.
+    expect(keySource("bedrock:minimax.minimax-m2.5", { STAMP_API_KEY: "one", AWS_BEARER_TOKEN_BEDROCK: "bt" })).toBe("key from STAMP_API_KEY, over AWS_BEARER_TOKEN_BEDROCK");
+    expect(keySource("bedrock:minimax.minimax-m2.5", { AWS_BEARER_TOKEN_BEDROCK: "bt" })).toBe("key from AWS_BEARER_TOKEN_BEDROCK");
+    expect(keySource("bedrock:minimax.minimax-m2.5", {})).toBe("AWS credential chain");
+    expect(keySource("compatible:m", { STAMP_API_KEY: "one" })).toBe("key from STAMP_API_KEY");
+    expect(keySource("groq:openai/gpt-oss-120b", {})).toBe("no key: set GROQ_API_KEY or STAMP_API_KEY");
   });
 
   test("ANTHROPIC_BASE_URL keeps working in the Anthropic SDK's form, without /v1", () => {
     expect(anthropicBaseURL("https://opencode.ai/zen/go")).toBe("https://opencode.ai/zen/go/v1");
     expect(anthropicBaseURL("https://opencode.ai/zen/go/v1/")).toBe("https://opencode.ai/zen/go/v1");
     expect(anthropicBaseURL("")).toBeUndefined();
+  });
+
+  test("a blank provider variable, as a workflow passes an unset one, never reaches a provider SDK as it loads", () => {
+    // @ai-sdk/anthropic builds its default client at import, and ANTHROPIC_BASE_URL="" makes that throw.
+    const cli = Bun.spawnSync(["bun", "run", path.resolve(import.meta.dir, "cli.ts")], { env: { ...process.env, ANTHROPIC_BASE_URL: "", AWS_BEARER_TOKEN_BEDROCK: "" }, cwd: import.meta.dir });
+
+    expect(cli.stderr.toString()).not.toContain("baseURL");
+    expect(cli.exitCode).toBe(2); // the usage message: the CLI got past its imports
   });
 });
 
@@ -102,6 +116,14 @@ describe("the review loop", () => {
     expect(model.doGenerateCalls[1]!.toolChoice).toEqual({ type: "tool", toolName: "submit_verdict" });
   });
 
+  test("a model that ignores the first forced call gets one more before the review errors", async () => {
+    const model = new MockLanguageModelV4({ doGenerate: [turn({ type: "text", text: "Looks fine." }), turn({ type: "text", text: "Still fine." }), turn(call("submit_verdict", { verdict: "ESCALATE", reasoning: "unsure" }, "1"))] });
+    const result = await run(model);
+
+    expect(result.output).toEqual({ verdict: "ESCALATE", reasoning: "unsure" });
+    expect(model.doGenerateCalls.at(-1)?.toolChoice).toEqual({ type: "required" });
+  });
+
   test("a guard rule stops a runaway loop and says which rule fired", async () => {
     const reads = Array.from({ length: 6 }, (_, i) => turn(call("read_file", { path: "total.ts" }, String(i))));
 
@@ -137,7 +159,7 @@ describe("the review loop", () => {
     try {
       const model = new MockLanguageModelV4({ doGenerate: [turn(call("submit_verdict", { verdict: "APPROVE", reasoning: "ok" }, "1"))] });
 
-      await expect(run(model)).rejects.toThrow(/STAMP_PRICING: kimi-k3.inputPer1M/);
+      await expect(run(model)).rejects.toThrow(/pricing: kimi-k3.inputPer1M/);
     } finally {
       delete process.env.STAMP_PRICING;
     }
@@ -162,11 +184,11 @@ describe("limits", () => {
 });
 
 test("the output ceiling fits the model: Nova's 10k limit, 16k elsewhere, STAMP_MAX_OUTPUT_TOKENS over both", () => {
-  expect(maxOutputTokens("bedrock:eu.amazon.nova-micro-v1:0", {})).toBe(10_000);
-  expect(maxOutputTokens("bedrock:amazon.nova-lite-v1:0", {})).toBe(10_000);
-  expect(maxOutputTokens("bedrock:zai.glm-4.7-flash", {})).toBe(16_000);
-  expect(maxOutputTokens("claude-opus-5", { STAMP_MAX_OUTPUT_TOKENS: "4000" })).toBe(4000);
-  expect(maxOutputTokens("claude-opus-5", { STAMP_MAX_OUTPUT_TOKENS: "lots" })).toBe(16_000);
+  expect(maxOutputTokens("bedrock:eu.amazon.nova-micro-v1:0", "")).toBe(10_000);
+  expect(maxOutputTokens("bedrock:amazon.nova-lite-v1:0", "")).toBe(10_000);
+  expect(maxOutputTokens("bedrock:zai.glm-4.7-flash", "")).toBe(16_000);
+  expect(maxOutputTokens("claude-opus-5", "4000")).toBe(4000);
+  expect(maxOutputTokens("claude-opus-5", "lots")).toBe(16_000);
 });
 
 test("openai: is the OpenAI API, and compatible: reaches any OpenAI-compatible endpoint named by STAMP_BASE_URL", () => {

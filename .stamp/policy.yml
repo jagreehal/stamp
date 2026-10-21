@@ -5,48 +5,39 @@
 # case-insensitively on word boundaries. Keep them single-quoted.
 version: 1
 
+# Settings. Each is optional; a non-blank environment variable of the same meaning overrides it (STAMP_MODEL,
+# AWS_REGION, STAMP_GUARD, ...), and `stamp config` shows every value in effect and where it came from.
+# Secrets never go here. Without a price for the model, the $ budget cannot fire ("budget guard inactive").
+# model: bedrock:minimax.minimax-m2.5
+# backends: [api, bedrock:openai.gpt-oss-120b-1:0]   # primary, then a second opinion
+# pricing:
+#   minimax.minimax-m2.5: { inputPer1M: 0.3, outputPer1M: 1.2 }
+# provider: { region: eu-west-1 }                    # also base_url (compatible:) and anthropic_base_url
+# guard: { budget_usd: 2, tokens: 3m, loop: 4/12, max_tools: 80, timeout: 15m }
+# max_output_tokens: 16000
+# cli: { claude_model: claude-sonnet-5-5, codex_model: gpt-5.5 }
+# label: stamp                                        # review only PRs carrying this label
+# notify: { on: [REFUSED, ESCALATE, ERROR] }
+# telemetry: { endpoint: https://otlp.example.com, service: stamp }
+# advise_on_deny: true                                # on a gate denial, still ask the model; its findings ride on the refusal, never approve
+
+# How posted reviews look. Leave out for the defaults. Glyph keys: APPROVED, REFUSED, ESCALATE,
+# ERROR, pass, fail, fix.
+# branding:
+#   name: stamp
+#   avatar: https://example.com/logo.png
+#   emoji: { ESCALATE: ⚠️ }
+
 # T2: never AI-approved. Any changed file matching a `paths` or `any` pattern
-# denies the PR before the LLM runs. `any` and `titles` patterns also scan the
-# PR title, but a title hit is only a scrutiny flag for the reviewer, never a
-# denial on its own (calibrated against ~440 PRs: most title-only hits were
-# incidental mentions humans approved unchanged).
+# denies the PR before the LLM runs. Only stamp's own policy is denied by
+# default: the reviewer reads every other change, with the sensitive areas
+# below flagged under `scrutiny`. To send an area to a human instead, add a
+# category here (`stamp init --strict` writes a policy with the full list).
 deny:
-  auth:
-    description: Authentication and authorization surfaces.
-    match:
-      any: ['auth', 'login', 'signup', 'oauth', 'saml', 'sso', 'oidc', 'credential', 'password', '2fa', 'mfa', 'two[_-]?factor']
-      titles: ['authenticated', 'authorized']
-      paths: ['session_auth', 'session_token', 'permission']
-  crypto_secrets:
-    description: Cryptography, secrets, and key material.
-    match:
-      any: ['crypto', 'encrypt', 'decrypt', 'vault']
-      paths: ['secret', 'api[_-]?key', 'private[_-]?key', 'signing[_-]?key', 'certificate', '\.env', '\.pem']
-  migrations:
-    description: Database and schema migrations.
-    match:
-      paths: ['migrations/', 'schema_change', 'drizzle/', 'prisma/migrations']
-  infra_cicd:
-    description: Infrastructure, CI, and deployment artifacts.
-    match:
-      any: ['terraform', 'kubernetes', 'helm']
-      paths: ['k8s', 'dockerfile', 'docker-compose', '\.github/workflows', 'iam', 'cloudflare', '(?:^|/)bin/deploy', 'deploy\.sh', 'vercel\.json', 'fly\.toml']
-  billing:
-    description: Payments and billing.
-    match:
-      any: ['billing', 'payment', 'stripe', 'invoice', 'pricing']
-  public_api:
-    description: Public API contracts and schemas.
-    match:
-      any: ['openapi', 'api_schema', 'swagger', 'public_api']
-  deps_toolchain:
-    description: Lockfiles and toolchain/build files. Manifests (package.json) without a lockfile change are flagged for the reviewer instead.
-    match:
-      paths: ['pnpm-lock\.yaml', 'package-lock\.json', 'yarn\.lock', 'bun\.lock', 'uv\.lock', 'poetry\.lock', 'Cargo\.lock', 'Gemfile\.lock', 'go\.sum', 'requirements[-\w]*\.(txt|in)', 'Makefile', '\.tool-versions', '\.nvmrc']
   stamp_policy:
     description: stamp's own policy, engine, and gate inputs. The gate cannot approve edits to itself.
     match:
-      paths: ['\.stamp/', 'stamp/src/', 'CODEOWNERS', 'AGENT_APPROVALS\.md']
+      paths: ['\.stamp/', 'stamp/src/', 'CODEOWNERS', 'AGENT_APPROVALS\.md', '\.github/workflows/stamp(-edited|-digest)?\.ya?ml']
 
 # T0: docs/tests/config only. Still LLM-reviewed, lighter bar.
 allow:
@@ -92,6 +83,35 @@ scrutiny:
     description: Configuration and house rules that review and fix agents follow on later PRs.
     paths: ['\.shepherd/', '\.claude/skills/', '\.agents/skills/', '(?:^|/)AGENTS\.md$', '(?:^|/)CLAUDE\.md$', '(?:^|/)REVIEW\.md$', 'docs/adr/']
     instruction: These files decide how agents review and fix future PRs. REFUSE if a lens was removed, its applies_to narrowed, a Review rule deleted or weakened, Fix guidance loosened (fewer Never touch or Escalate entries), or a house rule relaxed, or REVIEW.md told to skip a path or class of finding, lower a severity or cap findings. Adding or tightening rules is fine.
+
+  auth:
+    description: Authentication and authorization surfaces.
+    paths: ['auth', 'login', 'signup', 'oauth', 'saml', 'sso', 'oidc', 'credential', 'password', '2fa', 'mfa', 'two[_-]?factor', 'session_auth', 'session_token', 'permission']
+    instruction: REFUSE if a check that grants access was removed, loosened or bypassed, a session or token lives longer or is checked less, or a permission widened without a test. ESCALATE when you cannot trace who gains access.
+  crypto_secrets:
+    description: Cryptography, secrets, and key material.
+    paths: ['crypto', 'encrypt', 'decrypt', 'vault', 'secret', 'api[_-]?key', 'private[_-]?key', 'signing[_-]?key', 'certificate', '\.env', '\.pem']
+    instruction: REFUSE if an algorithm, key size or mode weakened, a secret is logged, committed or sent somewhere new, or verification was skipped. ESCALATE when you cannot tell where a key is generated, stored or sent.
+  migrations:
+    description: Database and schema migrations.
+    paths: ['migrations/', 'schema_change', 'drizzle/', 'prisma/migrations']
+    instruction: REFUSE a migration that drops or rewrites data without a backfill, cannot be rolled back, or locks a large table. ESCALATE when you cannot tell the table size or the deploy order.
+  infra_cicd:
+    description: Infrastructure, CI, and deployment artifacts.
+    paths: ['terraform', 'kubernetes', 'helm', 'k8s', 'dockerfile', 'docker-compose', '\.github/workflows', 'iam', 'cloudflare', '(?:^|/)bin/deploy', 'deploy\.sh', 'vercel\.json', 'fly\.toml']
+    instruction: REFUSE if a workflow gains permissions or secrets, runs untrusted input (pull_request_target, a PR's code with secrets), an action is unpinned, or an IAM policy or network rule widens. ESCALATE a deploy change you cannot see how to roll back.
+  billing:
+    description: Payments and billing.
+    paths: ['billing', 'payment', 'stripe', 'invoice', 'pricing']
+    instruction: REFUSE if an amount, currency, rounding, retry or idempotency rule changed without a test that pins it. ESCALATE when you cannot tell what a customer is charged after the change.
+  public_api:
+    description: Public API contracts and schemas.
+    paths: ['openapi', 'api_schema', 'swagger', 'public_api']
+    instruction: REFUSE a breaking change to a public contract (a removed or renamed field, a narrowed type, a new required input) without a version bump.
+  deps_toolchain:
+    description: Lockfiles and toolchain/build files.
+    paths: ['pnpm-lock\.yaml', 'package-lock\.json', 'yarn\.lock', 'bun\.lock', 'uv\.lock', 'poetry\.lock', 'Cargo\.lock', 'Gemfile\.lock', 'go\.sum', 'requirements[-\w]*\.(txt|in)', 'Makefile', '\.tool-versions', '\.nvmrc']
+    instruction: REFUSE a lockfile change the manifest does not explain, a package from a new registry or git URL, or an install script added. ESCALATE a new dependency with native code or install-time network access whose source you cannot check.
 
 # Bots that leave 👀 while reviewing; stamp waits for them before judging.
 reviewer_bots: ['greptile-apps[bot]', 'coderabbitai[bot]', 'chatgpt-codex-connector[bot]', 'claude[bot]']

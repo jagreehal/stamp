@@ -40,6 +40,6 @@ An approval names the one fact the change is safe because of, under **Safe becau
 
 Each non-approval carries a collapsed **Fix with a coding agent** block. It holds the verdict, the issues and the requested next step as one prompt you can copy, with the rule that weakening a test or a lint rule to clear the review counts as a refusal. Agents write most of the PRs stamp sees, so the fix loop starts there.
 
-Comment `/stamp` on a PR to re-run the review without an empty commit. stamp acts on comments from OWNER, MEMBER and COLLABORATOR only.
+Comment `/stamp` on a PR to re-run the review without an empty commit. stamp acts on comments from people with write access only: OWNER, MEMBER and COLLABORATOR, or anyone the permission API says can push, which covers access through a team and private org members.
 
 In CI the stamp login is `github-actions[bot]`. A local `--post` uses the account `gh` is logged in as. Each run can write an evidence bundle (`--json`), and the workflow uploads it as an artifact.

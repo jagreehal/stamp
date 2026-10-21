@@ -20,12 +20,14 @@ jobs:
   digest:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      STAMP_VERSION: 0.6.1 # pinned: `stamp init` writes the version it installs
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0: pinned
-      - run: bunx @jagreehal/stamp@0.1.0 digest --since ${{ github.event.schedule == '0 14 * * 1' && 72 || 24 }}
+      - run: bunx "@jagreehal/stamp@$STAMP_VERSION" digest --since ${{ github.event.schedule == '0 14 * * 1' && 72 || 24 }}
         env:
           GH_TOKEN: ${{ github.token }}
           STAMP_BOT_LOGIN: github-actions[bot]
