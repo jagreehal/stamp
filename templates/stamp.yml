@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20 # a hung model call must not burn a runner for six hours; a killed run is fail-closed (the approval is already retracted)
     env:
-      STAMP_VERSION: 0.6.1 # pinned: the engine decides what gets auto-approved, so bumps are deliberate
+      STAMP_VERSION: 0.7.0 # pinned: the engine decides what gets auto-approved, so bumps are deliberate
     steps:
       - uses: actions/checkout@v4
         with:
