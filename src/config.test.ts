@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { configSummary, effectiveConfig, resolve } from "./config.ts";
-import { PolicySchema, policyWithSettings } from "./policy.ts";
+import { PolicySchema, STAMP_VERSION, parsePolicy, policyJsonSchema, policyWithSettings } from "./policy.ts";
 
 const bundled = () => readFileSync(path.resolve(import.meta.dir, "../.stamp/policy.yml"), "utf8");
 
@@ -79,5 +79,22 @@ describe("settings", () => {
     expect(parseYaml(text)).toMatchObject({ model: "bedrock:minimax.minimax-m2.5", provider: { region: "eu-west-1" } });
     expect(policyWithSettings(bundled(), {})).toBe(bundled());
     expect(() => policyWithSettings(bundled(), { region: "europe" })).toThrow();
+  });
+
+  test("the published schema is PolicySchema at this version, and a bad policy names its line", () => {
+    const read = (rel: string) => readFileSync(path.resolve(import.meta.dir, "..", rel), "utf8");
+
+    expect(JSON.parse(read(".stamp/policy.schema.json"))).toEqual(JSON.parse(JSON.stringify(policyJsonSchema()))); // else: bun tools/policy-schema.ts
+
+    for (const rel of [".stamp/policy.yml", "templates/policy-strict.yml"]) expect(read(rel)).toStartWith(`# yaml-language-server: $schema=https://unpkg.com/@jagreehal/stamp@${STAMP_VERSION}/.stamp/policy.schema.json\n`);
+    expect(() => parsePolicy(bundled().replace("max_lines: ", "max_lines: -"))).toThrow(/^\.stamp\/policy\.yml:\d+:\d+ size_gate\.max_lines: /);
+    expect(() => parsePolicy(bundled().replace("version: 1\n", "version: 1\nnope: true\n"))).toThrow(/^\.stamp\/policy\.yml:8:\d+ .*"nope"/);
+    expect(() => parsePolicy(`${bundled()}\n  bad: [`)).toThrow(/^\.stamp\/policy\.yml:\d+:\d+ /);
+    // each YAML error gets its own line, and so does an alias to a missing anchor
+    expect(() => parsePolicy(bundled().replace("version: 1\n", "version: 1\nversion: 1\n").replace("allow:\n", "allow:\n  path_patterns: []\n"))).toThrow(/^\.stamp\/policy\.yml:8:1 Map keys must be unique\n\.stamp\/policy\.yml:\d+:3 Map keys must be unique$/);
+    expect(() => parsePolicy(bundled().replace("version: 1\n", "version: *missing\n"))).toThrow(/^\.stamp\/policy\.yml:7:10 unresolved alias \*missing$/);
+    // the schema requires deny.stamp_policy, so an editor flags its removal
+    expect(policyJsonSchema()).toMatchObject({ properties: { deny: { required: ["stamp_policy"] } } });
+    expect(() => parsePolicy(bundled().replace("  stamp_policy:", "  stamp_polcy:"))).toThrow(/:\d+:\d+ deny\.stamp_policy: required: the gate cannot approve edits to itself/);
   });
 });
