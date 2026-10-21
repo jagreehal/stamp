@@ -33,7 +33,7 @@ function repo() {
     return git("rev-parse", "HEAD");
   };
 
-  return { dir, commit, diff: (base: string, head: string) => git("diff", `${base}...${head}`) };
+  return { dir, git, commit, diff: (base: string, head: string) => git("diff", `${base}...${head}`) };
 }
 
 describe("approval retention", () => {
@@ -64,6 +64,37 @@ describe("approval retention", () => {
 
     story.and("the startup sweep dismisses it before the new head is reviewed");
     expect(sweepTargets(reviews, BOT, null)).toEqual([11]);
+  });
+
+  test("merging a base that edited the PR's file elsewhere keeps the approval", () => {
+    story.init({ ticket: "src/retention.ts", covers: ["src/retention.ts"] });
+
+    story.given("stamp approved a PR that changes one line of a.ts");
+    const { dir, git, commit, diff } = repo();
+    const lines = (edit: (l: string[]) => string[]) => edit(Array.from({ length: 12 }, (_, i) => `export const v${i} = ${i};`)).join("\n") + "\n";
+    const base = commit(lines((l) => l), "base");
+    git("checkout", "-qb", "pr");
+    const approvedHead = commit(lines((l) => l.map((v, i) => (i === 10 ? "export const v10 = 100;" : v))), "change v10");
+    const reviews = [verdict(31, "APPROVED", approvedHead, base, "2026-10-16T09:00:00Z")];
+
+    story.when("the base gains a line at the top of a.ts and the author merges it");
+    git("checkout", "-q", "-");
+    const newBase = commit(lines((l) => ["// header", ...l]), "header");
+    git("checkout", "-q", "pr");
+    git("merge", "-q", "--no-edit", newBase);
+    const mergedHead = git("rev-parse", "HEAD");
+    // SAFETY: tryRetainApproval only hands `pr` to its deps, which read repo, number and SHAs alone.
+    const pr = { repo: "o/r", number: 7, headSha: mergedHead, baseSha: newBase } as PR;
+
+    const result = tryRetainApproval(pr, BOT, dir, () => true, {
+      findStandingApproval: (live, bot) => standingApproval(reviews, live.headSha, bot),
+      compareDiff: (_repo, from, to) => diff(from, to),
+      retentionHolds: () => true,
+    });
+
+    story.then("the diff's line numbers moved but its patch id did not, so the approval stands");
+    expect(diff(newBase, mergedHead)).not.toBe(diff(base, approvedHead));
+    expect(result).toEqual({ kept: true, approval: { reviewId: 31, approvedHead, approvedBase: base }, pr });
   });
 
   test("a newer refusal supersedes an older approval", () => {

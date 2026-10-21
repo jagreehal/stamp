@@ -44,7 +44,7 @@ import {
   type PRMeta,
 } from "./policy.ts";
 import { approvedDiffUnchanged, standingApproval, tryRetainApproval } from "./retention.ts";
-import { buildPrompt, combine, diffCut, independentReviewers, oneLine, sanitize, secondOpinionNeeded, splitReviewChanges, type LLMVerdict } from "./reviewer.ts";
+import { assured, buildPrompt, combine, diffCut, independentReviewers, oneLine, sanitize, secondOpinionNeeded, splitReviewChanges, type LLMVerdict } from "./reviewer.ts";
 import { SIGNAL_IDS, SIGNAL_THRESHOLD, flagged, formatSignals, requestBody, type Signals } from "./signals.ts";
 
 const policy = loadPolicy(path.resolve(import.meta.dir, ".."), "no-such-ref"); // no such ref → bundled defaults
@@ -198,19 +198,36 @@ src/auth/**  @org/security @bob
 });
 
 test("second opinion: only on non-trivial approvals; disagreement escalates with both reasonings", () => {
-  const ok = (risk: LLMVerdict["risk"]): LLMVerdict => ({ verdict: "APPROVE", reasoning: "fine.", risk, issues: [], notes: [], next_steps: "", change_summary: "" });
+  const ok = (risk: LLMVerdict["risk"]): LLMVerdict => ({ verdict: "APPROVE", reasoning: "fine.", risk, issues: [], notes: [], next_steps: "", change_summary: "", safe_because: null });
   expect(secondOpinionNeeded(ok("low"), false)).toBe(false);
   expect(secondOpinionNeeded(ok("low"), true)).toBe(true); // a scrutiny/title/manifest flag makes it worth a second look
   expect(secondOpinionNeeded(ok("medium"), false)).toBe(true);
   expect(secondOpinionNeeded({ ...ok("high"), verdict: "REFUSE" }, true)).toBe(false); // already human-bound
   expect(combine("claude", ok("medium"), { backend: "codex", ...ok("low") })).toEqual({ verdict: "APPROVE", llm: ok("medium") });
-  const dissent = combine("claude", ok("medium"), { backend: "codex", verdict: "REFUSE", reasoning: "Breaks retries.", risk: "high", issues: ["retry loop drops the last attempt"], notes: ["retries are untested"], next_steps: "Ask @bob.", change_summary: "" });
+  const dissent = combine("claude", ok("medium"), { backend: "codex", verdict: "REFUSE", reasoning: "Breaks retries.", risk: "high", issues: ["retry loop drops the last attempt"], notes: ["retries are untested"], next_steps: "Ask @bob.", change_summary: "", safe_because: null });
   expect(dissent.verdict).toBe("ESCALATE");
   expect(dissent.llm.reasoning).toBe("Reviewers disagree. claude: fine. codex: Breaks retries.");
   expect(dissent.llm.issues).toEqual(["codex: retry loop drops the last attempt"]);
   expect(dissent.llm.notes).toEqual(["codex: retries are untested"]);
   expect(dissent.llm.next_steps).toBe("Ask @bob.");
   expect(dissent.llm.risk).toBe("high");
+});
+
+test("a high-risk approval escalates unless the fact it rests on was checked", () => {
+  const approve = (risk: LLMVerdict["risk"], safe_because: LLMVerdict["safe_because"]): LLMVerdict => ({ verdict: "APPROVE", reasoning: "Fine.", risk, issues: [], notes: [], next_steps: "", change_summary: "", safe_because });
+  const alone = (llm: LLMVerdict) => assured({ verdict: llm.verdict, llm });
+  const cited = { fact: "the only caller validates the id", evidence: "cited" } as const;
+  expect(alone(approve("high", cited)).verdict).toBe("APPROVE");
+  expect(alone(approve("medium", null)).verdict).toBe("APPROVE"); // only high risk needs checked assurance
+  const believed = alone(approve("high", { ...cited, evidence: "claimed" }));
+  expect(believed.verdict).toBe("ESCALATE");
+  expect(believed.llm.reasoning).toContain('"the only caller validates the id", which the reviewer did not check');
+  expect(alone(approve("high", null)).llm.reasoning).toContain("named no fact");
+  expect(alone({ ...approve("high", null), verdict: "REFUSE" }).verdict).toBe("REFUSE");
+  // A second reviewer's refusal escalates; the primary's well-evidenced approval must not turn it back.
+  const dissent = combine("claude", approve("high", cited), { backend: "codex", ...approve("high", null), verdict: "REFUSE", reasoning: "Breaks retries." });
+  expect(dissent.llm.verdict).toBe("APPROVE");
+  expect(assured(dissent).verdict).toBe("ESCALATE");
 });
 
 test("risk signals: request shape, flags above threshold strongest first, prompt block", () => {
@@ -760,6 +777,13 @@ describe("approval retention predicate", () => {
   });
   test("changed content refuses", () => {
     expect(approvedDiffUnchanged("diff a\n", "diff b\n")).toBe(false);
+  });
+  const hunk = (at: number, added: string) => `diff --git a/x.py b/x.py\nindex 1111111..2222222 100644\n--- a/x.py\n+++ b/x.py\n@@ -${at},2 +${at},2 @@\n def f():\n-    return 1\n+${added}\n`;
+  test("moved line numbers retain", () => {
+    expect(approvedDiffUnchanged(hunk(3, "    return 2"), hunk(9, "    return 2").replace("1111111..2222222", "3333333..4444444"))).toBe(true);
+  });
+  test("a whitespace-only change refuses: indentation is code", () => {
+    expect(approvedDiffUnchanged(hunk(3, "    return 2"), hunk(3, "  return 2"))).toBe(false);
   });
 });
 

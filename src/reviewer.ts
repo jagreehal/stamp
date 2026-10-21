@@ -35,6 +35,14 @@ export const VerdictSchema = z.object({
   notes: z.array(z.string()).default([]).describe("Non-blocking observations: refuted concerns, follow-ups, things worth knowing. Never repeat an issue here."),
   next_steps: z.string().describe("Empty on APPROVE. Otherwise what the author does next: who to ask, which comment to address."),
   change_summary: z.string().describe("What changed, for a teammate who never saw the PR. Own words, never quote the diff. Under 600 chars."),
+  safe_because: z
+    .object({
+      fact: z.string().describe("The one fact the change is safe because of, e.g. 'the only caller already passes a validated id'."),
+      evidence: z.enum(["claimed", "cited", "traced", "tested"]).describe("claimed: you believe it. cited: you read the file:line that shows it. traced: you walked the failure path and it cannot reach. tested: a test or story in the evidence exercises it."),
+    })
+    .nullable()
+    .default(null)
+    .describe("On APPROVE: the fact the approval rests on and how far you checked it. Null otherwise."),
 });
 
 export type LLMVerdict = z.infer<typeof VerdictSchema>;
@@ -59,7 +67,10 @@ Respond with the JSON verdict only, no prose around it, exactly these keys:
  "issues": ["one blocking issue per string, a reason for this verdict the author must fix; empty array if none"],
  "notes": ["non-blocking observations: refuted concerns, follow-ups; empty array if none"],
  "next_steps": "empty string on APPROVE; otherwise what the author does next",
- "change_summary": "what changed, for a teammate who never saw the PR; own words, never quote the diff; under 600 chars"}`;
+ "change_summary": "what changed, for a teammate who never saw the PR; own words, never quote the diff; under 600 chars",
+ "safe_because": {"fact": "on APPROVE, the one fact the change is safe because of", "evidence": "claimed" | "cited" | "traced" | "tested"} or null}
+
+On APPROVE, name the one fact the change is safe because of, and check it as far as you can: cited (you read the file:line), traced (you walked the failure path and it cannot reach), tested (a test or story in the evidence exercises it). A high-risk approval resting on a claimed fact escalates.`;
 
 // Strip control characters and cap length; the sentinel can't be forged from inside untrusted text.
 export function sanitize(s: string | null | undefined, max: number): string {
@@ -269,6 +280,20 @@ export type Opinion = Reviewed & { backend: Backend };
 /** A second opinion is worth its cost only where it can change the outcome: an approval that isn't plainly low-risk. */
 export const secondOpinionNeeded = (llm: LLMVerdict, flagged: boolean): boolean => llm.verdict === "APPROVE" && (llm.risk !== "low" || flagged);
 
+/**
+ * A high-risk approval must rest on a fact the reviewer checked. It takes the verdict after any second
+ * opinion, never the primary's own: a disagreement has already escalated and must stay escalated. One that names no fact, or only
+ * believes it, is not assurance: it escalates, keeping the reviewer's reasoning for the human.
+ */
+export function assured(outcome: Combined): Combined {
+  const { llm } = outcome;
+
+  if (outcome.verdict !== "APPROVE" || llm.risk !== "high" || (llm.safe_because && llm.safe_because.evidence !== "claimed")) return outcome;
+  const fact = llm.safe_because ? `It rests on "${llm.safe_because.fact}", which the reviewer did not check.` : "The reviewer named no fact it is safe because of.";
+
+  return { verdict: "ESCALATE", llm: { ...llm, reasoning: `High-risk approval without checked assurance. ${fact} ${llm.reasoning}`, next_steps: llm.next_steps || "A human confirms the fact the change is safe because of." } };
+}
+
 export type Combined = { verdict: LLMVerdict["verdict"]; llm: LLMVerdict };
 
 /** Two reviewers from different families: agreement stands, disagreement escalates with both reasonings. */
@@ -402,7 +427,7 @@ async function viaModel(modelId: string, system: string, prompt: string, repoRoo
     verbose,
   });
 
-  if (result.refused) return { verdict: "ESCALATE", reasoning: "Model declined to review.", risk: "high", issues: [], notes: [], next_steps: "Human review.", change_summary: "", run: result.run };
+  if (result.refused) return { verdict: "ESCALATE", reasoning: "Model declined to review.", risk: "high", issues: [], notes: [], next_steps: "Human review.", change_summary: "", safe_because: null, run: result.run };
 
   return { ...(result.output ?? parseVerdict(result.text)), run: result.run };
 }
