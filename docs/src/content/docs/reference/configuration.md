@@ -52,8 +52,40 @@ Deny and scrutiny path patterns are regexes, not globs. Use single-quoted YAML s
 | `rules.<name>.disable` | No rules | Rule id globs to drop |
 | `rules_from` | Absent | Build rule packs from another tool's config |
 | `rules_from.shepherd.on_break` | `escalate` | `on_break` for shepherd lenses that set no `gate` |
+| `branding.name` | `stamp` | The name in each review's header (`## ❌ stamp: REFUSED`), at most 40 characters |
+| `branding.avatar` | Absent | An `https://` image shown at 20×20 at the start of the header |
+| `branding.emoji.<key>` | Today's glyphs | Override any of `APPROVED` (✅), `REFUSED` (❌), `ESCALATE` (🙋), `ERROR` (⚠️), `pass` (✓), `fail` (✗) and `fix` (🤖, the "Fix with a coding agent" summary). Up to 16 characters, no whitespace |
+
 
 Both override ceilings must be present when `overrides` is set, and each must cover the global limit. When you configure familiarity, provide the strong and moderate thresholds together. Familiarity and test evidence remain advisory; they cannot override gates.
+
+## Settings
+
+Every non-secret setting lives in `.stamp/policy.yml`, read from the default branch, so changing one is a reviewed change like any other policy edit. Each one can be overridden by an environment variable for an experiment. A non-blank variable wins over the policy, which wins over the default; a blank variable (how a workflow passes an unset one) counts as unset. `stamp config` prints every value in effect and where it came from, and each review logs the settings that are not at their default.
+
+| Setting | Policy key | Env override | Default |
+| --- | --- | --- | --- |
+| Reviewer model (api backend) | `model` | `STAMP_MODEL` | `claude-opus-5` |
+| Backends: primary, then optional second opinion | `backends` (list) | `STAMP_BACKENDS`, then `STAMP_BACKEND` (comma-separated) | `[api]` |
+| Prices for models autotel cannot price | `pricing` (`{<model>: {inputPer1M, outputPer1M, cachedInputPer1M?}}`) | `STAMP_PRICING` (JSON) | none; without a price the `$` budget cannot fire, and the run logs `budget guard inactive` |
+| AWS region for Bedrock | `provider.region` | `AWS_REGION` | the AWS SDK's own lookup |
+| Base URL for `compatible:` models | `provider.base_url` | `STAMP_BASE_URL` | none (required for `compatible:`) |
+| Anthropic base URL | `provider.anthropic_base_url` | `ANTHROPIC_BASE_URL` | Anthropic direct |
+| Review limits | `guard` (`{budget_usd, tokens, loop, max_tools, timeout}`); a rule left out keeps its default | `STAMP_GUARD` (shorthand, replaces the whole set) | `budget_usd: 2, tokens: 3m, loop: 4/12, max_tools: 80, timeout: 15m` |
+| Output-token ceiling per model call | `max_output_tokens` | `STAMP_MAX_OUTPUT_TOKENS` | 16000, or 10000 on Amazon Nova |
+| Claude CLI model | `cli.claude_model` | `STAMP_CLAUDE_MODEL` | Claude Code's default |
+| Codex CLI model | `cli.codex_model` | `STAMP_CODEX_MODEL` | Codex's default |
+| Review only PRs with this label | `label` | `STAMP_LABEL`, or `--label` (the flag wins) | unset: every PR |
+| Verdicts that send a notification | `notify.on` (list) | `STAMP_NOTIFY_ON` (comma-separated) | `[REFUSED, ESCALATE, ERROR]` |
+| OTLP endpoint for traces | `telemetry.endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | off |
+| Trace service name | `telemetry.service` | `OTEL_SERVICE_NAME` | `stamp` |
+| On a gate denial, still run the model and append its findings as advice (the verdict stays REFUSED) | `advise_on_deny` | `STAMP_ADVISE_ON_DENY` (`true` or `1`) | `false` |
+
+Telemetry starts once stamp reads the policy, so the policy's `telemetry.endpoint` and `telemetry.service` both apply. The `stamp.review` span is backdated to the start of the run.
+
+**Secrets are environment-only** and never belong in the policy: `STAMP_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`, `DEEPSEEK_API_KEY`, `AI_GATEWAY_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`, `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_API_KEY`, `TYPESAFE_API_KEY`, `OTEL_EXPORTER_OTLP_HEADERS`, `STAMP_SLACK_WEBHOOK`, `STAMP_NOTIFY_WEBHOOK` and `GH_TOKEN`. `stamp config` reports each one as set or unset, never its value.
+
+**Runner settings stay in the workflow**, because they describe the job rather than the review: `STAMP_BOT_LOGIN` (the login of the token that posts), `STAMP_CLI_IMAGE`, `STAMP_BUILD_CLI_IMAGE` and `STAMP_VERSION`.
 
 ## Guidance files
 

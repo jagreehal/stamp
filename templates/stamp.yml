@@ -1,15 +1,15 @@
 # stamp: approve-first PR review. Installed by `bunx @jagreehal/stamp init`.
 #
-# One-time repo settings:
-#   - your provider's key as the STAMP_API_KEY secret, and STAMP_MODEL (provider:model, e.g.
-#     deepseek:deepseek-flash) as a variable when it is not claude-opus-5 on Anthropic. Keep settings like
-#     STAMP_MODEL in variables: GitHub masks a secret's value everywhere in the logs.
-#   - Bedrock: STAMP_MODEL bedrock:<model or inference profile id> and AWS_REGION as variables, then either
-#     a Bedrock API key as STAMP_API_KEY, or OIDC: `stamp init --aws-oidc` (or remove every `#aws-oidc `
-#     prefix in this file and stamp-edited.yml) and the AWS_ROLE_ARN variable naming a role that can invoke
-#     Bedrock models. Leave STAMP_API_KEY empty under OIDC: a key wins over the role.
+# Settings live in .stamp/policy.yml (model, backends, provider.region, guard, label, notify, ...), read from
+# the default branch, so changing one is reviewed like any policy change. `stamp config` prints every value
+# in effect and where it came from. This workflow needs only:
+#   - the secret for your provider: STAMP_API_KEY (any provider), or that provider's own variable below.
+#     Bedrock: a Bedrock API key as STAMP_API_KEY, or OIDC: `stamp init --aws-oidc` (or remove every
+#     `#aws-oidc ` prefix in this file and stamp-edited.yml) and the AWS_ROLE_ARN variable naming a role that
+#     can invoke Bedrock models. Leave STAMP_API_KEY empty under OIDC: a key wins over the role.
 #   - Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"
 #     (without it the approval posts but does not satisfy a required-reviews rule)
+# The `vars.*` lines further down are optional overrides of the policy, for experiments; leave them unset.
 name: stamp
 on:
   # `/stamp` in a PR comment re-runs the review: the fix loop otherwise needs an empty commit.
@@ -27,13 +27,17 @@ concurrency:
   # job's `if` skips (an ordinary comment, or a bot rewriting the PR description after every push)
   # gets a group of its own: in the shared group it cancelled the review in flight after that review
   # had retracted the approval, leaving no verdict coming. The condition below is the job's `if`,
-  # verbatim; a test keeps them in step. Two runs that do overlap order themselves by run marker.
+  # verbatim, except that a comment joins the group only from an OWNER, MEMBER or COLLABORATOR: anyone
+  # else's `/stamp` runs in a group of its own, so it cannot cancel a review before stamp has checked
+  # their permission. A test keeps them in step. Two runs that do overlap order themselves by run marker.
   group: stamp-${{ github.event.pull_request.number || github.event.issue.number }}-${{ ((github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null || (github.event.changes.body != null && github.event.sender.login == github.event.pull_request.user.login && contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->')))) || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && startsWith(github.event.comment.body, '/stamp') && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))) && 'review' || github.run_id }}
   cancel-in-progress: true # a newer head supersedes the review in flight
 
 permissions:
   contents: read
   pull-requests: write
+  # Reads the PR's reactions (the issues API serves them) to wait for reviewer bots still at work.
+  issues: read
   # Reads the test-evidence artifact when policy sets `stories:`.
   actions: read
   # Reads reviewer check runs, such as Claude Code Review, to wait while one is running.
@@ -45,16 +49,17 @@ jobs:
     # No draft/bot/label filter here on purpose: stamp itself decides whether to review, and it
     # retracts its stale approval on every skip path. A job-level `if` would skip the retraction too.
     # A comment never changes the head, so skipping one strands no approval. Only people who could
-    # merge anyway may spend a run this way.
+    # merge anyway may spend a run this way: stamp checks the commenter's permission first and exits
+    # without touching anything otherwise. That check is not here because author_association reads
+    # write access through a team, and a private org member, as CONTRIBUTOR.
     if: >-
       (github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null || (github.event.changes.body != null && github.event.sender.login == github.event.pull_request.user.login && contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->'))))
       || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null
-          && startsWith(github.event.comment.body, '/stamp')
-          && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+          && startsWith(github.event.comment.body, '/stamp'))
     runs-on: ubuntu-latest
     timeout-minutes: 20 # a hung model call must not burn a runner for six hours; a killed run is fail-closed (the approval is already retracted)
     env:
-      STAMP_VERSION: 0.1.0 # pinned: the engine decides what gets auto-approved, so bumps are deliberate
+      STAMP_VERSION: 0.6.1 # pinned: the engine decides what gets auto-approved, so bumps are deliberate
     steps:
       - uses: actions/checkout@v4
         with:
@@ -77,41 +82,41 @@ jobs:
           STAMP_BOT_LOGIN: github-actions[bot]
           STAMP_CLI_IMAGE: stamp-reviewer:local
           STAMP_BUILD_CLI_IMAGE: '1' # Stamp prepares the packaged image after approval handling and gates
-          STAMP_BACKEND: ${{ vars.STAMP_BACKEND }}           # empty = api; "claude" for Claude Code
-          STAMP_BACKENDS: ${{ vars.STAMP_BACKENDS }}         # e.g. "claude,codex": a second opinion on non-trivial approvals (needs both auths)
-          # api backend. STAMP_MODEL picks the provider: claude-opus-5 (Anthropic), bedrock:zai.glm-4.7-flash, openai:gpt-5.5,
-          # compatible:<model> with STAMP_BASE_URL (Azure OpenAI, xAI, Together, LiteLLM, Ollama), a shepherd tier name,
-          # opencode-go:kimi-k3, opencode:claude-sonnet-5-5, openrouter:moonshotai/kimi-k3, groq:openai/gpt-oss-120b,
-          # mistral:mistral-small-latest, gateway:anthropic/claude-sonnet-5.5.
-          # Set the secret for that provider; the others stay empty.
+          # Secrets: set the one your provider needs; the others stay empty. The model is `model:` in
+          # .stamp/policy.yml: claude-opus-5 (Anthropic), bedrock:minimax.minimax-m2.5, openai:gpt-5.5,
+          # compatible:<model> with provider.base_url, a shepherd tier name, opencode-go:kimi-k3,
+          # openrouter:moonshotai/kimi-k3, groq:openai/gpt-oss-120b, mistral:mistral-small-latest, gateway:anthropic/claude-sonnet-5.5.
+          STAMP_API_KEY: ${{ secrets.STAMP_API_KEY }}               # one key for whichever provider the model names
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}         # opencode-go:, opencode:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}     # openrouter:
-          STAMP_API_KEY: ${{ secrets.STAMP_API_KEY }}               # one key for whichever provider STAMP_MODEL names
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}                 # groq:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}           # mistral:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}         # deepseek:
           AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}     # gateway: (Vercel AI Gateway)
           AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }} # bedrock: an API key, as STAMP_API_KEY also is; leave both empty for OIDC (step above)
-          AWS_REGION: ${{ vars.AWS_REGION }}                        # bedrock:
-          STAMP_GUARD: ${{ vars.STAMP_GUARD }}                      # empty = budget:$2,tokens:3m,loop:4/12,max-tools:80,timeout:15m
-          STAMP_PRICING: ${{ vars.STAMP_PRICING }}                  # JSON per-1M prices for models autotel does not price
-          STAMP_MAX_OUTPUT_TOKENS: ${{ vars.STAMP_MAX_OUTPUT_TOKENS }} # empty = 16000, or 10000 on Amazon Nova
-          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }} # set to trace every review
-          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
-          STAMP_BASE_URL: ${{ vars.STAMP_BASE_URL }}         # compatible: models: any OpenAI-compatible endpoint (https://host/v1)
-          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }} # empty = Anthropic direct; https://opencode.ai/zen/go for OpenCode Go
-          STAMP_MODEL: ${{ vars.STAMP_MODEL }}               # empty = claude-opus-5; qwen3.8-max on Go
-          # claude backend
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          STAMP_CODEX_MODEL: ${{ vars.STAMP_CODEX_MODEL }}
-          STAMP_CLAUDE_MODEL: ${{ vars.STAMP_CLAUDE_MODEL }} # empty = Claude Code's default
-          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }} # optional: Jev risk signals before the review
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} # backend claude
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}               # backend codex
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}             # openai:, or backend codex
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }} # telemetry auth
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}         # optional: Jev risk signals before the review
           STAMP_NOTIFY_WEBHOOK: ${{ secrets.STAMP_NOTIFY_WEBHOOK }} # optional: Slack Incoming Webhook or any URL that takes JSON
-          STAMP_NOTIFY_ON: ${{ vars.STAMP_NOTIFY_ON }}               # empty = REFUSED,ESCALATE,ERROR; add APPROVED for every verdict
-          # STAMP_LABEL: stamp                               # label mode: review only PRs carrying the label
+          # Optional overrides. Each one, when set, wins over its key in .stamp/policy.yml; leave them unset
+          # and the policy decides. Run `stamp config` to see which won.
+          STAMP_MODEL: ${{ vars.STAMP_MODEL }}                      # model
+          STAMP_BACKEND: ${{ vars.STAMP_BACKEND }}                  # backends (one)
+          STAMP_BACKENDS: ${{ vars.STAMP_BACKENDS }}                # backends
+          STAMP_PRICING: ${{ vars.STAMP_PRICING }}                  # pricing (JSON)
+          AWS_REGION: ${{ vars.AWS_REGION }}                        # provider.region
+          STAMP_BASE_URL: ${{ vars.STAMP_BASE_URL }}                # provider.base_url
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}        # provider.anthropic_base_url
+          STAMP_GUARD: ${{ vars.STAMP_GUARD }}                      # guard (shorthand: budget:$2,tokens:3m,...)
+          STAMP_MAX_OUTPUT_TOKENS: ${{ vars.STAMP_MAX_OUTPUT_TOKENS }} # max_output_tokens
+          STAMP_CLAUDE_MODEL: ${{ vars.STAMP_CLAUDE_MODEL }}        # cli.claude_model
+          STAMP_CODEX_MODEL: ${{ vars.STAMP_CODEX_MODEL }}          # cli.codex_model
+          STAMP_LABEL: ${{ vars.STAMP_LABEL }}                      # label
+          STAMP_NOTIFY_ON: ${{ vars.STAMP_NOTIFY_ON }}              # notify.on
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }} # telemetry.endpoint
       - uses: actions/upload-artifact@v4
         if: always()
         with:

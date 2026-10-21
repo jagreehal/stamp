@@ -13,12 +13,12 @@ Start with the PR's Actions run, review comment and evidence artifact. Separate 
 | `ESCALATE` | Reviewer reasoning and requested assurance | Ask the owning team to review the current head |
 | `ERROR` | First error in the review and Actions logs | Check provider credentials, model ID, budget and backend setup |
 | CLI backend fails before review | Docker, image preparation, selected backend credential | Follow the isolation setup in the backend guide; Stamp has no host fallback |
-| Model/provider error | `STAMP_BACKEND`, `STAMP_MODEL` and the matching key (`STAMP_API_KEY` or the provider's own variable) | Use a provider/model combination from the backend table |
+| Model/provider error | `stamp config`: the `model` and `backends` in effect, where each came from, and whether the matching key (`STAMP_API_KEY` or the provider's own variable) is set | Use a provider/model combination from the backend table |
 | Edited policy has no effect | Policy source in the evidence | Merge the policy change; PR-head configuration does not govern the run |
 | Approval disappears after a push | Head/base changes and retention result | Wait for the current review; retention requires the same diff and passing checks |
 | Bot findings arrived after Stamp finished | Reviewer wait is bounded | Comment `/stamp` to request a fresh review with those findings |
 | No webhook alert | `STAMP_NOTIFY_ON`, the secret, and `notify webhook` lines in the log | Correct the endpoint or verdict list; the verdict still stands. A dry run, a run without `--post`, a retained approval or a verdict superseded while posting sends nothing |
-| Log shows `***` in place of ordinary words | A non-secret setting stored as a secret | Move `STAMP_MODEL`, `STAMP_BACKEND` and similar settings to repository variables; GitHub masks a secret's value everywhere in the log |
+| Log shows `***` in place of ordinary words | A non-secret setting stored as a secret | Move the setting into `.stamp/policy.yml` (or a repository variable); GitHub masks a secret's value everywhere in the log |
 
 ## Reproduce from your terminal
 

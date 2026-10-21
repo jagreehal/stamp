@@ -42,7 +42,7 @@ Inspect the PR review after you receive an alert; the event names the reviewed c
 
 ## Approved-merge digest
 
-`stamp init` writes `stamp-digest.yml`. Add `STAMP_SLACK_WEBHOOK` (a Slack Incoming Webhook URL) as a repository secret; without it the scheduled run logs that the digest is off and exits. The workflow runs on weekdays at 14:00 UTC and includes the last 24 hours of approved merges, or 72 hours on Monday. You can also start it by hand from the Actions tab. Each line links a merged PR that Stamp approved, with the reviewer's change summary.
+`stamp init --digest` writes `stamp-digest.yml`. Add `STAMP_SLACK_WEBHOOK` (a Slack Incoming Webhook URL) as a repository secret; without it the scheduled run logs that the digest is off and exits. The workflow runs on weekdays at 14:00 UTC and includes the last 24 hours of approved merges, or 72 hours on Monday. You can also start it by hand from the Actions tab. Each line links a merged PR that Stamp approved, with the reviewer's change summary.
 
 To run a digest from your terminal, set the webhook in your environment and run:
 

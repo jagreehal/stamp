@@ -1,12 +1,12 @@
 // Policy loading + deterministic gates. No LLM here: everything in this file is
 // reproducible from the file list, the diff stats, and .stamp/policy.yml.
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { FamiliarityPolicySchema, stripDiffPath } from "./familiarity.ts";
-import { TimedOut, callTimeout, type LinkedIssue } from "./github.ts";
+import { TimedOut, TRUSTED_ASSOCIATIONS, callTimeout, type LinkedIssue } from "./github.ts";
 import { StoriesPolicySchema } from "./stories.ts";
 
 const Match = z.object({
@@ -38,6 +38,42 @@ const RulePackSchema = z
 
 type RulePack = z.infer<typeof RulePackSchema>;
 
+// One glyph per verdict and gate result, as posted today. Kept short and free of whitespace: Shepherd and people
+// grep a review's header, and a value is not a place for markup.
+const DEFAULT_GLYPHS = { APPROVED: "✅", REFUSED: "❌", ESCALATE: "🙋", ERROR: "⚠️", pass: "✓", fail: "✗", fix: "🤖" };
+
+const Glyph = z.string().min(1).max(16).regex(/^\S+$/, "a glyph has no whitespace");
+
+const Branding = z
+  .object({
+    name: z.string().trim().min(1).max(40).optional(),
+    avatar: z.url({ protocol: /^https$/, hostname: z.regexes.domain }).max(500).optional(),
+    emoji: z.object({ APPROVED: Glyph, REFUSED: Glyph, ESCALATE: Glyph, ERROR: Glyph, pass: Glyph, fail: Glyph, fix: Glyph }).partial().strict().optional(),
+  })
+  .strict();
+
+const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+// Policy text lands in Markdown and HTML: escape anything either reads as markup, Markdown first so the entities stay whole.
+const escapeText = (s: string) => escapeHtml(s.replace(/[\\`*_[\]()#!|~]/g, "\\$&"));
+
+/**
+ * The glyphs and header a posted review uses, from the policy's `branding`, with today's defaults for anything
+ * unset. Every value is escaped, so a policy cannot inject markup. Stamp finds its own reviews by the hidden
+ * run and reviewed markers only, never this header, so branding cannot affect retraction or retention.
+ */
+export function brand(b: z.infer<typeof Branding> | undefined) {
+  const g = { ...DEFAULT_GLYPHS, ...b?.emoji };
+  const glyphs = { APPROVED: escapeText(g.APPROVED), REFUSED: escapeText(g.REFUSED), ESCALATE: escapeText(g.ESCALATE), ERROR: escapeText(g.ERROR), pass: escapeText(g.pass), fail: escapeText(g.fail), fix: escapeText(g.fix) };
+  const name = b?.name ?? "stamp";
+  const avatar = b?.avatar ? `<img src="${escapeHtml(b.avatar)}" width="20" height="20" alt="${escapeHtml(name)}"> ` : "";
+
+  return { ...glyphs, heading: (verdict: "APPROVED" | "REFUSED" | "ESCALATE" | "ERROR") => `## ${avatar}${glyphs[verdict]} ${escapeText(name)}: ${verdict}` };
+}
+
+/** Prices per million tokens for models autotel's tables leave out: `{"kimi-k3":{"inputPer1M":3,"outputPer1M":15}}`. */
+export const Pricing = z.record(z.string(), z.object({ inputPer1M: z.number(), outputPer1M: z.number(), cachedInputPer1M: z.number().optional() }).strict());
+
 export const PolicySchema = z
   .object({
     version: z.literal(1),
@@ -67,6 +103,32 @@ export const PolicySchema = z
     rules: z.record(z.string().regex(/^[a-z][a-z0-9-]*$/), RulePackSchema).default({}),
     // Rule packs declared once, in another tool's config: shepherd's lenses become rule packs here.
     rules_from: z.object({ shepherd: z.object({ on_break: OnBreak.default("escalate") }).strict() }).strict().optional(),
+    // How posted reviews look: the header name, a small avatar, and any glyph. Absent = today's output, byte for byte.
+    branding: Branding.optional(),
+    // Settings, read from the default branch like the rest, so a change to one is reviewed. A non-blank environment
+    // variable overrides each one (config.ts, `stamp config`). Secrets are never here.
+    model: z.string().min(1).optional(),
+    backends: z.array(z.string().min(1)).min(1).optional(),
+    pricing: Pricing.optional(),
+    provider: z.object({ region: z.string().regex(/^[a-z]{2}(-[a-z]+)+-\d$/, "an AWS region such as eu-west-1").optional(), base_url: z.url({ protocol: /^https?$/ }).optional(), anthropic_base_url: z.url({ protocol: /^https?$/ }).optional() }).strict().optional(),
+    guard: z
+      .object({
+        budget_usd: z.number().positive(),
+        tokens: z.union([z.number().int().positive(), z.string().regex(/^\d+(\.\d+)?[km]?$/, "a count such as 3m or 500k")]),
+        loop: z.string().regex(/^\d+\/\d+$/, "repeats/window, such as 4/12"),
+        max_tools: z.number().int().positive(),
+        timeout: z.string().regex(/^\d+(\.\d+)?(ms|s|m|h)?$/, "a duration such as 15m"),
+      })
+      .partial()
+      .strict()
+      .optional(),
+    max_output_tokens: z.number().int().positive().optional(),
+    cli: z.object({ claude_model: z.string().min(1).optional(), codex_model: z.string().min(1).optional() }).strict().optional(),
+    label: z.string().min(1).optional(),
+    notify: z.object({ on: z.array(z.enum(["APPROVED", "REFUSED", "ESCALATE", "ERROR"])).min(1).optional() }).strict().optional(),
+    telemetry: z.object({ endpoint: z.url({ protocol: /^https?$/ }).optional(), service: z.string().min(1).optional() }).strict().optional(),
+    // When a gate denies, still ask the model, and append its findings to the refusal as advice. It cannot approve.
+    advise_on_deny: z.boolean().optional(),
   })
   .strict()
   .refine((p) => "stamp_policy" in p.deny, { message: "deny.stamp_policy is required: the gate cannot approve edits to itself" })
@@ -80,6 +142,16 @@ export type Policy = z.infer<typeof PolicySchema> & { policyFiles?: string[] };
 /** The package's own .stamp/: the hosted default a repo with no policy files reviews under. */
 export const DEFAULTS_DIR = path.resolve(import.meta.dir, "..");
 
+let localPolicyDir: string | null = null;
+
+/**
+ * `--policy-dir`: read `.stamp/` files from this directory first, to try a policy before it is merged. Only for a
+ * run that posts nothing: the CLI refuses it with `--post`, because a PR must never supply the policy that gates it.
+ */
+export function useLocalPolicy(dir: string | null): void {
+  localPolicyDir = dir;
+}
+
 /**
  * Read a policy file from the trusted ref (the default branch), else the package's bundled
  * default. The working tree is NEVER consulted: it is the PR head, and a PR must not be able to
@@ -87,6 +159,9 @@ export const DEFAULTS_DIR = path.resolve(import.meta.dir, "..");
  * the bundled defaults, however many .stamp/ files the PR adds.
  */
 export function readTrusted(repoRoot: string, rel: string, ref = "origin/HEAD"): string | null {
+  const local = localPolicyDir && rel.startsWith(".stamp/") ? path.join(localPolicyDir, rel.slice(".stamp/".length)) : null;
+
+  if (local && existsSync(local)) return readFileSync(local, "utf8");
   const git = (args: string[]) => execFileSync("git", ["-C", repoRoot, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: callTimeout() });
   let refExists = false;
 
@@ -1021,8 +1096,7 @@ export type PRMeta = {
 
 const BOT_RE = /\[bot\]$|^(dependabot|renovate)/i;
 
-// Only people who could merge anyway. A drive-by contributor's PR is never auto-approved.
-export const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+export { TRUSTED_ASSOCIATIONS };
 
 export type GateRun = Tier & { gates: Gate[]; denied: string[] };
 
@@ -1095,3 +1169,49 @@ export function runGates(policy: Policy, pr: PRMeta): GateRun {
  * `id-token: write` and adds the step that exchanges it for the AWS_ROLE_ARN role's credentials.
  */
 export const enableAwsOidc = (template: string) => template.replace(/^(\s*)#aws-oidc /gm, "$1");
+
+/** The bundled policy with the settings `stamp init` was given written in, so a first run needs only the secret. */
+export function policyWithSettings(text: string, s: { model?: string; region?: string }): string {
+  const lines = [s.model && `model: ${JSON.stringify(s.model)}`, s.region && `provider:\n  region: ${JSON.stringify(s.region)}`].filter(Boolean);
+  const out = lines.length ? text.replace(/^version: 1\n/m, `$&\n# Written by stamp init.\n${lines.join("\n")}\n`) : text;
+
+  PolicySchema.parse(parseYaml(out)); // a bad --model or --region fails here, not on the first review
+
+  return out;
+}
+
+/** This package's version: what `stamp init` pins the workflow to, and what every review records. */
+export const STAMP_VERSION = z.object({ version: z.string() }).parse(JSON.parse(readFileSync(path.join(DEFAULTS_DIR, "package.json"), "utf8"))).version;
+
+const JobEnvironment = z.union([z.string(), z.object({ name: z.string() }).transform((e) => e.name)]);
+
+const InstalledJobs = z.object({ jobs: z.record(z.string(), z.object({ environment: JobEnvironment.optional() }).loose()) }).loose();
+
+/** The environment a workflow's job runs in, read as YAML: `environment: "ai-review"` and `{ name: … }` both count. */
+const environmentOf = (workflow: string) => Object.values(InstalledJobs.parse(parseYaml(workflow)).jobs).find((j) => j.environment)?.environment;
+
+/** The choices an installed workflow was written with, so `stamp init --upgrade` keeps them on today's template. */
+export function workflowChoices(installed: string) {
+  return {
+    awsOidc: /^\s*id-token: write/m.test(installed),
+    environment: environmentOf(installed),
+    region: /vars\.AWS_REGION \|\| '([a-z0-9-]+)'/.exec(installed)?.[1],
+  };
+}
+
+/**
+ * A workflow template as `stamp init` writes it: pinned to this stamp, with OIDC turned on and the review job in a
+ * GitHub environment when asked. An environment's secrets reach only the jobs that name it, so the model key
+ * stays out of every other workflow in the repository.
+ */
+export function installWorkflow(template: string, o: { awsOidc?: boolean; environment?: string; region?: string } = {}): string {
+  if (o.environment !== undefined && !/^[\w.-]+$/.test(o.environment)) throw new Error(`--environment: not a GitHub environment name: ${o.environment}`);
+
+  if (o.region !== undefined && !/^[a-z]{2}(-[a-z]+)+-\d$/.test(o.region)) throw new Error(`--region: not an AWS region: ${o.region}`);
+  // The OIDC step runs before stamp reads its policy, so it gets the region written in, under the variable.
+  const regional = o.region ? template.replace("aws-region: ${{ vars.AWS_REGION }}", `aws-region: \${{ vars.AWS_REGION || '${o.region}' }}`) : template;
+  const pinned = regional.replace(/^(\s*STAMP_VERSION: )\S+/m, `$1${STAMP_VERSION}`);
+  const placed = o.environment ? pinned.replace(/^( {4}runs-on: .*\n)/m, `$1    environment: ${o.environment} # holds the model key: only this job can read it\n`) : pinned;
+
+  return o.awsOidc ? enableAwsOidc(placed) : placed;
+}

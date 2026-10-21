@@ -47,6 +47,30 @@ const paginated = <T>(schema: z.ZodType<T>, endpoint: string, cwd: string): T[] 
 
 const Login = z.object({ login: z.string() });
 
+// Only people who could merge anyway. A drive-by contributor's PR is never auto-approved.
+export const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+
+const MERGERS = new Set(["admin", "maintain", "write"]);
+
+/** A user's effective permission on the repository, team grants included. */
+export const permissionOf = (repo: string, login: string, cwd: string) => call(z.object({ permission: z.string() }), ["api", `repos/${repo}/collaborators/${login}/permission`], cwd).permission;
+
+/**
+ * author_association reads write access through a team, and a private org member, as CONTRIBUTOR. Someone the
+ * permission API says can push counts as COLLABORATOR; a failed lookup keeps the association GitHub gave.
+ */
+export function effectiveAssociation(association: string, permission: () => string): string {
+  if (TRUSTED_ASSOCIATIONS.has(association)) return association;
+
+  try {
+    return MERGERS.has(permission()) ? "COLLABORATOR" : association;
+  } catch (e) {
+    if (TimedOut.safeParse(e).success) throw e;
+
+    return association;
+  }
+}
+
 const CheckRuns = z.object({ check_runs: z.array(z.object({ name: z.string(), status: z.string() })) });
 
 /** The check runs with one name on one commit, by name and status. */
@@ -212,7 +236,7 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
     title: view.title,
     body: view.body ?? "",
     author: view.user.login,
-    authorAssociation: view.author_association,
+    authorAssociation: effectiveAssociation(view.author_association, () => permissionOf(repo.nameWithOwner, view.user.login, cwd)),
     isFork: view.head.repo?.full_name !== view.base.repo.full_name,
     isDraft: view.draft,
     mergeable: view.mergeable_state === "dirty" ? "CONFLICTING" : "MERGEABLE",
@@ -249,15 +273,26 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
       created: c.created_at,
       reactions: reactionList(c.reactions),
     })),
-    reactions: paginated(ReactionRow, `${base}/issues/${number}/reactions`, cwd).map((r) => ({
-      user: r.user.login,
-      content: r.content,
-      created: r.created_at,
-    })),
+    reactions: prReactions(base, number, cwd),
     commits: paginated(CommitRow, `${base}/pulls/${number}/commits`, cwd).map((c) => ({ sha: c.sha, message: c.commit.message })),
     issues: closingIssues(owner, name, number, cwd),
     diff: gh(["pr", "diff", String(number)], cwd),
   };
+}
+
+/**
+ * The PR's reactions, read for reviewer bots still at work. The endpoint sits behind the `issues` permission, and
+ * without it the only loss is not waiting for those bots, so a 403 warns and reads as none rather than failing the run.
+ */
+function prReactions(base: string, number: number, cwd: string): PR["reactions"] {
+  try {
+    return paginated(ReactionRow, `${base}/issues/${number}/reactions`, cwd).map((r) => ({ user: r.user.login, content: r.content, created: r.created_at }));
+  } catch (e) {
+    if (!(e instanceof Error) || !e.message.includes("HTTP 403")) throw e;
+    console.error("PR reactions unreadable (HTTP 403: grant the workflow `issues: read`); not waiting for reviewer bots");
+
+    return [];
+  }
 }
 
 export type Verdict = "APPROVED" | "REFUSED" | "ESCALATE" | "ERROR";

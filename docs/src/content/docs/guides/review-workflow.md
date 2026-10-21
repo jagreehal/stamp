@@ -38,7 +38,7 @@ The `telemetry` gate holds a PR that writes a credential or a whole request into
 
 - The PR is out of draft and has no merge conflicts.
 - No "changes requested" review stands. A later comment does not clear one.
-- The author is OWNER, MEMBER or COLLABORATOR, and the head lives on this repository, not a fork.
+- The author is OWNER, MEMBER or COLLABORATOR, or has write access some other way (a team grant, or a private org membership that GitHub reports as CONTRIBUTOR), and the head lives on this repository, not a fork.
 - The author is not a bot.
 
 ## The review

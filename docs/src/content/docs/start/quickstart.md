@@ -30,24 +30,24 @@ Stamp prints each gate and a gate verdict. This command makes no model call and 
 ## 2. Install repository configuration
 
 ```bash
-bunx @jagreehal/stamp init
+bunx @jagreehal/stamp init --model deepseek:deepseek-flash
 ```
 
-Expect `.stamp/policy.yml`, `.stamp/review-guidance.md` and three workflows under `.github/workflows/`. Stamp keeps files that already exist. Review the generated policy before you merge it.
+Leave out `--model` for `claude-opus-5` on Anthropic. For Bedrock, add the region too: `--model bedrock:minimax.minimax-m2.5 --region eu-west-1`. Expect `.stamp/policy.yml` with those settings written in, `.stamp/review-guidance.md`, and two workflows under `.github/workflows/` (three with `--digest`). Stamp keeps files that already exist. Review the generated policy before you merge it. It sends every change except stamp's own policy to the reviewer, flagging auth, secrets, migrations, infrastructure, billing and dependency changes for extra scrutiny. Add `--strict` to send those areas to a human instead. Every setting lives in that file (the [settings table](/stamp/reference/configuration/#settings) lists them), so changing one later is a reviewed PR, not a hidden repository variable.
 
-## 3. Configure a model
+## 3. Add the one secret
 
-Add your provider's key as the `STAMP_API_KEY` repository Actions secret. Stamp sends it to whichever provider `STAMP_MODEL` names. Without `STAMP_MODEL` the model is `claude-opus-5` on Anthropic. To use another model, set `STAMP_MODEL` as a repository Actions **variable**, for example `deepseek:deepseek-flash`. Use the [provider table](/stamp/reference/backends/) to choose another provider or an isolated CLI backend. The CLI backends require Docker; the API backend does not.
-
-Keep `STAMP_MODEL`, `STAMP_BACKEND` and the other non-secret settings in variables, not secrets. GitHub masks a secret's value everywhere in the logs, so `STAMP_BACKEND=api` stored as a secret would replace every "api" in the run log with `***`.
+Add the secret `stamp init` names for your model (`AWS_BEARER_TOKEN_BEDROCK` for Bedrock, `ANTHROPIC_API_KEY` for Anthropic, and so on; `STAMP_API_KEY` works for any provider) as an Actions secret. It's the only thing the first run needs; stamp sends it to whichever provider `model` names. Use the [provider table](/stamp/reference/backends/) to choose another provider or an isolated CLI backend. The CLI backends require Docker; the API backend does not. With `stamp init --environment ai-review`, store it as an environment secret of `ai-review` instead, so no other workflow can read it.
 
 In repository **Settings → Actions → General**, enable **Allow GitHub Actions to create and approve pull requests** if you intend its reviews to satisfy a required approval rule.
 
-Keep secrets in Actions secrets or your terminal environment. Do not commit them to policy files.
+Keep secrets in Actions secrets or your terminal environment, never in policy files.
+
+To check what a run will use, run `bunx @jagreehal/stamp config`. It prints every setting, its value and whether it came from the policy, an environment variable or the default, and reports each secret as set or unset.
 
 ## 4. Choose the trigger and merge setup
 
-The generated workflow reviews PRs without a trigger label by default. To opt individual PRs in, set `STAMP_LABEL: stamp` in the review step's environment. Keep the workflow's withdrawal events and concurrency logic intact.
+The generated workflow reviews every PR by default. To review only PRs that carry a label, set `label: stamp` in `.stamp/policy.yml`. Keep the workflow's withdrawal events and concurrency logic intact.
 
 Commit and merge the setup. Stamp reads policy from the default branch; changes on the setup PR do not replace the trusted policy for that PR.
 

@@ -6,9 +6,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { enableAwsOidc } from "./policy.ts";
+import { brand, enableAwsOidc, installWorkflow, useLocalPolicy, workflowChoices } from "./policy.ts";
 import { band, computeFamiliarity, ensureFullHistory, formatFamiliarity, parseDiff, type AuthorFamiliarity, type FamiliarityPolicy } from "./familiarity.ts";
-import { callTimeout, isOurs, sameRepoIssues, scrub, scrubJson, sweepTargets, withBudget, type PR, type ReviewRecord } from "./github.ts";
+import { callTimeout, effectiveAssociation, isOurs, sameRepoIssues, scrub, scrubJson, sweepTargets, withBudget, type PR, type ReviewRecord } from "./github.ts";
 import {
   PolicySchema,
   addedSecrets,
@@ -44,10 +44,28 @@ import {
   type PRMeta,
 } from "./policy.ts";
 import { approvedDiffUnchanged, standingApproval, tryRetainApproval } from "./retention.ts";
-import { assured, buildPrompt, combine, diffCut, independentReviewers, oneLine, sanitize, secondOpinionNeeded, splitReviewChanges, type LLMVerdict } from "./reviewer.ts";
+import { advisable, assured, buildPrompt, combine, diffCut, independentReviewers, oneLine, parseVerdict, sanitize, secondOpinionNeeded, splitReviewChanges, withAdvice, type LLMVerdict } from "./reviewer.ts";
 import { SIGNAL_IDS, SIGNAL_THRESHOLD, flagged, formatSignals, requestBody, type Signals } from "./signals.ts";
 
-const policy = loadPolicy(path.resolve(import.meta.dir, ".."), "no-such-ref"); // no such ref → bundled defaults
+const bundled = loadPolicy(path.resolve(import.meta.dir, ".."), "no-such-ref"); // no such ref → bundled defaults
+
+// The gate logic is exercised against `stamp init --strict`'s policy, which denies every sensitive category.
+const policy = PolicySchema.parse(parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/policy-strict.yml"), "utf8")));
+
+test("the bundled policy denies only stamp's own policy and flags the sensitive areas for the reviewer", () => {
+  expect(Object.keys(bundled.deny)).toEqual(["stamp_policy"]);
+  expect(denyCategories(bundled, ["src/auth/session.ts", ".github/workflows/ci.yml", "pnpm-lock.yaml"])).toEqual([]);
+  expect(denyCategories(bundled, [".stamp/policy.yml"])).toEqual(["stamp_policy"]);
+
+  // stamp's workflows set variables that override the policy, so they are gate inputs too.
+  for (const wf of ["stamp.yml", "stamp-edited.yml", "stamp-digest.yml"]) expect(denyCategories(bundled, [`.github/workflows/${wf}`])).toEqual(["stamp_policy"]);
+  expect(denyCategories(bundled, [".github/workflows/ci.yml"])).toEqual([]);
+  expect(scrutinyFlags(bundled, ["src/auth/session.ts", "pnpm-lock.yaml"]).map((s) => s.name)).toEqual(["auth", "deps_toolchain"]);
+
+  // Strict keeps the same scrutiny and deny patterns, as deny categories instead.
+  for (const [name, rule] of Object.entries(policy.deny)) if (name !== "stamp_policy") expect([...(bundled.scrutiny[name]?.paths ?? [])].sort()).toEqual([...(rule.match.any ?? []), ...(rule.match.paths ?? [])].sort());
+  expect(Object.keys(policy.scrutiny).filter((k) => !(k in policy.deny))).toEqual(Object.keys(bundled.scrutiny).filter((k) => !(k in policy.deny)));
+});
 
 const f = (filename: string, lines = 10): PRFile => ({ filename, additions: lines, deletions: 0 });
 
@@ -107,6 +125,11 @@ describe("prerequisites", () => {
     expect(g({ isFork: true }).message).toContain("fork");
     expect(g({ authorAssociation: "FIRST_TIME_CONTRIBUTOR" }).message).toContain("not a collaborator");
     expect(g({ authorAssociation: "COLLABORATOR" }).passed).toBe(true);
+    // author_association reads team grants and private org members as CONTRIBUTOR: write access through any route counts
+    expect(effectiveAssociation("CONTRIBUTOR", () => "maintain")).toBe("COLLABORATOR");
+    expect(effectiveAssociation("CONTRIBUTOR", () => "read")).toBe("CONTRIBUTOR");
+    expect(effectiveAssociation("CONTRIBUTOR", () => { throw new Error("HTTP 404"); })).toBe("CONTRIBUTOR");
+    expect(effectiveAssociation("MEMBER", () => { throw new Error("never asked"); })).toBe("MEMBER");
     // a CHANGES_REQUESTED stays blocking until that user APPROVES or it is DISMISSED; a comment doesn't clear it
     expect(g({ reviews: [{ user: "x", state: "CHANGES_REQUESTED" }] }).message).toContain("changes requested by x");
     expect(g({ reviews: [{ user: "x", state: "CHANGES_REQUESTED" }, { user: "x", state: "COMMENTED" }] }).passed).toBe(false);
@@ -151,14 +174,13 @@ test("policy is read from the trusted ref or the bundled default, never the work
   git("commit", "-qm", "base with no .stamp/");
   // A PR head plants a policy that hollows out the deny list.
   mkdirSync(path.join(repo, ".stamp"));
-  writeFileSync(path.join(repo, ".stamp/policy.yml"), readFileSync(path.join(import.meta.dir, "../.stamp/policy.yml"), "utf8").replace(/deny:[\s\S]*?\nallow:/, "deny:\n  stamp_policy:\n    match: { paths: ['nothing-matches-this'] }\nallow:"));
+  writeFileSync(path.join(repo, ".stamp/policy.yml"), readFileSync(path.join(import.meta.dir, "../.stamp/policy.yml"), "utf8").replace(/^deny:[\s\S]*?\nallow:/m, "deny:\n  stamp_policy:\n    match: { paths: ['nothing-matches-this'] }\nallow:"));
   const planted = loadPolicy(repo, "main");
-  expect(Object.keys(planted.deny)).toEqual(Object.keys(policy.deny)); // bundled defaults, not the planted file
-  expect(denyCategories(planted, ["src/auth/x.ts"])).toEqual(["auth"]);
+  expect(denyCategories(planted, [".stamp/policy.yml"])).toEqual(["stamp_policy"]); // bundled defaults, not the planted file
   // Once the default branch carries a policy, that one wins.
   git("add", "-A");
   git("commit", "-qm", "policy lands on main");
-  expect(Object.keys(loadPolicy(repo, "main").deny)).toEqual(["stamp_policy"]);
+  expect(denyCategories(loadPolicy(repo, "main"), [".stamp/policy.yml"])).toEqual([]);
 });
 
 test("quality-gate config edits are flagged for the reviewer, never denied", () => {
@@ -233,6 +255,36 @@ test("a high-risk approval escalates unless the fact it rests on was checked", (
   const dissent = combine("claude", approve("high", cited), { backend: "codex", ...approve("high", null), verdict: "REFUSE", reasoning: "Breaks retries." });
   expect(dissent.llm.verdict).toBe("APPROVE");
   expect(assured(dissent).verdict).toBe("ESCALATE");
+});
+
+test("advise_on_deny: the model's findings ride along on a denial, and even its approval leaves the verdict REFUSED", () => {
+  const advice: LLMVerdict = { verdict: "APPROVE", reasoning: "Looks fine to me.", risk: "low", issues: ["login no longer returns after the 401"], notes: ["no test covers it"], next_steps: "", change_summary: "", safe_because: null };
+  const out = withAdvice("Gates denied: touches auth. A human reviewer has to take it from here.", advice);
+
+  expect(out.verdict).toBe("REFUSED");
+  expect(out.body).toStartWith("Gates denied: touches auth.");
+  expect(out.body).toContain("**Advisory review (cannot approve)**: the model read the change anyway and said APPROVE.");
+  expect(out.body).toContain("- login no longer returns after the 401\n- no test covers it (not blocking)");
+  expect(withAdvice("Gates denied: x.", { ...advice, verdict: "REFUSE" }).verdict).toBe("REFUSED");
+  // No advice when the model would read other people's commits, a credential, or an outsider's checkout.
+  expect(advisable([{ gate: "size" }, { gate: "deny-list" }])).toBe(true);
+
+  for (const gate of ["base", "secrets", "prerequisites"]) expect(advisable([{ gate: "size" }, { gate }])).toBe(false);
+});
+
+test("a verdict is found in a model's narration, a code fence or stray braces; a reply without one says so", () => {
+  const verdict = { verdict: "REFUSE", reasoning: "Drops the return.", risk: "high", issues: ["x"], notes: [], next_steps: "Fix it.", change_summary: "c", safe_because: null };
+  // GLM 4.7 Flash, recorded: it ends a turn narrating, braces and all, and only then gives the JSON.
+  const glm = `Now I understand the code flow. Let me verify the claim {in tier()} by tracing the logic:\n\n\`\`\`json\n${JSON.stringify(verdict)}\n\`\`\`\nDone {ok}.`;
+
+  expect(parseVerdict(glm).verdict).toBe("REFUSE");
+  expect(parseVerdict(`{"note": "a brace } inside a string"} ${JSON.stringify(verdict)}`).reasoning).toBe("Drops the return.");
+  expect(() => parseVerdict("Now I understand the code flow. Let me verify the claim by tracing the logic:")).toThrow("reviewer ended without a verdict: Now I understand");
+  expect(() => parseVerdict("")).toThrow("(no text)");
+  expect(() => parseVerdict(`For example: ${JSON.stringify({ ...verdict, verdict: "APPROVE" })} My verdict: ${JSON.stringify(verdict)}`)).toThrow("conflicting verdicts");
+  expect(() => parseVerdict(`${JSON.stringify({ ...verdict, verdict: "APPROVE", risk: "low" })} ${JSON.stringify({ ...verdict, verdict: "APPROVE" })}`)).toThrow("conflicting verdicts"); // same enum, different verdict
+  expect(parseVerdict(`${JSON.stringify(verdict)} again: ${JSON.stringify(verdict)}`).verdict).toBe("REFUSE"); // an identical repeat is one verdict
+  expect(() => parseVerdict(JSON.stringify({ ...verdict, verdict: "MAYBE" }))).toThrow("off-schema verdict"); // the schema is never relaxed
 });
 
 test("risk signals: request shape, flags above threshold strongest first, prompt block", () => {
@@ -1041,14 +1093,53 @@ stamp:
   });
 });
 
+test("--policy-dir reads .stamp/ files from that directory first, so a policy can be tried before it is merged", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "stamp-policy-dir-"));
+  writeFileSync(path.join(dir, "steering.md"), "local steering");
+
+  try {
+    useLocalPolicy(dir);
+    expect(readTrusted(dir, ".stamp/steering.md")).toBe("local steering");
+    expect(readTrusted(dir, ".stamp/review-guidance.md")).toContain("Showstoppers"); // absent locally: the bundled default
+  } finally {
+    useLocalPolicy(null);
+  }
+
+  expect(readTrusted(dir, ".stamp/steering.md")).toBeNull();
+});
+
+test("branding: no block posts today's header and glyphs; a custom one is applied, escaped and validated", () => {
+  const plain = brand(undefined);
+
+  expect([plain.heading("APPROVED"), plain.heading("REFUSED"), plain.heading("ESCALATE"), plain.heading("ERROR")]).toEqual(["## ✅ stamp: APPROVED", "## ❌ stamp: REFUSED", "## 🙋 stamp: ESCALATE", "## ⚠️ stamp: ERROR"]);
+  expect([plain.pass, plain.fail, plain.fix]).toEqual(["✓", "✗", "🤖"]);
+
+  const custom = brand({ name: "Acme <b>*Review*</b>", avatar: 'https://example.com/a.png?x="><script>', emoji: { REFUSED: "🛑", pass: "🟢" } });
+
+  expect(custom.heading("REFUSED")).toBe('## <img src="https://example.com/a.png?x=&#34;&#62;&#60;script&#62;" width="20" height="20" alt="Acme &#60;b&#62;*Review*&#60;/b&#62;"> 🛑 Acme &#60;b&#62;\\*Review\\*&#60;/b&#62;: REFUSED');
+  expect([custom.pass, custom.fail]).toEqual(["🟢", "✗"]);
+
+  const branding = (b: Record<string, string | Record<string, string>>) => PolicySchema.safeParse({ ...parseYaml(readFileSync(path.resolve(import.meta.dir, "../.stamp/policy.yml"), "utf8")), branding: b }).success;
+
+  expect(branding({ name: "Acme", avatar: "https://example.com/a.png", emoji: { ESCALATE: "⚠️" } })).toBe(true);
+  expect(branding({ avatar: "http://example.com/a.png" })).toBe(false);
+  expect(branding({ avatar: "javascript:alert(1)" })).toBe(false);
+  expect(branding({ emoji: { APPROVED: "ok then" } })).toBe(false);
+  expect(branding({ emoji: { APPROVED: "x".repeat(17) } })).toBe(false);
+  expect(branding({ emoji: { WAT: "x" } })).toBe(false);
+});
+
 describe("workflow template", () => {
   test("only runs that review share the concurrency group, so a skipped run never cancels a review", () => {
     const wf = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp.yml"), "utf8"));
     const squash = (t: string) => t.replace(/\s+/g, " ").trim();
     const reviews = squash(z.string().parse(wf.jobs.review.if));
     const group = squash(z.string().parse(wf.concurrency.group));
+    // A comment joins the review's group only from a known collaborator: anyone else's /stamp waits on stamp's permission check, in its own group.
+    const trusted = reviews.replace("startsWith(github.event.comment.body, '/stamp')", `startsWith(github.event.comment.body, '/stamp') && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)`);
 
-    expect(group).toContain(`\${{ (${reviews}) && 'review' || github.run_id }}`);
+    expect(trusted).not.toBe(reviews);
+    expect(group).toContain(`\${{ (${trusted}) && 'review' || github.run_id }}`);
     expect(wf.concurrency["cancel-in-progress"]).toBe(true);
   });
 
@@ -1133,6 +1224,33 @@ describe("Bedrock through OIDC", () => {
     expect(steps[aws]?.with).toEqual({ "role-to-assume": "${{ vars.AWS_ROLE_ARN }}", "aws-region": "${{ vars.AWS_REGION }}" });
     expect(aws).toBeLessThan(steps.findIndex((s) => JSON.stringify(s).includes("bunx")));
     expect(enableAwsOidc(read("stamp.yml"))).not.toMatch(/^\s*#aws-oidc /m);
+  });
+
+  test("init pins the workflow to this stamp and puts the review job in the environment it was given", () => {
+    const { version } = JSON.parse(read("../package.json"));
+    const wf = parseYaml(installWorkflow(read("stamp.yml"), { environment: "ai-review" }));
+
+    expect(wf.jobs.review.env.STAMP_VERSION).toBe(version);
+    expect(wf.jobs.review.environment).toBe("ai-review");
+    expect(parseYaml(installWorkflow(read("stamp.yml"))).jobs.review.environment).toBeUndefined();
+    expect(() => installWorkflow(read("stamp.yml"), { environment: "x\n  evil: 1" })).toThrow("not a GitHub environment name");
+    // The bundled template names this version too (tools/sync-template-version.ts keeps it there on release).
+    expect(parseYaml(read("stamp.yml")).jobs.review.env.STAMP_VERSION).toBe(version);
+    expect(parseYaml(read("stamp-digest.yml")).jobs.digest.env.STAMP_VERSION).toBe(version);
+    expect(parseYaml(installWorkflow(read("stamp-digest.yml"))).jobs.digest.env.STAMP_VERSION).toBe(version);
+  });
+
+  test("init --upgrade reads back the environment, OIDC and region a workflow was written with", () => {
+    const choices = { awsOidc: true, environment: "ai-review", region: "eu-west-1" };
+
+    expect(workflowChoices(installWorkflow(read("stamp.yml"), choices))).toEqual(choices);
+    // The digest can hold its webhook in an environment too; --upgrade keeps it.
+    expect(workflowChoices(installWorkflow(read("stamp-digest.yml"), { environment: "ai-review" })).environment).toBe("ai-review");
+    expect(workflowChoices(installWorkflow(read("stamp-edited.yml"), { awsOidc: true }))).toEqual({ awsOidc: true, environment: undefined, region: undefined });
+    expect(workflowChoices(read("stamp.yml"))).toEqual({ awsOidc: false, environment: undefined, region: undefined });
+    // Hand-edited but valid YAML keeps its environment; dropping it would lose the environment's secrets.
+    expect(workflowChoices(read("stamp.yml").replace(/^( {4}runs-on: .*\n)/m, '$1    environment: "ai-review"\n')).environment).toBe("ai-review");
+    expect(workflowChoices(read("stamp.yml").replace(/^( {4}runs-on: .*\n)/m, "$1    environment:\n      name: ai-review\n")).environment).toBe("ai-review");
   });
 });
 
