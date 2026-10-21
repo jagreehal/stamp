@@ -14,7 +14,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { notify, notifyOn, slackEscape } from "./notify.ts";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
-import { callTimeout, checkRuns, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
+import { callTimeout, checkRuns, withoutComments, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
 import {
   DEFAULTS_DIR,
   detectOwnership,
@@ -152,7 +152,7 @@ let retention: RetentionResult = { kept: false, reason: "not_posting" };
 
 // Retention is the deliberate exception to dismiss-first. It keeps a standing approval, and skips the
 // review, only when everything a fresh run would check still holds: the trigger label, not a draft, a
-// PR diff with the approved one's patch id, every gate against today's trusted policy, and finally a PR that has not
+// byte-identical PR diff, every gate against today's trusted policy, and finally a PR that has not
 // moved since. Anything ambiguous or failing falls through to dismiss (fail closed). A `/stamp`
 // comment is an explicit request for a fresh review, so it goes straight to dismissal without a
 // fetch. The checks share one budget, well inside the job's timeout, so a hung call ends in the
@@ -650,6 +650,9 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed |
   if (verdict === "APPROVED" && llm?.safe_because) parts.push("", `**Safe because:** ${llm.safe_because.fact} (${llm.safe_because.evidence})`);
 
   if (verdict !== "APPROVED" && llm?.issues.length) parts.push("", ...agentPrompt(pr, verdict, reasoning, llm));
+
+  // Everything above is model-written. With no HTML comment in it, nothing there can pass for the markers below.
+  for (let i = 0; i < parts.length; i++) parts[i] = withoutComments(parts[i]!);
   parts.push(
     "",
     "<details><summary>mechanics</summary>",

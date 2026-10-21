@@ -298,7 +298,14 @@ export type Combined = { verdict: LLMVerdict["verdict"]; llm: LLMVerdict };
 
 /** Two reviewers from different families: agreement stands, disagreement escalates with both reasonings. */
 export function combine(primary: Backend, llm: LLMVerdict, opinion: Opinion): Combined {
-  if (opinion.verdict === "APPROVE") return { verdict: "APPROVE", llm };
+  if (opinion.verdict === "APPROVE") {
+    // Each approval must hold on its own: a second reviewer who calls it high risk needs a checked fact too.
+    const second = assured({ verdict: "APPROVE", llm: opinion });
+
+    if (second.verdict === "APPROVE") return { verdict: "APPROVE", llm };
+
+    return { verdict: "ESCALATE", llm: { ...llm, reasoning: `${opinion.backend}: ${second.llm.reasoning}`, risk: "high", next_steps: second.llm.next_steps } };
+  }
 
   return {
     verdict: "ESCALATE",

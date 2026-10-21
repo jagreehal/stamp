@@ -1,31 +1,24 @@
 // Approval retention: keep a standing stamp approval when a push left the PR's
-// own change the same (typical case: merging the base branch).
+// own diff byte-identical (typical case: merging a base that touched none of the PR's files).
 //
 // The deliberate exception to dismiss-first. Fail closed on anything ambiguous:
 // empty diffs, binary markers, GitHub errors, missing reviewed marker, a failed
 // gate, or a PR that moved while it was being checked.
-import { execFileSync } from "node:child_process";
-import { callTimeout, compareDiff, isOurs, listReviews, reviewedShas, unchanged, type PR, type ReviewRecord } from "./github.ts";
+import { compareDiff, isOurs, listReviews, reviewedShas, unchanged, type PR, type ReviewRecord } from "./github.ts";
 
 const BINARY_MARKER_RE = /^Binary files\b.*differ$/m;
 
-/** git's id for a diff's changes, ignoring line numbers and blob ids, keeping whitespace. Empty when git finds no change. */
-export const patchId = (diff: string): string => execFileSync("git", ["patch-id", "--verbatim"], { input: diff, encoding: "utf8", timeout: callTimeout() }).split(" ")[0]!.trim();
-
 /**
- * Whether the PR's own change is the one that was approved: the same `git patch-id`. A base merge
- * that moves the PR's hunks, or edits a file the PR touches outside them, shifts the diff's line
- * numbers and blob ids without changing what the PR does, so it keeps the approval.
+ * Whether the PR's own diff is byte-identical to the one that was approved. A base merge that leaves
+ * every file the PR touches alone keeps it so; one that edits such a file changes its blob ids, and the
+ * PR goes back for review, since the base edit can change what the PR's code does.
  */
 export function approvedDiffUnchanged(approvedDiff: string, currentDiff: string): boolean {
   if (!approvedDiff.trim() || !currentDiff.trim()) return false;
 
   if (BINARY_MARKER_RE.test(approvedDiff) || BINARY_MARKER_RE.test(currentDiff)) return false;
 
-  if (approvedDiff === currentDiff) return true;
-  const approved = patchId(approvedDiff);
-
-  return approved !== "" && approved === patchId(currentDiff);
+  return approvedDiff === currentDiff;
 }
 
 export type StandingApproval = { reviewId: number; approvedHead: string; approvedBase: string };
@@ -60,7 +53,7 @@ export type RetentionResult =
 const github = { findStandingApproval, compareDiff, retentionHolds };
 
 /**
- * Keep a standing approval only when its PR diff has the live one's patch id, every gate passes
+ * Keep a standing approval only when its PR diff is byte-identical to the live one, every gate passes
  * against today's trusted policy, and, checked last, the PR still matches what was checked.
  * Otherwise fail closed to the normal dismiss path.
  */
@@ -80,7 +73,7 @@ export function tryRetainApproval(pr: PR, botLogin: string, cwd: string, gatesPa
 
   if (!approvedDiffUnchanged(approvedDiff, currentDiff)) return { kept: false, reason: "diff_changed" };
 
-  // An unchanged patch says nothing about policy tightened since, a new CHANGES_REQUESTED, or a conflict.
+  // A byte-identical diff says nothing about policy tightened since, a new CHANGES_REQUESTED, or a conflict.
   if (!gatesPass()) return { kept: false, reason: "gates_failed" };
 
   // Last, because every check above read state that a push, retarget or manual dismissal can change.
