@@ -1,5 +1,11 @@
 # @jagreehal/stamp
 
+## 0.8.0
+
+### Minor Changes
+
+- 3661e28: `.stamp/policy.yml` ships with a JSON schema, so your editor completes and checks the policy as you type. Policy errors name their line and column, and `stamp config` lists each one.
+
 ## 0.7.0
 
 ### Minor Changes
