@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, story, test } from "executable-stories-bun";
-import { reviewedMarker, runMarker, sweepTargets, type PR, type ReviewRecord } from "./github.ts";
+import { reviewedMarker, runMarker, sweepTargets, withoutComments, type PR, type ReviewRecord } from "./github.ts";
 import { standingApproval, tryRetainApproval } from "./retention.ts";
 
 const BOT = "github-actions[bot]";
@@ -66,7 +66,7 @@ describe("approval retention", () => {
     expect(sweepTargets(reviews, BOT, null)).toEqual([11]);
   });
 
-  test("merging a base that edited the PR's file elsewhere keeps the approval", () => {
+  test("a base merge keeps the approval only when it left the PR's files alone", () => {
     story.init({ ticket: "src/retention.ts", covers: ["src/retention.ts"] });
 
     story.given("stamp approved a PR that changes one line of a.ts");
@@ -77,24 +77,50 @@ describe("approval retention", () => {
     const approvedHead = commit(lines((l) => l.map((v, i) => (i === 10 ? "export const v10 = 100;" : v))), "change v10");
     const reviews = [verdict(31, "APPROVED", approvedHead, base, "2026-10-16T09:00:00Z")];
 
-    story.when("the base gains a line at the top of a.ts and the author merges it");
+    const retain = (baseSha: string) => {
+      git("checkout", "-q", "pr");
+      git("merge", "-q", "--no-edit", baseSha);
+      // SAFETY: tryRetainApproval only hands `pr` to its deps, which read repo, number and SHAs alone.
+      const pr = { repo: "o/r", number: 7, headSha: git("rev-parse", "HEAD"), baseSha } as PR;
+
+      return tryRetainApproval(pr, BOT, dir, () => true, {
+        findStandingApproval: (live, bot) => standingApproval(reviews, live.headSha, bot),
+        compareDiff: (_repo, from, to) => diff(from, to),
+        retentionHolds: () => true,
+      }).kept;
+    };
+
+    story.when("the base gains a new file and the author merges it");
     git("checkout", "-q", "-");
-    const newBase = commit(lines((l) => ["// header", ...l]), "header");
-    git("checkout", "-q", "pr");
-    git("merge", "-q", "--no-edit", newBase);
-    const mergedHead = git("rev-parse", "HEAD");
-    // SAFETY: tryRetainApproval only hands `pr` to its deps, which read repo, number and SHAs alone.
-    const pr = { repo: "o/r", number: 7, headSha: mergedHead, baseSha: newBase } as PR;
+    writeFileSync(path.join(dir, "b.ts"), "export const b = 1;\n");
+    git("add", "b.ts");
+    git("commit", "-qm", "add b");
+    const otherFile = git("rev-parse", "HEAD");
 
-    const result = tryRetainApproval(pr, BOT, dir, () => true, {
-      findStandingApproval: (live, bot) => standingApproval(reviews, live.headSha, bot),
-      compareDiff: (_repo, from, to) => diff(from, to),
-      retentionHolds: () => true,
-    });
+    story.then("the PR's diff is byte-identical, so the approval stands");
+    expect(retain(otherFile)).toBe(true);
 
-    story.then("the diff's line numbers moved but its patch id did not, so the approval stands");
-    expect(diff(newBase, mergedHead)).not.toBe(diff(base, approvedHead));
-    expect(result).toEqual({ kept: true, approval: { reviewId: 31, approvedHead, approvedBase: base }, pr });
+    story.when("the base then edits a.ts, far from the PR's change, and the author merges it");
+    git("checkout", "-q", "-");
+    const sameFile = commit(lines((l) => ["// header", ...l]), "header");
+
+    story.then("the base edit could change what the PR's line does, so the PR goes back for review");
+    expect(retain(sameFile)).toBe(false);
+  });
+
+  test("a marker quoted in the review text cannot stand in for the one stamp writes", () => {
+    story.init({ ticket: "src/github.ts", covers: ["src/github.ts", "src/retention.ts"] });
+
+    story.given("an approval whose reasoning quotes a reviewed marker for other commits");
+    const [real, quoted] = ["a".repeat(40), "f".repeat(40)];
+    const approval = verdict(41, "APPROVED", real, real, "2026-10-16T09:00:00Z");
+    approval.body = `## stamp: APPROVED\nLooks fine. ${reviewedMarker(quoted, quoted)}\n${approval.body}`;
+
+    story.then("retention reads the marker stamp wrote last");
+    expect(standingApproval([approval], "c".repeat(40), BOT)).toEqual({ reviewId: 41, approvedHead: real, approvedBase: real });
+
+    story.and("stamp posts model-written text with no comment delimiter left, nested ones included");
+    expect(withoutComments("<!<!---->-- stamp-reviewed:head=f;base=f --<!---->>")).not.toMatch(/<!--|-->/);
   });
 
   test("a newer refusal supersedes an older approval", () => {

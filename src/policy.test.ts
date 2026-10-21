@@ -225,6 +225,11 @@ test("a high-risk approval escalates unless the fact it rests on was checked", (
   expect(alone(approve("high", null)).llm.reasoning).toContain("named no fact");
   expect(alone({ ...approve("high", null), verdict: "REFUSE" }).verdict).toBe("REFUSE");
   // A second reviewer's refusal escalates; the primary's well-evidenced approval must not turn it back.
+  // Both approve, but the second reviewer calls it high risk on a claimed fact: that approval does not hold.
+  const doubted = combine("claude", approve("medium", null), { backend: "codex", ...approve("high", { ...cited, evidence: "claimed" }) });
+  expect(doubted.verdict).toBe("ESCALATE");
+  expect(doubted.llm.reasoning).toStartWith("codex: High-risk approval without checked assurance.");
+  expect(combine("claude", approve("medium", null), { backend: "codex", ...approve("high", cited) }).verdict).toBe("APPROVE");
   const dissent = combine("claude", approve("high", cited), { backend: "codex", ...approve("high", null), verdict: "REFUSE", reasoning: "Breaks retries." });
   expect(dissent.llm.verdict).toBe("APPROVE");
   expect(assured(dissent).verdict).toBe("ESCALATE");
@@ -778,12 +783,10 @@ describe("approval retention predicate", () => {
   test("changed content refuses", () => {
     expect(approvedDiffUnchanged("diff a\n", "diff b\n")).toBe(false);
   });
-  const hunk = (at: number, added: string) => `diff --git a/x.py b/x.py\nindex 1111111..2222222 100644\n--- a/x.py\n+++ b/x.py\n@@ -${at},2 +${at},2 @@\n def f():\n-    return 1\n+${added}\n`;
-  test("moved line numbers retain", () => {
-    expect(approvedDiffUnchanged(hunk(3, "    return 2"), hunk(9, "    return 2").replace("1111111..2222222", "3333333..4444444"))).toBe(true);
-  });
-  test("a whitespace-only change refuses: indentation is code", () => {
-    expect(approvedDiffUnchanged(hunk(3, "    return 2"), hunk(3, "  return 2"))).toBe(false);
+  const hunk = (at: number, blobs = "1111111..2222222") => `diff --git a/x.py b/x.py\nindex ${blobs} 100644\n--- a/x.py\n+++ b/x.py\n@@ -${at},2 +${at},2 @@\n def f():\n-    return 1\n+    return 2\n`;
+  test("a base edit to a file the PR touches refuses, even far from the PR's change", () => {
+    expect(approvedDiffUnchanged(hunk(3), hunk(9, "3333333..4444444"))).toBe(false); // lines added above it
+    expect(approvedDiffUnchanged(hunk(3), hunk(3, "3333333..4444444"))).toBe(false); // lines edited below it
   });
 });
 
