@@ -4,6 +4,8 @@ title: "Policy reference"
 
 Stamp reads `.stamp/policy.yml` from the default branch. If that branch has no policy file, Stamp uses the bundled policy. A custom policy replaces the bundled policy; it does not merge with it. Start from the generated file rather than writing a fragment as a whole policy.
 
+The generated policy's first line links your editor to the JSON schema, `.stamp/policy.schema.json`, at the installed version. With a YAML language extension, your editor completes field names and marks invalid values as you type. `stamp config` lists each problem with its line and column.
+
 ## Required fields
 
 | Field | Type | Effect |

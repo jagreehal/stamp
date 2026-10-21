@@ -105,7 +105,7 @@ if (process.argv[2] === "config") {
   try {
     policy = loadPolicy(root);
   } catch (e) {
-    read = `unreadable, so defaults only: ${e instanceof Error ? e.message.split("\n")[0] : e}`;
+    read = `unreadable, so defaults only:\n${e instanceof Error ? e.message : e}`;
   }
 
   const config = effectiveConfig(policy);

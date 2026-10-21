@@ -1,0 +1,638 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "number",
+      "const": 1
+    },
+    "deny": {
+      "type": "object",
+      "properties": {
+        "stamp_policy": {
+          "type": "object",
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "match": {
+              "type": "object",
+              "properties": {
+                "any": {
+                  "default": [],
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "titles": {
+                  "default": [],
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "paths": {
+                  "default": [],
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "required": [
+            "match"
+          ]
+        }
+      },
+      "required": [
+        "stamp_policy"
+      ],
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "match": {
+            "type": "object",
+            "properties": {
+              "any": {
+                "default": [],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "titles": {
+                "default": [],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "paths": {
+                "default": [],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "match"
+        ]
+      },
+      "description": "Categories a PR may not touch: a match sends it to a human. deny.stamp_policy is required."
+    },
+    "allow": {
+      "type": "object",
+      "properties": {
+        "path_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extensions_only": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "path_patterns",
+        "extensions_only"
+      ],
+      "description": "Paths and extensions that count as low-risk."
+    },
+    "size_gate": {
+      "type": "object",
+      "properties": {
+        "max_lines": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "max_files": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "max_lines",
+        "max_files"
+      ],
+      "description": "The largest change stamp reviews; anything bigger goes to a human."
+    },
+    "tiers": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "max_lines": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "max_files": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "max_lines",
+          "max_files"
+        ]
+      }
+    },
+    "overrides": {
+      "description": "Contract ceilings for AGENT_APPROVALS.md grants. Absent = no folder delegation.",
+      "type": "object",
+      "properties": {
+        "size_gate.max_lines": {
+          "type": "object",
+          "properties": {
+            "ceiling": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "ceiling"
+          ]
+        },
+        "size_gate.max_files": {
+          "type": "object",
+          "properties": {
+            "ceiling": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "ceiling"
+          ]
+        }
+      },
+      "required": [
+        "size_gate.max_lines",
+        "size_gate.max_files"
+      ],
+      "additionalProperties": false
+    },
+    "familiarity": {
+      "description": "Judgment-layer only; never a gate. Absent = no familiarity signal computed.",
+      "type": "object",
+      "properties": {
+        "strong": {
+          "type": "object",
+          "properties": {
+            "min_blame_overlap_pct": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "min_blame_overlap_pct"
+          ]
+        },
+        "moderate": {
+          "type": "object",
+          "properties": {
+            "min_prior_prs": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "max_days_since_touch": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "min_prior_prs",
+            "max_days_since_touch"
+          ]
+        }
+      },
+      "required": [
+        "strong",
+        "moderate"
+      ],
+      "additionalProperties": false
+    },
+    "stories": {
+      "description": "Judgment-layer only; never a gate. Absent = no test evidence read from CI.",
+      "type": "object",
+      "properties": {
+        "workflow": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact": {
+          "type": "string",
+          "minLength": 1
+        },
+        "file": {
+          "default": "index.review.json",
+          "type": "string"
+        },
+        "max_bytes": {
+          "default": 1000000,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 10000000
+        }
+      },
+      "required": [
+        "workflow",
+        "artifact"
+      ],
+      "additionalProperties": false
+    },
+    "scrutiny": {
+      "default": {},
+      "description": "Paths the reviewer looks at harder, with what to check. Never changes a gate.",
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "instruction": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "paths",
+          "instruction"
+        ]
+      }
+    },
+    "reviewer_bots": {
+      "default": [],
+      "description": "Review bots whose fresh 👀 reaction stamp briefly waits on.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "long_lived_branches": {
+      "default": [
+        "main",
+        "master",
+        "develop",
+        "release",
+        "release/*",
+        "staging"
+      ],
+      "description": "Long-lived branches (globs): a PR whose commits mostly sit on one of these, other than its base, was opened against the wrong base.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "reviewer_checks": {
+      "default": [],
+      "description": "Review services that report progress as a check run on the head, such as Claude Code Review.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "rules": {
+      "default": {},
+      "description": "Team rule packs: SKILL.md files whose \"## Review\" rules the reviewer applies to matching files.",
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]*$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "skill": {
+            "type": "string"
+          },
+          "applies_to": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "on_break": {
+            "default": "escalate",
+            "type": "string",
+            "enum": [
+              "refuse",
+              "escalate",
+              "note"
+            ]
+          },
+          "only": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "disable": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "required": [
+          "skill"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "rules_from": {
+      "description": "Rule packs declared once, in another tool's config: shepherd's lenses become rule packs here.",
+      "type": "object",
+      "properties": {
+        "shepherd": {
+          "type": "object",
+          "properties": {
+            "on_break": {
+              "default": "escalate",
+              "type": "string",
+              "enum": [
+                "refuse",
+                "escalate",
+                "note"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "shepherd"
+      ],
+      "additionalProperties": false
+    },
+    "branding": {
+      "description": "How posted reviews look: the header name, a small avatar, and any glyph. Absent = today's output, byte for byte.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "avatar": {
+          "type": "string",
+          "maxLength": 500,
+          "format": "uri"
+        },
+        "emoji": {
+          "type": "object",
+          "properties": {
+            "APPROVED": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16,
+              "pattern": "^\\S+$"
+            },
+            "REFUSED": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16,
+              "pattern": "^\\S+$"
+            },
+            "ESCALATE": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16,
+              "pattern": "^\\S+$"
+            },
+            "ERROR": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16,
+              "pattern": "^\\S+$"
+            },
+            "pass": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16,
+              "pattern": "^\\S+$"
+            },
+            "fail": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16,
+              "pattern": "^\\S+$"
+            },
+            "fix": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16,
+              "pattern": "^\\S+$"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "model": {
+      "description": "The reviewer model, provider:model. Overridden by STAMP_MODEL.",
+      "type": "string",
+      "minLength": 1
+    },
+    "backends": {
+      "description": "Primary backend, then a second opinion. Overridden by STAMP_BACKENDS.",
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "pricing": {
+      "description": "Prices per million tokens for models autotel's tables leave out. Overridden by STAMP_PRICING.",
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "inputPer1M": {
+            "type": "number"
+          },
+          "outputPer1M": {
+            "type": "number"
+          },
+          "cachedInputPer1M": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "inputPer1M",
+          "outputPer1M"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "provider": {
+      "type": "object",
+      "properties": {
+        "region": {
+          "type": "string",
+          "pattern": "^[a-z]{2}(-[a-z]+)+-\\d$"
+        },
+        "base_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "anthropic_base_url": {
+          "type": "string",
+          "format": "uri"
+        }
+      },
+      "additionalProperties": false
+    },
+    "guard": {
+      "description": "Bounds on one review's cost, tokens, repeated calls, tool calls and time. Overridden by STAMP_GUARD.",
+      "type": "object",
+      "properties": {
+        "budget_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "string",
+              "pattern": "^\\d+(\\.\\d+)?[km]?$"
+            }
+          ]
+        },
+        "loop": {
+          "type": "string",
+          "pattern": "^\\d+\\/\\d+$"
+        },
+        "max_tools": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^\\d+(\\.\\d+)?(ms|s|m|h)?$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "max_output_tokens": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+    },
+    "cli": {
+      "type": "object",
+      "properties": {
+        "claude_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "codex_model": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "label": {
+      "description": "When set, a PR needs this label before stamp reviews it. Overridden by STAMP_LABEL.",
+      "type": "string",
+      "minLength": 1
+    },
+    "notify": {
+      "type": "object",
+      "properties": {
+        "on": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "APPROVED",
+              "REFUSED",
+              "ESCALATE",
+              "ERROR"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "telemetry": {
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "format": "uri"
+        },
+        "service": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "advise_on_deny": {
+      "description": "When a gate denies, still ask the model, and append its findings to the refusal as advice. It cannot approve.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "version",
+    "deny",
+    "allow",
+    "size_gate",
+    "tiers"
+  ],
+  "additionalProperties": false,
+  "title": "stamp policy",
+  "description": "stamp's merge-gate policy, .stamp/policy.yml. Read from the default branch, never the PR head."
+}

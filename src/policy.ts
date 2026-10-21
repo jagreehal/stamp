@@ -3,7 +3,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { parse as parseYaml } from "yaml";
+import { LineCounter, isNode, parse as parseYaml, parseDocument, visit } from "yaml";
 import { z } from "zod";
 import { FamiliarityPolicySchema, stripDiffPath } from "./familiarity.ts";
 import { TimedOut, TRUSTED_ASSOCIATIONS, callTimeout, type LinkedIssue } from "./github.ts";
@@ -14,6 +14,8 @@ const Match = z.object({
   titles: z.array(z.string()).default([]),
   paths: z.array(z.string()).default([]),
 });
+
+const denyCategory = { description: z.string().optional(), match: Match };
 
 const OverrideCeiling = z.object({ ceiling: z.number().int().positive() });
 
@@ -77,39 +79,36 @@ export const Pricing = z.record(z.string(), z.object({ inputPer1M: z.number(), o
 export const PolicySchema = z
   .object({
     version: z.literal(1),
-    deny: z.record(z.string(), z.object({ description: z.string().optional(), match: Match })),
-    allow: z.object({ path_patterns: z.array(z.string()), extensions_only: z.array(z.string()) }),
-    size_gate: z.object({ max_lines: z.number().int().positive(), max_files: z.number().int().positive() }),
+    // A property, so the published schema requires stamp_policy too.
+    deny: z
+      .object({ stamp_policy: z.object(denyCategory, { error: (i) => (i.input === undefined ? "required: the gate cannot approve edits to itself" : undefined) }) })
+      .catchall(z.object(denyCategory))
+      .describe("Categories a PR may not touch: a match sends it to a human. deny.stamp_policy is required."),
+    allow: z.object({ path_patterns: z.array(z.string()), extensions_only: z.array(z.string()) }).describe("Paths and extensions that count as low-risk."),
+    size_gate: z.object({ max_lines: z.number().int().positive(), max_files: z.number().int().positive() }).describe("The largest change stamp reviews; anything bigger goes to a human."),
     tiers: z.record(z.string(), z.object({ max_lines: z.number().int(), max_files: z.number().int() })),
-    // Contract ceilings for AGENT_APPROVALS.md grants. Absent = no folder delegation.
     overrides: z
       .object({
         "size_gate.max_lines": OverrideCeiling,
         "size_gate.max_files": OverrideCeiling,
       })
       .strict()
-      .optional(),
-    // Judgment-layer only; never a gate. Absent = no familiarity signal computed.
-    familiarity: FamiliarityPolicySchema.optional(),
-    // Judgment-layer only; never a gate. Absent = no test evidence read from CI.
-    stories: StoriesPolicySchema.optional(),
-    scrutiny: z.record(z.string(), z.object({ description: z.string().optional(), paths: z.array(z.string()), instruction: z.string() })).default({}),
-    reviewer_bots: z.array(z.string()).default([]),
-    // Long-lived branches (globs): a PR whose commits mostly sit on one of these, other than its base, was opened against the wrong base.
-    long_lived_branches: z.array(z.string().min(1)).default(["main", "master", "develop", "release", "release/*", "staging"]),
-    // Review services that report progress as a check run on the head, such as Claude Code Review.
-    reviewer_checks: z.array(z.string()).default([]),
-    // Team rule packs: SKILL.md files whose "## Review" rules the reviewer applies to matching files.
-    rules: z.record(z.string().regex(/^[a-z][a-z0-9-]*$/), RulePackSchema).default({}),
-    // Rule packs declared once, in another tool's config: shepherd's lenses become rule packs here.
-    rules_from: z.object({ shepherd: z.object({ on_break: OnBreak.default("escalate") }).strict() }).strict().optional(),
-    // How posted reviews look: the header name, a small avatar, and any glyph. Absent = today's output, byte for byte.
-    branding: Branding.optional(),
+      .optional()
+      .describe("Contract ceilings for AGENT_APPROVALS.md grants. Absent = no folder delegation."),
+    familiarity: FamiliarityPolicySchema.optional().describe("Judgment-layer only; never a gate. Absent = no familiarity signal computed."),
+    stories: StoriesPolicySchema.optional().describe("Judgment-layer only; never a gate. Absent = no test evidence read from CI."),
+    scrutiny: z.record(z.string(), z.object({ description: z.string().optional(), paths: z.array(z.string()), instruction: z.string() })).default({}).describe("Paths the reviewer looks at harder, with what to check. Never changes a gate."),
+    reviewer_bots: z.array(z.string()).default([]).describe("Review bots whose fresh 👀 reaction stamp briefly waits on."),
+    long_lived_branches: z.array(z.string().min(1)).default(["main", "master", "develop", "release", "release/*", "staging"]).describe("Long-lived branches (globs): a PR whose commits mostly sit on one of these, other than its base, was opened against the wrong base."),
+    reviewer_checks: z.array(z.string()).default([]).describe("Review services that report progress as a check run on the head, such as Claude Code Review."),
+    rules: z.record(z.string().regex(/^[a-z][a-z0-9-]*$/), RulePackSchema).default({}).describe('Team rule packs: SKILL.md files whose "## Review" rules the reviewer applies to matching files.'),
+    rules_from: z.object({ shepherd: z.object({ on_break: OnBreak.default("escalate") }).strict() }).strict().optional().describe("Rule packs declared once, in another tool's config: shepherd's lenses become rule packs here."),
+    branding: Branding.optional().describe("How posted reviews look: the header name, a small avatar, and any glyph. Absent = today's output, byte for byte."),
     // Settings, read from the default branch like the rest, so a change to one is reviewed. A non-blank environment
     // variable overrides each one (config.ts, `stamp config`). Secrets are never here.
-    model: z.string().min(1).optional(),
-    backends: z.array(z.string().min(1)).min(1).optional(),
-    pricing: Pricing.optional(),
+    model: z.string().min(1).optional().describe("The reviewer model, provider:model. Overridden by STAMP_MODEL."),
+    backends: z.array(z.string().min(1)).min(1).optional().describe("Primary backend, then a second opinion. Overridden by STAMP_BACKENDS."),
+    pricing: Pricing.optional().describe("Prices per million tokens for models autotel's tables leave out. Overridden by STAMP_PRICING."),
     provider: z.object({ region: z.string().regex(/^[a-z]{2}(-[a-z]+)+-\d$/, "an AWS region such as eu-west-1").optional(), base_url: z.url({ protocol: /^https?$/ }).optional(), anthropic_base_url: z.url({ protocol: /^https?$/ }).optional() }).strict().optional(),
     guard: z
       .object({
@@ -121,20 +120,27 @@ export const PolicySchema = z
       })
       .partial()
       .strict()
-      .optional(),
+      .optional()
+      .describe("Bounds on one review's cost, tokens, repeated calls, tool calls and time. Overridden by STAMP_GUARD."),
     max_output_tokens: z.number().int().positive().optional(),
     cli: z.object({ claude_model: z.string().min(1).optional(), codex_model: z.string().min(1).optional() }).strict().optional(),
-    label: z.string().min(1).optional(),
+    label: z.string().min(1).optional().describe("When set, a PR needs this label before stamp reviews it. Overridden by STAMP_LABEL."),
     notify: z.object({ on: z.array(z.enum(["APPROVED", "REFUSED", "ESCALATE", "ERROR"])).min(1).optional() }).strict().optional(),
     telemetry: z.object({ endpoint: z.url({ protocol: /^https?$/ }).optional(), service: z.string().min(1).optional() }).strict().optional(),
-    // When a gate denies, still ask the model, and append its findings to the refusal as advice. It cannot approve.
-    advise_on_deny: z.boolean().optional(),
+    advise_on_deny: z.boolean().optional().describe("When a gate denies, still ask the model, and append its findings to the refusal as advice. It cannot approve."),
   })
   .strict()
-  .refine((p) => "stamp_policy" in p.deny, { message: "deny.stamp_policy is required: the gate cannot approve edits to itself" })
   .refine((p) => !p.overrides || (p.overrides["size_gate.max_lines"].ceiling >= p.size_gate.max_lines && p.overrides["size_gate.max_files"].ceiling >= p.size_gate.max_files), {
     message: "overrides ceilings must cover the global size_gate limits",
+    path: ["overrides"],
   });
+
+/** The JSON schema editors validate `.stamp/policy.yml` against, published as `.stamp/policy.schema.json`. */
+export const policyJsonSchema = () => ({
+  ...z.toJSONSchema(PolicySchema, { io: "input", target: "draft-7" }),
+  title: "stamp policy",
+  description: "stamp's merge-gate policy, .stamp/policy.yml. Read from the default branch, never the PR head.",
+});
 
 // Files outside .stamp/ that the policy was built from (shepherd's config and its local packs): editing one edits policy.
 export type Policy = z.infer<typeof PolicySchema> & { policyFiles?: string[] };
@@ -194,7 +200,54 @@ export function loadPolicy(repoRoot: string, ref?: string): Policy {
 
   if (raw === null) throw new Error("missing .stamp/policy.yml");
 
-  return PolicySchema.parse(parseYaml(raw));
+  return parsePolicy(raw);
+}
+
+/** Parse policy text, failing with one `.stamp/policy.yml:line:col key: problem` line per issue. */
+export function parsePolicy(raw: string): Policy {
+  const lines = new LineCounter();
+  const doc = parseDocument(raw, { lineCounter: lines, prettyErrors: false });
+
+  const at = (offset: number) => {
+    const { line, col } = lines.linePos(offset);
+
+    return `.stamp/policy.yml:${line}:${col}`;
+  };
+
+  const problems = doc.errors.map((e) => `${at(e.pos[0])} ${e.message}`);
+
+  // An alias to an anchor that does not exist parses cleanly, then throws from toJS with no position.
+  visit(doc, {
+    Alias(_, alias) {
+      if (!alias.resolve(doc) && alias.range) problems.push(`${at(alias.range[0])} unresolved alias *${alias.source}`);
+    },
+  });
+
+  if (problems.length) throw new Error(problems.join("\n"));
+  let value: unknown;
+
+  try {
+    value = doc.toJS();
+  } catch (e) {
+    throw new Error(`.stamp/policy.yml: ${e instanceof Error ? e.message : e}`); // such as an excessive alias count
+  }
+
+  const parsed = PolicySchema.safeParse(value);
+
+  if (parsed.success) return parsed.data;
+
+  const where = (keys: PropertyKey[]): string => {
+    // A missing key has no node of its own: point at the nearest parent that exists.
+    for (let n = keys.length; n >= 0; n--) {
+      const node = doc.getIn(keys.slice(0, n), true);
+
+      if (isNode(node) && node.range) return at(node.range[0]);
+    }
+
+    return ".stamp/policy.yml";
+  };
+
+  throw new Error(parsed.error.issues.map((i) => `${where(i.code === "unrecognized_keys" ? [...i.path, i.keys[0]!] : i.path)} ${i.path.join(".") || "(top level)"}: ${i.message}`).join("\n"));
 }
 
 export function loadGuidance(repoRoot: string, ref?: string): string {
