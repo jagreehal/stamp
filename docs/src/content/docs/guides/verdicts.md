@@ -36,6 +36,8 @@ The trigger label exists only in label mode, and only a substantive non-approval
 
 Set `STAMP_NOTIFY_WEBHOOK` to hear about refusals, escalations and errors as they land. Read [notifications](/stamp/integrations/notifications/).
 
+An approval names the one fact the change is safe because of, under **Safe because**, with how far the reviewer checked it: `claimed` (it believes it), `cited` (it read the `file:line`), `traced` (it walked the failure path and it cannot reach) or `tested` (a test or story in the evidence exercises it). A high-risk approval that names no fact, or only a claimed one, becomes `ESCALATE`, because a belief is not assurance. The fact also lands in the evidence bundle, so you can audit what an approval rested on when it turns out wrong.
+
 Each non-approval carries a collapsed **Fix with a coding agent** block. It holds the verdict, the issues and the requested next step as one prompt you can copy, with the rule that weakening a test or a lint rule to clear the review counts as a refusal. Agents write most of the PRs stamp sees, so the fix loop starts there.
 
 Comment `/stamp` on a PR to re-run the review without an empty commit. stamp acts on comments from OWNER, MEMBER and COLLABORATOR only.

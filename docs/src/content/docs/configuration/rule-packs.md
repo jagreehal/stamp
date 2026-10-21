@@ -77,7 +77,9 @@ lenses:
     gate: refuse                                          # stamp's on_break for this lens
 ```
 
-stamp reads shepherd's file and every pack it extends the way shepherd does: from the default branch, packs before the file, nested packs included, and a pinned pack's relative paths in its own repository at its commit. A lens's `gate` becomes its `on_break`, and its `applies_to`, `only` and `disable` carry over. A `rules:` entry with the same name wins. stamp reads a lens by path, so a lens that names an installed skill (`skill: vercel-react-best-practices`) is reported and skipped; convert it into a lens directory with shepherd's `lens-import` skill. Editing `.shepherd/config.yml`, `.shepherd/lenses.yml`, a local pack they extend, or a lens file stamp reads counts as editing stamp's policy.
+Shepherd's `pstack` pack turns the principles of [pstack](https://github.com/cursor/plugins/tree/main/pstack) into a lens, so a team whose agents work through pstack gets stamp checking the same principles. Its gate is `note`.
+
+stamp reads shepherd's file and every pack it extends the way shepherd does: from the default branch, packs before the file, nested packs included, and a pinned pack's relative paths in its own repository at its commit. A lens's `gate` becomes its `on_break`, and its `applies_to`, `only` and `disable` carry over. A `rules:` entry with the same name wins. stamp reads a lens by path, so a lens that names an installed skill (`skill: vercel-react-best-practices`) or a plugin's skill (`skill: pstack:principle-fix-root-causes`) is reported and skipped; convert it into a lens directory with shepherd's `lens-import` skill. Editing `.shepherd/config.yml`, `.shepherd/lenses.yml`, a local pack they extend, or a lens file stamp reads counts as editing stamp's policy.
 
 shepherd ships stack packs for `react`, `nextjs`, `node-api`, `go`, `rust`, `java`, `dotnet`, `python` and `observability`. Pin a commit from jagreehal/shepherd's main branch.
 

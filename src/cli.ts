@@ -45,7 +45,7 @@ import {
 import { tryRetainApproval, type RetentionResult } from "./retention.ts";
 import { beginReviewSpan, endReviewSpan, inReviewSpan, reviewMeasurements, summarizeRun, type ReviewAttributes } from "./llm.ts";
 import { egressRefusals } from "./isolated-cli.ts";
-import { type Backend, BACKENDS, combine, MODEL, review, secondOpinionNeeded, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
+import { assured, type Backend, BACKENDS, combine, type Combined, MODEL, review, secondOpinionNeeded, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
 import { approvedOn, stackedParent, wrongBase, type StackDeps, type WrongBase } from "./stack.ts";
 import { ghStoryDeps, loadStoryEvidence, storyEvidenceRecord, type StoryEvidence } from "./stories.ts";
@@ -152,7 +152,7 @@ let retention: RetentionResult = { kept: false, reason: "not_posting" };
 
 // Retention is the deliberate exception to dismiss-first. It keeps a standing approval, and skips the
 // review, only when everything a fresh run would check still holds: the trigger label, not a draft, a
-// byte-identical PR diff, every gate against today's trusted policy, and finally a PR that has not
+// PR diff with the approved one's patch id, every gate against today's trusted policy, and finally a PR that has not
 // moved since. Anything ambiguous or failing falls through to dismiss (fail closed). A `/stamp`
 // comment is an explicit request for a fresh review, so it goes straight to dismissal without a
 // fetch. The checks share one budget, well inside the job's timeout, so a hung call ends in the
@@ -413,13 +413,18 @@ if (opts["dry-run"]) {
     // A second opinion from a different family, only where it can change the outcome. The second
     // reviewer never sees the first verdict, so it cannot anchor on it. Agreement is the independent
     // assurance the guidance asks for in risky territory; disagreement escalates with both reasonings.
+    let outcome: Combined = { verdict: llm.verdict, llm };
+
     if (second && secondOpinionNeeded(llm, flags.length + scrutiny.length + manifests.length + signalFlags.length > 0)) {
       opinion = { backend: second, ...(await inReviewSpan(() => review(second, input, guidance, exploreRoot, opts.verbose))) };
-      const combined = combine(primary!, llm, opinion);
-      verdict = VERDICT_OF[combined.verdict];
-      llm = combined.llm;
-      body = llm.reasoning;
+      outcome = combine(primary!, llm, opinion);
     }
+
+    // Checked on the combined verdict: a disagreement has already escalated, and only an approval can be held back.
+    outcome = assured(outcome);
+    verdict = VERDICT_OF[outcome.verdict];
+    llm = { ...llm, ...outcome.llm };
+    body = llm.reasoning;
   } catch (e) {
     verdict = "ERROR";
     body = `Review failed before reaching a verdict: ${String(e instanceof Error ? e.message : e).split("\n")[0]}`;
@@ -641,6 +646,8 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed |
   if (llm?.next_steps) parts.push("", `**Next:** ${llm.next_steps}`);
 
   if (llm?.change_summary) parts.push("", `**What changed:** ${llm.change_summary}`);
+
+  if (verdict === "APPROVED" && llm?.safe_because) parts.push("", `**Safe because:** ${llm.safe_because.fact} (${llm.safe_because.evidence})`);
 
   if (verdict !== "APPROVED" && llm?.issues.length) parts.push("", ...agentPrompt(pr, verdict, reasoning, llm));
   parts.push(
