@@ -1,6 +1,7 @@
 // Test evidence from the repository's own CI: the executable-stories review JSON its tests wrote for the
-// commit under review. Advisory only. It reaches the reviewer inside the untrusted fence, and nothing in it
-// moves a gate or counts as independent assurance: the PR's author wrote the tests that produced it.
+// commit under review. It reaches the reviewer inside the untrusted fence, and nothing in it moves a gate,
+// grants an approval or counts as independent assurance: the PR's author wrote the tests that produced it.
+// It can only hold an approval back: a `weakened` finding sends the PR to a person (weakenedCount).
 // Matching the commit makes the report relevant to this head. It does not make the report trustworthy.
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -36,7 +37,7 @@ const ReviewReport = z.object({
   run: z.object({ total: z.number(), passed: z.number(), failed: z.number(), skipped: z.number(), pending: z.number() }),
   findings: z.array(
     z.object({
-      kind: z.enum(["failed", "unasserted", "skipped", "uncovered", "weak", "policy"]),
+      kind: z.enum(["failed", "unasserted", "weakened", "skipped", "uncovered", "weak", "policy"]),
       severity: z.enum(["blocker", "major", "minor"]),
       title: z.string(),
       file: z.string().optional(),
@@ -65,6 +66,8 @@ export type StoryDeps = {
   report: (runId: number, artifact: string, file: string, maxBytes: number) => string | null;
   /** A commit's parent SHAs. */
   parents: (sha: string) => string[];
+  /** Whether `sha` is `from` or a descendant of it. */
+  descends: (sha: string, from: string) => boolean;
 };
 
 const GhRuns = z.array(
@@ -129,6 +132,7 @@ export function ghStoryDeps(repo: string, cwd: string, timeout: number): StoryDe
       }
     },
     parents: (sha) => z.array(z.string()).parse(JSON.parse(gh(["api", `repos/${repo}/commits/${sha}`, "--jq", "[.parents[].sha]"]))),
+    descends: (sha, from) => ["ahead", "identical"].includes(gh(["api", `repos/${repo}/compare/${from}...${sha}`, "--jq", ".status"]).trim()),
   };
 }
 
@@ -153,10 +157,10 @@ export function parseReport(text: string, file: string): { ok: true; report: Rev
 
 /**
  * Which commit the report's tests ran on, from the SHA its run recorded. A pull_request workflow checks out
- * GitHub's synthetic merge of the head into the base: that counts only when its parents are exactly the
- * reviewed base and this head. Null when the report records no SHA.
+ * GitHub's synthetic merge of the head into the base: that counts only when its parents are this head and
+ * the reviewed base or a commit descended from it. Null when the report records no SHA.
  */
-export function testedCommit(report: ReviewReport, headSha: string, baseSha: string, parents: StoryDeps["parents"]): "head" | "merge" | string | null {
+export function testedCommit(report: ReviewReport, headSha: string, baseSha: string, { parents, descends }: Pick<StoryDeps, "parents" | "descends">): "head" | "merge" | string | null {
   const tested = report.execution?.gitSha;
 
   if (!tested) return null;
@@ -169,7 +173,9 @@ export function testedCommit(report: ReviewReport, headSha: string, baseSha: str
   try {
     const [base, head, ...rest] = parents(tested);
 
-    return base === baseSha && head === headSha && rest.length === 0 ? "merge" : tested;
+    // GitHub merges into the base branch as it is when the run starts, which can be past the base SHA the
+    // PR reports. Newer base code still ran this head's tests; a merge into an older base did not.
+    return head === headSha && rest.length === 0 && base !== undefined && (base === baseSha || descends(base, baseSha)) ? "merge" : tested;
   } catch {
     return tested;
   }
@@ -202,12 +208,20 @@ export function loadStoryEvidence(policy: StoriesPolicy, headSha: string, baseSh
 
   if (!read.ok) return { status: "invalid", run, reason: read.reason };
 
-  const tested = testedCommit(read.report, headSha, baseSha, deps.parents);
+  const tested = testedCommit(read.report, headSha, baseSha, deps);
 
   if (tested === null) return { status: "invalid", run, reason: `${policy.file} does not record which commit its tests ran on` };
 
   return tested === "head" || tested === "merge" ? { status: "ok", run, tested, scope: read.report.execution?.runScope, report: read.report } : { status: "stale", run, tested };
 }
+
+/**
+ * How many scenarios the head's own run measured checking less than the base branch's: removed, newly skipped, or
+ * making fewer steps or assertions. An approval with any of these is held for a person. The report can only hold
+ * an approval back, never grant one. Zero unless the evidence is this head's.
+ */
+export const weakenedCount = (e: StoryEvidence | null): number =>
+  e?.status === "ok" ? e.report.findings.filter((f) => f.kind === "weakened").length : 0;
 
 /** One line for the trusted context: what stamp found, never what the report claims. */
 export function formatStoryStatus(e: StoryEvidence): string {
@@ -258,4 +272,26 @@ export function storyEvidenceRecord(e: StoryEvidence | null) {
     case "ok":
       return { status: e.status, run, tested: e.tested, scope: e.scope ?? null, run_counts: e.report.run, findings: e.report.findings.length, uncovered: e.report.changedFiles.filter((f) => f.band === "uncovered").length };
   }
+}
+
+/**
+ * One line for the review's test evidence section: counts and status only, never the report's own text. HTML, not
+ * Markdown: it sits in a `<summary>`, where GitHub renders no Markdown.
+ */
+export function evidenceSummary(e: StoryEvidence): string {
+  const link = (r: StoryRun) => `<a href="${r.url.replace(/[&"<>]/g, (c) => `&#${c.charCodeAt(0)};`)}">run</a>`;
+
+  if (e.status === "missing") return `none (${e.reason})`;
+
+  if (e.status === "pending") return `⏳ still running (${link(e.run)})`;
+
+  if (e.status === "invalid") return `unreadable (${e.reason})`;
+
+  if (e.status === "stale") return `stale: tested <code>${e.tested.slice(0, 7)}</code> (${link(e.run)})`;
+
+  const { run } = e.report;
+  const weakened = weakenedCount(e);
+  const counts = [`${run.passed} passed`, ...(run.failed ? [`❌ ${run.failed} failed`] : []), ...(run.skipped ? [`${run.skipped} skipped`] : [])];
+
+  return [...counts, ...(weakened ? [`⚠️ ${weakened} scenario${weakened === 1 ? " checks" : "s check"} less than base`] : []), link(e.run)].join(" · ");
 }

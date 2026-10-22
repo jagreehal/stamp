@@ -145,7 +145,7 @@ The `api` backend runs its repository-confined tools in-process and needs no Doc
 
 Every `api` review runs under `STAMP_GUARD`, written in autotel's rule shorthand. The default is `budget:$2,tokens:3m,loop:4/12,max-tools:80,timeout:15m`: a cost ceiling, a token ceiling, a spin-loop rule (the same call 4 times in 12), a tool-call cap, and a timeout that also cuts off a model call in flight. A rule that fires ends the review as ERROR. A model without a price keeps its token ceiling; give it a price with `STAMP_PRICING='{"kimi-k3":{"inputPer1M":3,"outputPer1M":15}}'`.
 
-The mechanics table names the model, its tool calls, the cost and the time (`bedrock:minimax.minimax-m2.5 · 9 tool calls · $0.0042 · 6.2s`). The `--json` evidence carries the full run record: steps, tool calls and failures, tokens, cost and the limits it ran under. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and each run also becomes a trace. One `stamp.review` span covers the run from start to verdict, and the `gen_ai.*` spans, one per model call and tool call, nest under it. Its attributes make one wide event per review, so you can chart approval rates, refusal reasons and ERROR runs by repository:
+The Reviewer line names the model, its tool calls, the cost and the time (`bedrock:minimax.minimax-m2.5 · 9 tool calls · $0.0042 · 6.2s`). The `--json` evidence carries the full run record: steps, tool calls and failures, tokens, cost and the limits it ran under. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and each run also becomes a trace. One `stamp.review` span covers the run from start to verdict, and the `gen_ai.*` spans, one per model call and tool call, nest under it. Its attributes make one wide event per review, so you can chart approval rates, refusal reasons and ERROR runs by repository:
 
 | Attribute | Holds |
 | --- | --- |
@@ -189,7 +189,7 @@ flowchart TD
 
 The first backend reviews every PR. The second runs when the first approves something above plain low risk: a risk above `low`, or a title, scrutiny, manifest or Jev flag. It never sees the first verdict.
 
-When both approve, stamp approves and lists the second verdict in the mechanics table as independent assurance. When they disagree, stamp posts ESCALATE with both reasonings, the dissenter's issues and its next step. A plainly low-risk PR costs one call.
+When both approve, stamp approves and lists the second verdict in the Reviewer section as independent assurance. When they disagree, stamp posts ESCALATE with both reasonings, the dissenter's issues and its next step. A plainly low-risk PR costs one call.
 
 Across 146 real PRs, four commercial reviewers never flagged the same line, and 93% of findings came from one tool alone. Two models from different families miss different things.
 

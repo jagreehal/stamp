@@ -237,7 +237,7 @@
       "additionalProperties": false
     },
     "stories": {
-      "description": "Judgment-layer only; never a gate. Absent = no test evidence read from CI.",
+      "description": "Judgment-layer, never a gate; a scenario the report measures checking less than the base branch holds an approval for a person. Absent = no test evidence read from CI.",
       "type": "object",
       "properties": {
         "workflow": {

@@ -3,6 +3,7 @@
 // fails here with a message, not three functions later as an undefined property.
 import { execFileSync } from "node:child_process";
 import { z } from "zod";
+import { CARD_MARKER, renderCard } from "./actions.ts";
 import type { PRFile } from "./policy.ts";
 
 // A hung call must fail rather than wait for the job to be killed: a killed run skips every catch,
@@ -267,7 +268,7 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
         .map((c) => ({ user: c.author ? `${c.author.login}${c.author.__typename === "Bot" ? "[bot]" : ""}` : "ghost", path: t.path, body: c.body, outdated: t.isOutdated, resolved: t.isResolved, thread, created: c.createdAt }))
         .filter((c) => !exclude.includes(c.user)),
     ),
-    discussion: notOurs(paginated(CommentRow, `${base}/issues/${number}/comments`, cwd)).map((c) => ({
+    discussion: notOurs(paginated(CommentRow, `${base}/issues/${number}/comments`, cwd)).filter((c) => !c.body.includes(CARD_MARKER)).map((c) => ({
       user: c.user.login,
       body: c.body,
       created: c.created_at,
@@ -341,6 +342,15 @@ export const listReviews = (repo: string, prNumber: number, cwd: string) => pagi
 
 export type ReviewRecord = z.infer<typeof ReviewRow>;
 
+/**
+ * Written on a verdict reached while policy asked for CI test evidence and the review did not read it
+ * (pending, stale, missing or unreadable). Retention never keeps such an approval: the evidence may have
+ * landed since, and a byte-identical diff says nothing about it.
+ */
+export const EVIDENCE_UNSEEN_MARKER = "<!-- stamp-evidence:unseen -->";
+
+export const evidenceUnseen = (r: ReviewRecord) => r.body.includes(EVIDENCE_UNSEEN_MARKER);
+
 /** The head and base one of our reviews covered, from its marker; null for a review posted before the marker existed. */
 export function reviewedShas(r: ReviewRecord): { head: string; base: string } | null {
   // The last marker: stamp writes it after the review text, so text above it cannot stand in for it.
@@ -363,7 +373,7 @@ const reviewedHead = (r: ReviewRecord) => reviewedShas(r)?.head ?? r.commit_id;
 export const isOurs = (r: ReviewRecord, botLogin: string) => r.user.login === botLogin || (r.user.login.endsWith("[bot]") && RUN_MARKER.test(r.body));
 
 /** Whether the run that posted `r` started after `iso`: the later-started run owns the newer verdict. */
-const startedAfter = (r: ReviewRecord, iso: string) => {
+const startedAfter = (r: { body: string }, iso: string) => {
   // The last marker, as for the reviewed marker: stamp writes it after the review text.
   const started = [...r.body.matchAll(new RegExp(RUN_MARKER, "g"))].at(-1)?.[1];
 
@@ -418,6 +428,90 @@ function newerVerdictExists(pr: PR, opts: PostOptions): boolean {
   if (newer) console.log("a newer stamp run already posted on this head; this run's verdict is stale");
 
   return newer;
+}
+
+const SUPERSEDED = "<details><summary>Superseded: ";
+
+/**
+ * An older review of ours, folded under one line that names its verdict and links the latest. The body stays whole
+ * inside, markers included, so retention and the sweeps read it exactly as before.
+ */
+export function supersededBody(r: ReviewRecord, latestId: number): string | null {
+  if (r.body.startsWith(SUPERSEDED)) return null;
+
+  const verdict = /: (APPROVED|REFUSED|ESCALATE|ERROR)\b/.exec(r.body.split("\n", 1)[0] ?? "")?.[1] ?? r.state.toLowerCase();
+
+  return `${SUPERSEDED}stamp ${verdict} on <code>${reviewedHead(r).slice(0, 7)}</code> · <a href="#pullrequestreview-${latestId}">latest review</a></summary>\n\n${r.body}\n\n</details>`;
+}
+
+/**
+ * The older reviews of ours to fold under `latestId`, by id; null when a run that started after `started` has posted,
+ * since its verdict is the current one and this run must neither fold it nor rewrite the card over it.
+ */
+export function foldTargets(reviews: ReviewRecord[], latestId: number, botLogin: string, started: string): number[] | null {
+  const ours = reviews.filter((r) => r.id !== latestId && isOurs(r, botLogin));
+
+  if (ours.some((r) => startedAfter(r, started))) return null;
+
+  return ours.flatMap((r) => (supersededBody(r, latestId) ? [r.id] : []));
+}
+
+/**
+ * Fold every older review of ours under the one just posted, so the PR reads one current verdict. Folds nothing
+ * when a newer run has posted since: that run folds this one. Best effort.
+ */
+export function foldSuperseded(pr: PR, latestId: number, botLogin: string, started: string, cwd: string): void {
+  const reviews = listReviews(pr.repo, pr.number, cwd);
+  const targets = foldTargets(reviews, latestId, botLogin, started);
+
+  for (const r of reviews.filter((x) => targets?.includes(x.id))) {
+    gh(["api", "-X", "PUT", `repos/${pr.repo}/pulls/${pr.number}/reviews/${r.id}`, "-f", `body=${supersededBody(r, latestId)}`], cwd);
+  }
+}
+
+const OwnComment = z.object({ id: z.number(), user: Login, body: z.string() });
+
+const VERDICT_HEADING = /^## (.*?: (APPROVED|REFUSED|ESCALATE|ERROR))\b/;
+
+/**
+ * The card for the newest verdict of ours on the PR (by run start), or null when there is none. Derived from the
+ * reviews alone, so every run computes the same card and whichever writes last leaves the newest verdict showing.
+ */
+export function cardFor(reviews: ReviewRecord[], botLogin: string, shepherd: boolean): string | null {
+  const runStart = (r: ReviewRecord) => [...r.body.matchAll(new RegExp(RUN_MARKER, "g"))].at(-1)?.[1] ?? "";
+  const newest = reviews.filter((r) => isOurs(r, botLogin) && !r.body.startsWith(SUPERSEDED)).sort((a, b) => runStart(a).localeCompare(runStart(b))).at(-1);
+  const heading = newest ? VERDICT_HEADING.exec(newest.body.split("\n", 1)[0] ?? "") : null;
+
+  if (!newest || !heading) return null;
+
+  // SAFETY: VERDICT_HEADING's second group only matches one of the four verdicts.
+  const verdict = heading[2] as Verdict;
+
+  // A dismissed approval was withdrawn (a push, a draft, a lost label), and the card says so.
+  const title = newest.state === "DISMISSED" ? `${heading[1]!} (withdrawn)` : heading[1]!;
+
+  return `${renderCard({ heading: title, verdict, head: reviewedHead(newest), reviewId: newest.id, shepherd })}\n${runMarker(runStart(newest))}`;
+}
+
+/**
+ * Bring the PR's stamp card in line with the newest verdict. A run can write over a newer run's card in the gap
+ * between reading it and writing, and two first runs can each post one, so every write is followed by a re-read:
+ * the loop ends when exactly one card matches the newest verdict. Duplicates go, the oldest card stays.
+ */
+export function publishCard(prNumber: number, botLogin: string, shepherd: boolean, cwd: string): void {
+  const pr = { repo: repoSlug(cwd), number: prNumber };
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const desired = cardFor(listReviews(pr.repo, pr.number, cwd), botLogin, shepherd);
+    const [card, ...extra] = paginated(OwnComment, `repos/${pr.repo}/issues/${pr.number}/comments`, cwd).filter((c) => c.user.login === botLogin && c.body.startsWith(CARD_MARKER));
+
+    for (const c of extra) gh(["api", "-X", "DELETE", `repos/${pr.repo}/issues/comments/${c.id}`], cwd);
+
+    if (!desired || (card?.body === desired && !extra.length)) return;
+
+    if (card) gh(["api", "-X", "PATCH", `repos/${pr.repo}/issues/comments/${card.id}`, "-f", `body=${desired}`], cwd);
+    else gh(["api", "-X", "POST", `repos/${pr.repo}/issues/${pr.number}/comments`, "-f", `body=${desired}`], cwd);
+  }
 }
 
 /** Approvals are real reviews (count toward branch protection); everything else is a comment. Never request-changes. */

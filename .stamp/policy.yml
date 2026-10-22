@@ -38,7 +38,7 @@ deny:
   stamp_policy:
     description: stamp's own policy, engine, and gate inputs. The gate cannot approve edits to itself.
     match:
-      paths: ['\.stamp/', 'stamp/src/', 'CODEOWNERS', 'AGENT_APPROVALS\.md', '\.github/workflows/stamp(-edited|-digest)?\.ya?ml']
+      paths: ['\.stamp/', 'stamp/src/', 'CODEOWNERS', 'AGENT_APPROVALS\.md', '\.github/workflows/stamp(-edited|-digest|-actions)?\.ya?ml']
 
 # T0: docs/tests/config only. Still LLM-reviewed, lighter bar.
 allow:

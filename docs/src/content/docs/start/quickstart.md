@@ -33,7 +33,7 @@ Stamp prints each gate and a gate verdict. This command makes no model call and 
 bunx @jagreehal/stamp init --model deepseek:deepseek-flash
 ```
 
-Leave out `--model` for `claude-opus-5` on Anthropic. For Bedrock, add the region too: `--model bedrock:minimax.minimax-m2.5 --region eu-west-1`. Expect `.stamp/policy.yml` with those settings written in, `.stamp/review-guidance.md`, and two workflows under `.github/workflows/` (three with `--digest`). Stamp keeps files that already exist. Review the generated policy before you merge it. It sends every change except stamp's own policy to the reviewer, flagging auth, secrets, migrations, infrastructure, billing and dependency changes for extra scrutiny. Add `--strict` to send those areas to a human instead. Every setting lives in that file (the [settings table](/stamp/reference/configuration/#settings) lists them), so changing one later is a reviewed PR, not a hidden repository variable.
+Leave out `--model` for `claude-opus-5` on Anthropic. For Bedrock, add the region too: `--model bedrock:minimax.minimax-m2.5 --region eu-west-1`. Expect `.stamp/policy.yml` with those settings written in, `.stamp/review-guidance.md`, and three workflows under `.github/workflows/` (four with `--digest`). Stamp keeps files that already exist. Review the generated policy before you merge it. It sends every change except stamp's own policy to the reviewer, flagging auth, secrets, migrations, infrastructure, billing and dependency changes for extra scrutiny. Add `--strict` to send those areas to a human instead. Every setting lives in that file (the [settings table](/stamp/reference/configuration/#settings) lists them), so changing one later is a reviewed PR, not a hidden repository variable.
 
 ## 3. Add the one secret
 
@@ -57,7 +57,11 @@ Open a test PR or push to an existing one after setup reaches the default branch
 
 Expect `APPROVED`, `REFUSED`, `ESCALATE` or `ERROR`. Read [verdicts](/stamp/guides/verdicts/) for the action to take. Check the `stamp-evidence-<PR number>` artifact (it holds `stamp.json`) for the run's evidence. A branch rule may still require CI or a code owner's approval.
 
-To request another review, comment `/stamp` on the PR as a collaborator. In label mode a refusal removes the trigger label; reapply it when you want another automatic review.
+The review reads one line per part: the verdict and its reasoning, then collapsed sections for issues, test evidence, gates and the reviewer run. Each new verdict folds stamp's earlier reviews under a one-line "Superseded" summary, so the PR shows one current verdict.
+
+Stamp also keeps one card comment on the PR, rewritten each run, with the latest verdict and two checkboxes. Ticking **Review again** re-runs the review. On a verdict that is not an approval, in a repository that runs Shepherd, ticking **Hand to shepherd** dispatches Shepherd's workflow for the PR (`stamp-actions.yml` does that, with `actions: write` and nothing else). Both act only for someone who could merge.
+
+To request another review, you can also comment `/stamp` on the PR as a collaborator. In label mode a refusal removes the trigger label; reapply it when you want another automatic review.
 
 ## Next steps
 

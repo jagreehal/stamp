@@ -1,0 +1,35 @@
+# stamp: "Hand to shepherd" on the stamp card. Installed by `bunx @jagreehal/stamp init`.
+# Ticking the box edits stamp's card comment; this dispatches shepherd's workflow for the PR, as a `/shepherd`
+# comment would. A file of its own because it needs `actions: write`, which stamp.yml's review never does, and a
+# workflow that stamp-edited.yml calls may not ask for more than its caller grants. No checkout and no model keys:
+# it reads the event and calls the API, nothing else.
+name: stamp-actions
+on:
+  issue_comment:
+    types: [edited]
+
+permissions:
+  actions: write # workflow_dispatch of shepherd.yml
+
+jobs:
+  shepherd:
+    # The card (posted by the workflow token or a custom App, so any [bot] carrying the marker, as stamp itself
+    # matches its reviews), and this edit is the one that ticked the box: an unrelated edit does nothing. The
+    # ticker's permission below is the guard.
+    if: >-
+      github.event.issue.pull_request != null && endsWith(github.event.comment.user.login, '[bot]') && startsWith(github.event.comment.body, '<!-- stamp-actions -->')
+      && contains(github.event.comment.body, '- [x] <!-- stamp-action:shepherd -->')
+      && !contains(github.event.changes.body.from, '- [x] <!-- stamp-action:shepherd -->')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SENDER: ${{ github.event.sender.login }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          # Only someone who could merge may hand a PR on; anyone can tick a box they cannot actually save.
+          perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$SENDER/permission" --jq .permission 2>/dev/null || echo none)
+          case "$perm" in admin|maintain|write) ;; *) echo "$SENDER ($perm) cannot merge; not handing PR #$PR to shepherd"; exit 0 ;; esac
+          gh workflow run shepherd.yml -R "$GITHUB_REPOSITORY" -f pr="$PR" -f asked=true
+          echo "handed PR #$PR to shepherd for $SENDER"

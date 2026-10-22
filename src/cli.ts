@@ -16,7 +16,7 @@ import { parseArgs, type ParseArgsConfig } from "node:util";
 import { z } from "zod";
 import { notify, notifyOn, slackEscape } from "./notify.ts";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
-import { callTimeout, checkRuns, effectiveAssociation, permissionOf, TRUSTED_ASSOCIATIONS, withoutComments, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, postVerdict, reconcilePosted, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
+import { callTimeout, EVIDENCE_UNSEEN_MARKER, checkRuns, effectiveAssociation, permissionOf, TRUSTED_ASSOCIATIONS, withoutComments, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, foldSuperseded, postVerdict, reconcilePosted, publishCard, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
 import {
   DEFAULTS_DIR,
   detectOwnership,
@@ -56,13 +56,19 @@ import { egressRefusals } from "./isolated-cli.ts";
 import { advisable, assured, type Backend, combine, type Combined, review, reviewers, secondOpinionNeeded, withAdvice, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
 import { approvedOn, stackedParent, wrongBase, type StackDeps, type WrongBase } from "./stack.ts";
-import { ghStoryDeps, loadStoryEvidence, storyEvidenceRecord, type StoryEvidence } from "./stories.ts";
+import { CARD_MARKER, ticked } from "./actions.ts";
+import { evidenceSummary, ghStoryDeps, loadStoryEvidence, storyEvidenceRecord, weakenedCount, type StoryEvidence } from "./stories.ts";
 
 const VERSION = STAMP_VERSION;
 
 const STARTED = new Date().toISOString(); // stamped into every posted review so concurrent runs can order themselves
 
-const CommentEvent = z.object({ comment: z.object({ user: z.object({ login: z.string() }), author_association: z.string() }) });
+const CommentEvent = z.object({
+  action: z.string().optional(),
+  comment: z.object({ user: z.object({ login: z.string() }), author_association: z.string(), body: z.string().default("") }),
+  sender: z.object({ login: z.string() }),
+  changes: z.object({ body: z.object({ from: z.string() }).optional() }).optional(),
+});
 
 const VERDICT_OF: Record<LLMVerdict["verdict"], Verdict> = { APPROVE: "APPROVED", REFUSE: "REFUSED", ESCALATE: "ESCALATE" };
 
@@ -153,11 +159,11 @@ if (positionals[0] === "init") {
   // stamp's templates, keeping the environment, OIDC and region each was written with unless a flag changes one.
   const digest = opts.digest || existsSync(path.join(repoRoot, ".github/workflows/stamp-digest.yml"));
 
-  for (const rel of [".stamp/policy.yml", ".stamp/review-guidance.md", ".github/workflows/stamp.yml", ".github/workflows/stamp-edited.yml", ...(digest ? [".github/workflows/stamp-digest.yml"] : [])]) {
+  for (const rel of [".stamp/policy.yml", ".stamp/review-guidance.md", ".github/workflows/stamp.yml", ".github/workflows/stamp-edited.yml", ".github/workflows/stamp-actions.yml", ...(digest ? [".github/workflows/stamp-digest.yml"] : [])]) {
     const dest = path.join(repoRoot, rel);
     const src = path.join(DEFAULTS_DIR, rel.startsWith(".github") ? `templates/${path.basename(rel)}` : rel);
     const workflow = rel.startsWith(".github");
-    const ownJob = rel.endsWith("/stamp.yml") || rel.endsWith("/stamp-digest.yml"); // stamp-edited.yml only calls stamp.yml
+    const ownJob = rel.endsWith("/stamp.yml") || rel.endsWith("/stamp-digest.yml"); // stamp-edited.yml only calls stamp.yml; stamp-actions.yml holds no keys
 
     if (existsSync(dest) && !(workflow && opts.upgrade)) {
       console.log(`kept    ${rel}${workflow ? " (exists): run `stamp init --upgrade` to update it" : ""}`);
@@ -246,12 +252,21 @@ if (!prNumber) {
 // A `/stamp` comment counts only from someone who could merge. The workflow's `if` sees author_association
 // alone, which reads write access through a team, and a private org member, as CONTRIBUTOR, so the effective
 // permission is checked here, before anything changes: a comment never moves the head, so ignoring one strands nothing.
+// A tick of "Review again" on the stamp card is an edit of our own comment: the person is the sender, and the
+// box must be one this edit ticked, so an unrelated edit of the card never re-runs a review.
 if (opts.post && process.env.GITHUB_EVENT_NAME === "issue_comment" && process.env.GITHUB_EVENT_PATH) {
-  const { comment } = CommentEvent.parse(JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8")));
-  const association = effectiveAssociation(comment.author_association, () => permissionOf(repoSlug(repoRoot), comment.user.login, repoRoot));
+  const event = CommentEvent.parse(JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8")));
+  const edited = event.action === "edited";
+  const who = edited ? event.sender.login : event.comment.user.login;
+  const association = effectiveAssociation(edited ? "NONE" : event.comment.author_association, () => permissionOf(repoSlug(repoRoot), who, repoRoot));
+
+  if (edited && !(event.comment.user.login.endsWith("[bot]") && event.comment.body.startsWith(CARD_MARKER) && ticked(event.changes?.body?.from ?? "", event.comment.body).includes("rereview"))) {
+    console.log("an edit that ticked no \"Review again\" box on the stamp card; ignoring it");
+    process.exit(0);
+  }
 
   if (!TRUSTED_ASSOCIATIONS.has(association)) {
-    console.log(`/stamp from ${comment.user.login} (${association}), who cannot merge; ignoring it`);
+    console.log(`${edited ? "Review again" : "/stamp"} from ${who} (${association}), who cannot merge; ignoring it`);
     process.exit(0);
   }
 }
@@ -316,6 +331,16 @@ if (opts.post) {
   // The stale-approval invariant: no stamp approval may stand over commits it didn't review.
   // Fail-closed: if any later step crashes, the prior approval is already gone.
   dismissOwnApprovals(prNumber, me, repoRoot);
+
+  // Every way out from here (a verdict, a withdrawal skip, a crash) leaves the card showing the newest verdict.
+  // publishCard makes synchronous gh calls under the call timeout, so it runs at exit.
+  process.on("exit", () => {
+    try {
+      publishCard(prNumber, me, existsSync(path.join(repoRoot, ".github/workflows/shepherd.yml")), repoRoot);
+    } catch (e) {
+      console.error(`could not update the stamp card: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  });
 }
 
 let pr = fetchPR(prNumber, repoRoot, [me]);
@@ -473,10 +498,26 @@ if (gateVerdict === "PASSED" && policy.familiarity) {
 let stories: StoryEvidence | null = null;
 
 if (gateVerdict === "PASSED" && policy.stories) {
-  try {
-    stories = loadStoryEvidence(policy.stories, pr.headSha, pr.baseSha, ghStoryDeps(pr.repo, repoRoot, callTimeout()));
-  } catch (e) {
-    console.error(`test evidence unavailable: ${e instanceof Error ? e.message : e}`);
+  const load = (p: NonNullable<typeof policy.stories>) => {
+    try {
+      return loadStoryEvidence(p, pr.headSha, pr.baseSha, ghStoryDeps(pr.repo, repoRoot, callTimeout()));
+    } catch (e) {
+      console.error(`test evidence unavailable: ${e instanceof Error ? e.message : e}`);
+
+      return null;
+    }
+  };
+
+  stories = load(policy.stories);
+
+  // CI starts alongside this run, so its report lands after stamp gets here. Wait for a run still going,
+  // bounded like the reviewer wait. A missing run is not waited for: a workflow that skips this PR never comes.
+  const storiesUntil = Date.now() + REVIEWER_WAIT_MS;
+
+  while (stories?.status === "pending" && Date.now() < storiesUntil) {
+    console.log(`waiting for ${policy.stories.workflow} run ${stories.run.id} to upload its test evidence`);
+    await Bun.sleep(20_000);
+    stories = load(policy.stories);
   }
 }
 
@@ -574,6 +615,13 @@ if (opts["dry-run"]) {
   }
 }
 
+const weakened = weakenedCount(stories);
+
+if (verdict === "APPROVED" && weakened > 0) {
+  verdict = "ESCALATE";
+  body = `This PR's test run checks less than the base branch's: ${weakened} scenario${weakened === 1 ? "" : "s"} removed, newly skipped, or making fewer steps or assertions (the \`weakened\` findings in the test evidence report). The reviewer would approve, but a check that got weaker is a person's call: confirm the behaviour it covered was meant to change, or restore the check.\n\n${body}`;
+}
+
 // A stacked PR's approval waits on its parent: merged first, it would land the parent's code with it.
 if (verdict === "APPROVED" && pr.stack && !parentApproved(pr.repo, pr.stack)) {
   verdict = "ESCALATE";
@@ -634,6 +682,13 @@ if (opts.post) {
 
   // A verdict that went stale while posting belongs to a newer run or head: it notifies nobody.
   if (posted !== null && reconcilePosted(pr, posted, verdict, post)) {
+    // Presentation only: the verdict has posted. The card follows at exit.
+    try {
+      foldSuperseded(pr, posted, me, STARTED, repoRoot);
+    } catch (e) {
+      console.error(`could not fold older reviews: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
     const url = `${process.env.GITHUB_SERVER_URL || "https://github.com"}/${pr.repo}/pull/${pr.number}`;
     await notify(process.env.STAMP_NOTIFY_WEBHOOK, { event: "stamp.verdict", repo: pr.repo, pr: pr.number, url, title: pr.title, head_sha: pr.headSha, verdict, held: gateVerdict === "DENIED", reason: scrub(body) }, notifyOn(setting("notify_on")));
   }
@@ -763,7 +818,7 @@ function checkoutAtHead(sha: string): string {
  */
 function agentPrompt(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict): string[] {
   return [
-    `<details><summary>${branded.fix} Fix with a coding agent</summary>`,
+    `<details><summary>${branded.fix} <strong>Fix with a coding agent</strong></summary>`,
     "",
     "`````markdown",
     `Address this review of PR #${pr.number}, on head ${pr.headSha.slice(0, 7)}.`,
@@ -784,12 +839,13 @@ function agentPrompt(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdic
   ];
 }
 
+/** A collapsed section whose title carries its result, so the comment reads one line per part. */
+function section(title: string, body: string[], open = false): string[] {
+  return ["", `<details${open ? " open" : ""}><summary>${title}</summary>`, "", ...body, "", "</details>"];
+}
+
 function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed | null, opinion: Opinion | null, gates: Gate[]): string {
-  const parts = [branded.heading(verdict), "", reasoning];
-
-  if (llm?.issues.length) parts.push("", "**Issues**", ...llm.issues.map((i) => `- ${i}`));
-
-  if (llm?.notes.length) parts.push("", "**Notes** (not blocking)", ...llm.notes.map((i) => `- ${i}`));
+  const parts = [`${branded.heading(verdict)} <sub>· head \`${pr.headSha.slice(0, 7)}\`</sub>`, "", reasoning];
 
   if (llm?.next_steps) parts.push("", `**Next:** ${llm.next_steps}`);
 
@@ -797,25 +853,29 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed |
 
   if (verdict === "APPROVED" && llm?.safe_because) parts.push("", `**Safe because:** ${llm.safe_because.fact} (${llm.safe_because.evidence})`);
 
+  if (llm?.issues.length) parts.push(...section(`<strong>Issues:</strong> ${llm.issues.length}`, llm.issues.map((i) => `- ${i}`), true));
+
+  if (llm?.notes.length) parts.push(...section(`<strong>Notes:</strong> ${llm.notes.length} not blocking`, llm.notes.map((i) => `- ${i}`)));
+
   if (verdict !== "APPROVED" && llm?.issues.length) parts.push("", ...agentPrompt(pr, verdict, reasoning, llm));
 
   // Everything above is model-written. With no HTML comment in it, nothing there can pass for the markers below.
   for (let i = 0; i < parts.length; i++) parts[i] = withoutComments(parts[i]!);
+  const failed = gates.filter((g) => !g.passed).length;
+  const run = llm?.run ? summarizeRun(llm.run) : backends[0];
+
+  if (policy.stories) parts.push(...section(`<strong>Test evidence:</strong> ${stories ? evidenceSummary(stories) : "not read"}`, [`From the \`${policy.stories.artifact}\` artifact of \`${policy.stories.workflow}\`.`]));
+
   parts.push(
-    "",
-    "<details><summary>mechanics</summary>",
-    "",
-    "| gate | result |",
-    "|---|---|",
-    ...gates.map((g) => `| ${g.gate} | ${g.passed ? branded.pass : branded.fail} ${g.message} |`),
-    `| reviewer | ${llm?.run ? summarizeRun(llm.run) : backends[0]}${llm ? ` → ${llm.verdict}` : ""} |`,
-    ...(opinion ? [`| second opinion | ${opinion.run ? summarizeRun(opinion.run) : opinion.backend} → ${opinion.verdict} (${opinion.risk} risk) |`] : []),
-    "",
-    `stamp ${VERSION} · head \`${pr.headSha.slice(0, 7)}\` · base \`${pr.baseRef}@${pr.baseSha.slice(0, 7)}\`${pr.stack ? ` · stacked on #${pr.stack.parent} \`${pr.stack.parentHead.slice(0, 7)}\`` : ""} · policy \`${policySource(`origin/${pr.defaultBranch}`).policy}\` · risk ${llm?.risk ?? "n/a"}`,
-    "</details>",
+    ...section(`<strong>Gates:</strong> ${branded.pass} ${gates.length - failed}${failed ? ` · ${branded.fail} ${failed}` : ""}`, ["| gate | result |", "|---|---|", ...gates.map((g) => `| ${g.gate} | ${g.passed ? branded.pass : branded.fail} ${g.message} |`)]),
+    ...section(`<strong>Reviewer:</strong> ${run}${llm ? ` → ${llm.verdict}` : ""}${opinion ? ` · second opinion → ${opinion.verdict}` : ""}`, [
+      ...(opinion ? [`Second opinion: ${opinion.run ? summarizeRun(opinion.run) : opinion.backend} → ${opinion.verdict} (${opinion.risk} risk)`, ""] : []),
+      `stamp ${VERSION} · head \`${pr.headSha.slice(0, 7)}\` · base \`${pr.baseRef}@${pr.baseSha.slice(0, 7)}\`${pr.stack ? ` · stacked on #${pr.stack.parent} \`${pr.stack.parentHead.slice(0, 7)}\`` : ""} · policy \`${policySource(`origin/${pr.defaultBranch}`).policy}\` · risk ${llm?.risk ?? "n/a"}`,
+    ]),
     runMarker(STARTED),
     // A delta review records the parent's head as its base, so retention never keeps it on the whole PR's diff.
     reviewedMarker(pr.headSha, pr.stack?.parentHead ?? pr.baseSha),
+    ...(verdict === "APPROVED" && policy.stories && stories?.status !== "ok" ? [EVIDENCE_UNSEEN_MARKER] : []),
   );
 
   return parts.join("\n").replace(/!\[([^\]]*)\]\(/g, "[image: $1]("); // no auto-fetched images: a markdown image is an exfil channel

@@ -58,7 +58,7 @@ test("the bundled policy denies only stamp's own policy and flags the sensitive 
   expect(denyCategories(bundled, [".stamp/policy.yml"])).toEqual(["stamp_policy"]);
 
   // stamp's workflows set variables that override the policy, so they are gate inputs too.
-  for (const wf of ["stamp.yml", "stamp-edited.yml", "stamp-digest.yml"]) expect(denyCategories(bundled, [`.github/workflows/${wf}`])).toEqual(["stamp_policy"]);
+  for (const wf of ["stamp.yml", "stamp-edited.yml", "stamp-digest.yml", "stamp-actions.yml"]) expect(denyCategories(bundled, [`.github/workflows/${wf}`])).toEqual(["stamp_policy"]);
   expect(denyCategories(bundled, [".github/workflows/ci.yml"])).toEqual([]);
   expect(scrutinyFlags(bundled, ["src/auth/session.ts", "pnpm-lock.yaml"]).map((s) => s.name)).toEqual(["auth", "deps_toolchain"]);
 
@@ -845,7 +845,7 @@ describe("approval retention predicate", () => {
 describe("approval retention flow", () => {
   // SAFETY: tryRetainApproval only hands `pr` to the injected deps, which read repo, number and SHAs alone.
   const livePr = { repo: "o/r", number: 7, headSha: "h2", baseSha: "b2" } as PR;
-  const standing = { reviewId: 1, approvedHead: "h1", approvedBase: "b1" };
+  const standing = { reviewId: 1, approvedHead: "h1", approvedBase: "b1", evidenceUnseen: false };
 
   const run = (opts: { gates: boolean; holds: boolean; diffs?: [string, string] }) => {
     const calls: string[] = [];
@@ -1136,7 +1136,11 @@ describe("workflow template", () => {
     const reviews = squash(z.string().parse(wf.jobs.review.if));
     const group = squash(z.string().parse(wf.concurrency.group));
     // A comment joins the review's group only from a known collaborator: anyone else's /stamp waits on stamp's permission check, in its own group.
-    const trusted = reviews.replace("startsWith(github.event.comment.body, '/stamp')", `startsWith(github.event.comment.body, '/stamp') && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)`);
+    // A tick of "Review again" carries no ticker's association, so it never joins the group.
+    const tick = /\s*\|\| \(github\.event_name == 'issue_comment' && github\.event\.action == 'edited'.*$/;
+    const trusted = reviews.replace(tick, "").replace("startsWith(github.event.comment.body, '/stamp')", `startsWith(github.event.comment.body, '/stamp') && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)`);
+
+    expect(reviews).toMatch(tick);
 
     expect(trusted).not.toBe(reviews);
     expect(group).toContain(`\${{ (${trusted}) && 'review' || github.run_id }}`);
@@ -1161,6 +1165,26 @@ describe("workflow template", () => {
     expect(edited.jobs.review).toMatchObject({ uses: "./.github/workflows/stamp.yml", secrets: "inherit" });
     expect(condition).toContain("github.event.changes.base != null");
     expect(condition).toContain("contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->')");
+  });
+
+  test("a tick on the stamp card acts only when that edit ticked the box, and only stamp-actions.yml can dispatch", () => {
+    const wf = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp.yml"), "utf8"));
+    const actions = parseYaml(readFileSync(path.resolve(import.meta.dir, "../templates/stamp-actions.yml"), "utf8"));
+    const reviews = z.string().parse(wf.jobs.review.if).replace(/\s+/g, " ");
+    const handoff = z.string().parse(actions.jobs.shepherd.if).replace(/\s+/g, " ");
+
+    expect(wf.on.issue_comment.types).toEqual(["created", "edited"]);
+    expect(reviews).toContain("github.event.action == 'created' && github.event.issue.pull_request != null && startsWith(github.event.comment.body, '/stamp')");
+    expect(reviews).toContain("contains(github.event.comment.body, '- [x] <!-- stamp-action:rereview -->') && !contains(github.event.changes.body.from, '- [x] <!-- stamp-action:rereview -->')");
+
+    // A custom App posts the card as <app>[bot], so neither workflow names github-actions[bot].
+    for (const condition of [reviews, handoff]) expect(condition).toContain("endsWith(github.event.comment.user.login, '[bot]') && startsWith(github.event.comment.body, '<!-- stamp-actions -->')");
+
+    expect(`${reviews} ${handoff}`).not.toContain("'github-actions[bot]'");
+    expect(handoff).toContain("!contains(github.event.changes.body.from, '- [x] <!-- stamp-action:shepherd -->')");
+    expect(wf.permissions.actions).toBe("read");
+    expect(actions.permissions).toEqual({ actions: "write" });
+    expect(actions.jobs.shepherd.steps.some((s: { uses?: string }) => s.uses?.startsWith("actions/checkout"))).toBe(false);
   });
 
   test("stamp-edited.yml grants every permission stamp.yml asks for, so the called workflow starts", () => {
@@ -1309,7 +1333,7 @@ describe("standing approval", () => {
 
   test("reads the head from our marker, not commit_id, which GitHub moves forward on a base update", () => {
     const carried = review({ commit_id: head }); // approved `older`; GitHub now reports the live head
-    expect(standingApproval([carried], head, "github-actions[bot]")).toEqual({ reviewId: 1, approvedHead: older, approvedBase: base });
+    expect(standingApproval([carried], head, "github-actions[bot]")).toEqual({ reviewId: 1, approvedHead: older, approvedBase: base, evidenceUnseen: false });
   });
 
   test.each([
