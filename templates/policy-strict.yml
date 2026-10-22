@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://unpkg.com/@jagreehal/stamp@0.8.0/.stamp/policy.schema.json
+# yaml-language-server: $schema=https://unpkg.com/@jagreehal/stamp@0.9.0/.stamp/policy.schema.json
 # stamp merge-gate policy, strict: `stamp init --strict` writes this one.
 # Auth, secrets, migrations, infrastructure, billing, public API and toolchain
 # changes always go to a human.
