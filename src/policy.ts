@@ -96,7 +96,7 @@ export const PolicySchema = z
       .optional()
       .describe("Contract ceilings for AGENT_APPROVALS.md grants. Absent = no folder delegation."),
     familiarity: FamiliarityPolicySchema.optional().describe("Judgment-layer only; never a gate. Absent = no familiarity signal computed."),
-    stories: StoriesPolicySchema.optional().describe("Judgment-layer only; never a gate. Absent = no test evidence read from CI."),
+    stories: StoriesPolicySchema.optional().describe("Judgment-layer, never a gate; a scenario the report measures checking less than the base branch holds an approval for a person. Absent = no test evidence read from CI."),
     scrutiny: z.record(z.string(), z.object({ description: z.string().optional(), paths: z.array(z.string()), instruction: z.string() })).default({}).describe("Paths the reviewer looks at harder, with what to check. Never changes a gate."),
     reviewer_bots: z.array(z.string()).default([]).describe("Review bots whose fresh 👀 reaction stamp briefly waits on."),
     long_lived_branches: z.array(z.string().min(1)).default(["main", "master", "develop", "release", "release/*", "staging"]).describe("Long-lived branches (globs): a PR whose commits mostly sit on one of these, other than its base, was opened against the wrong base."),

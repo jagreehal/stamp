@@ -241,7 +241,7 @@ export function repoTools(root: string) {
   };
 }
 
-/** What one review cost and did: the evidence bundle carries it, and the mechanics table shows its summary. */
+/** What one review cost and did: the evidence bundle carries it, and the review's Reviewer line shows its summary. */
 export type RunRecord = {
   model: string;
   steps: number;

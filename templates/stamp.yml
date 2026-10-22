@@ -12,9 +12,10 @@
 # The `vars.*` lines further down are optional overrides of the policy, for experiments; leave them unset.
 name: stamp
 on:
-  # `/stamp` in a PR comment re-runs the review: the fix loop otherwise needs an empty commit.
+  # `/stamp` in a PR comment re-runs the review: the fix loop otherwise needs an empty commit. So does ticking
+  # "Review again" on the stamp card, which edits that comment.
   issue_comment:
-    types: [created]
+    types: [created, edited]
   pull_request:
     # `converted_to_draft` and `unlabeled` withdraw a standing approval: the draft/label skip paths retract it.
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
@@ -29,8 +30,9 @@ concurrency:
   # had retracted the approval, leaving no verdict coming. The condition below is the job's `if`,
   # verbatim, except that a comment joins the group only from an OWNER, MEMBER or COLLABORATOR: anyone
   # else's `/stamp` runs in a group of its own, so it cannot cancel a review before stamp has checked
-  # their permission. A test keeps them in step. Two runs that do overlap order themselves by run marker.
-  group: stamp-${{ github.event.pull_request.number || github.event.issue.number }}-${{ ((github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null || (github.event.changes.body != null && github.event.sender.login == github.event.pull_request.user.login && contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->')))) || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && startsWith(github.event.comment.body, '/stamp') && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))) && 'review' || github.run_id }}
+  # their permission. A tick of "Review again" also runs in a group of its own: the ticker's permission is not in
+  # the event, so stamp checks it before anything changes. A test keeps them in step. Two runs that do overlap order themselves by run marker.
+  group: stamp-${{ github.event.pull_request.number || github.event.issue.number }}-${{ ((github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null || (github.event.changes.body != null && github.event.sender.login == github.event.pull_request.user.login && contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->')))) || (github.event_name == 'issue_comment' && github.event.action == 'created' && github.event.issue.pull_request != null && startsWith(github.event.comment.body, '/stamp') && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))) && 'review' || github.run_id }}
   cancel-in-progress: true # a newer head supersedes the review in flight
 
 permissions:
@@ -54,8 +56,11 @@ jobs:
     # write access through a team, and a private org member, as CONTRIBUTOR.
     if: >-
       (github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null || (github.event.changes.body != null && github.event.sender.login == github.event.pull_request.user.login && contains(github.event.pull_request.body, '<!-- shepherd:review-changes -->'))))
-      || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null
+      || (github.event_name == 'issue_comment' && github.event.action == 'created' && github.event.issue.pull_request != null
           && startsWith(github.event.comment.body, '/stamp'))
+      || (github.event_name == 'issue_comment' && github.event.action == 'edited' && github.event.issue.pull_request != null
+          && endsWith(github.event.comment.user.login, '[bot]') && startsWith(github.event.comment.body, '<!-- stamp-actions -->') && contains(github.event.comment.body, '- [x] <!-- stamp-action:rereview -->')
+          && !contains(github.event.changes.body.from, '- [x] <!-- stamp-action:rereview -->'))
     runs-on: ubuntu-latest
     timeout-minutes: 20 # a hung model call must not burn a runner for six hours; a killed run is fail-closed (the approval is already retracted)
     env:
