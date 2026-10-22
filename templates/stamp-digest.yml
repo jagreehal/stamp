@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      STAMP_VERSION: 0.8.0 # pinned: `stamp init` writes the version it installs
+      STAMP_VERSION: 0.9.0 # pinned: `stamp init` writes the version it installs
     steps:
       - uses: actions/checkout@v4
         with:
