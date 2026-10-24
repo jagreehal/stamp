@@ -847,13 +847,16 @@ function section(title: string, body: string[], open = false): string[] {
 function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed | null, opinion: Opinion | null, gates: Gate[]): string {
   const parts = [`${branded.heading(verdict)} <sub>· head \`${pr.headSha.slice(0, 7)}\`</sub>`, "", reasoning];
 
+  // Risk sits under the verdict: a reader triages by it.
+  if (llm && verdict !== "ERROR") parts.push("", `**Merge risk:** ${{ low: "🟢", medium: "🟡", high: "🔴" }[llm.risk]} ${llm.risk}`);
+
   if (llm?.next_steps) parts.push("", `**Next:** ${llm.next_steps}`);
 
   if (llm?.change_summary) parts.push("", `**What changed:** ${llm.change_summary}`);
 
   if (verdict === "APPROVED" && llm?.safe_because) parts.push("", `**Safe because:** ${llm.safe_because.fact} (${llm.safe_because.evidence})`);
 
-  if (llm?.issues.length) parts.push(...section(`<strong>Issues:</strong> ${llm.issues.length}`, llm.issues.map((i) => `- ${i}`), true));
+  if (llm?.issues.length) parts.push(...section(`<strong>Issues:</strong> ${llm.issues.length}`, llm.issues.map((i, n) => `${n + 1}. ${i}`), true)); // numbered, so a reply can name "issue 2"
 
   if (llm?.notes.length) parts.push(...section(`<strong>Notes:</strong> ${llm.notes.length} not blocking`, llm.notes.map((i) => `- ${i}`)));
 

@@ -1101,6 +1101,9 @@ test("--policy-dir reads .stamp/ files from that directory first, so a policy ca
     useLocalPolicy(dir);
     expect(readTrusted(dir, ".stamp/steering.md")).toBe("local steering");
     expect(readTrusted(dir, ".stamp/review-guidance.md")).toContain("Showstoppers"); // absent locally: the bundled default
+    expect(readTrusted(dir, ".stamp/review-guidance.md")).toContain("A demonstrable bug in code the PR adds");
+    expect(readTrusted(dir, ".stamp/review-guidance.md")).toContain("A test that cannot fail");
+    expect(readTrusted(dir, ".stamp/review-guidance.md")).toContain("A fix that came undone");
   } finally {
     useLocalPolicy(null);
   }

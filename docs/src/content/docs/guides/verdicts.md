@@ -38,6 +38,8 @@ Set `STAMP_NOTIFY_WEBHOOK` to hear about refusals, escalations and errors as the
 
 An approval names the one fact the change is safe because of, under **Safe because**, with how far the reviewer checked it: `claimed` (it believes it), `cited` (it read the `file:line`), `traced` (it walked the failure path and it cannot reach) or `tested` (a test or story in the evidence exercises it). A high-risk approval that names no fact, or only a claimed one, becomes `ESCALATE`, because a belief is not assurance. The fact also lands in the evidence bundle, so you can audit what an approval rested on when it turns out wrong.
 
+Every review shows the merge risk under the verdict and numbers its issues, so a reply can name one. Each issue opens with `file:line` and a title, and a bug names the input, the actual and expected result, and the fix. stamp refuses a bug it can show on an ordinary input, a change that brings back a problem a resolved thread named, and a new test the bug in the same diff passes.
+
 Each non-approval carries a collapsed **Fix with a coding agent** block. It holds the verdict, the issues and the requested next step as one prompt you can copy, with the rule that weakening a test or a lint rule to clear the review counts as a refusal. Agents write most of the PRs stamp sees, so the fix loop starts there.
 
 Comment `/stamp` on a PR to re-run the review without an empty commit. stamp acts on comments from people with write access only: OWNER, MEMBER and COLLABORATOR, or anyone the permission API says can push, which covers access through a team and private org members.

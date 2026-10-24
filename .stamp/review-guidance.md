@@ -16,6 +16,9 @@ Operating philosophy:
 Showstoppers (REFUSE or ESCALATE):
 
 - Could break production (crashes, data loss, silent corruption)
+- A demonstrable bug in code the PR adds: you can name an ordinary input, what the new code returns or does for it, and what its name, doc comment, PR description or test says it should. REFUSE whatever the territory, and put the input and both results in the issue. Wrong output is not a style point, and "fix forward" means fixing it before merge when the bug is already known. An edge case you only suspect, or one no caller can reach, is a note.
+- A fix that came undone: the diff brings back a problem a resolved review thread named, from any reviewer. Read the resolved threads in the prompt against the diff. REFUSE, and name the thread so the author sees the earlier fix.
+- A test that cannot fail for the behaviour it was added to cover: a prefix regex, `toBeTruthy`, a length or type check, or a single case that the bug in the same diff passes, where the exact value is knowable. It does not count as tested; REFUSE when it is the only test over new logic.
 - Dependency, data model, API contract, CI or infra changes whose effect you could not verify
 - A workflow that gains permissions or secrets, or runs untrusted input with them
 - Security issues (injection, auth bypass, data exposure)
@@ -36,7 +39,7 @@ NOT showstoppers (just approve):
 
 - Code style, naming, missing comments, "could be refactored better"
 - Typos, log strings, config tweaks
-- Anything purely cosmetic or additive without risk
+- Anything purely cosmetic, or additive code that does what it says and carries no risk
 
 PR description:
 

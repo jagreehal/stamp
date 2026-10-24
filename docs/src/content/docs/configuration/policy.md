@@ -164,7 +164,7 @@ branding:
     pass: 🟢
 ```
 
-The keys are every glyph stamp posts: `APPROVED` ✅, `REFUSED` ❌, `ESCALATE` 🙋, `ERROR` ⚠️, `pass` ✓ and `fail` ✗ (the gate table and the console), and `fix` 🤖 (the "Fix with a coding agent" summary). `avatar` must be an `https://` URL. stamp escapes `name`, `avatar` and every glyph, so a policy value can't add markup. A glyph is at most 16 characters with no whitespace.
+The keys are every glyph stamp posts: `APPROVED` ✅, `REFUSED` ❌, `ESCALATE` 🙋, `ERROR` ⚠️, `pass` ✓ and `fail` ✗ (the gate table and the console), and `fix` 🤖 (the "Fix with a coding agent" summary). The merge-risk glyphs (🟢 🟡 🔴) are fixed. `avatar` must be an `https://` URL. stamp escapes `name`, `avatar` and every glyph, so a policy value can't add markup. A glyph is at most 16 characters with no whitespace.
 
 Stamp finds its own earlier reviews through the hidden `<!-- stamp-run:… -->` and `<!-- stamp-reviewed:… -->` markers, never the header, so branding doesn't affect retraction or approval retention. Tools that look for stamp's review should match `<!-- stamp-run:` too, not the heading text.
 
