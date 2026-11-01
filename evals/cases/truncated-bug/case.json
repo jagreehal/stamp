@@ -1,0 +1,14 @@
+{
+  "title": "chore: regenerate fixtures and tidy price rounding",
+  "body": "Regenerates the fixture data and touches rounding.",
+  "base": {
+    "fixtures/data.csv": "id,value\n",
+    "src/café.ts": "export const round = (x: number) => Math.round(x * 100) / 100;\n"
+  },
+  "head": {
+    "fixtures/data.csv": { "repeat": "1000,row of regenerated fixture data padding the diff past the prompt limit", "times": 5600 },
+    "src/café.ts": "export const round = (x: number) => Math.floor(x * 100) / 100;\n"
+  },
+  "expect": "block",
+  "bugs": [{ "id": "floor-not-round", "file": "café.ts", "match": ["floor", "round(ing)? down", "truncat"] }]
+}

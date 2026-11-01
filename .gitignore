@@ -7,3 +7,4 @@ node_modules
 # Documentation build output
 docs/.astro/
 docs/dist/
+evals/runs/

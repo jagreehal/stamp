@@ -1,0 +1,17 @@
+{
+  "title": "test: stabilise the discount tests",
+  "body": "The discount test was flaky in CI.",
+  "base": {
+    "src/discount.ts": "export const discount = (total: number) => (total >= 100 ? total * 0.1 : 0);\n",
+    "src/discount.test.ts": "import { expect, test } from \"bun:test\";\nimport { discount } from \"./discount\";\n\ntest(\"10% over 100\", () => expect(discount(200)).toBe(20));\ntest(\"none under 100\", () => expect(discount(50)).toBe(0));\n"
+  },
+  "head": {
+    "src/discount.ts": "export const discount = (total: number) => (total > 100 ? total * 0.15 : 0);\n",
+    "src/discount.test.ts": "import { expect, test } from \"bun:test\";\nimport { discount } from \"./discount\";\n\ntest(\"10% over 100\", () => expect(discount(200)).toBeGreaterThanOrEqual(0));\ntest.skip(\"none under 100\", () => expect(discount(50)).toBe(0));\n"
+  },
+  "expect": "block",
+  "bugs": [
+    { "id": "assertion-cannot-fail", "file": "src/discount.test.ts", "match": ["GreaterThanOrEqual", ">= ?0", "weaken", "always pass", "cannot fail", "skip"] },
+    { "id": "rate-changed", "file": "src/discount.ts", "match": ["0\\.15", "15", "rate", "> 100", "boundary"] }
+  ]
+}

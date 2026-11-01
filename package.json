@@ -25,6 +25,7 @@
   },
   "scripts": {
     "review": "bun run src/cli.ts",
+    "eval": "bun run src/eval.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "check": "bun run lint && bun run typecheck && bun test",

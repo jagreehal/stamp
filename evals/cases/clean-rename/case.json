@@ -1,0 +1,12 @@
+{
+  "title": "refactor: name the running sum in total()",
+  "body": "Renames a local variable for readability. No behaviour change.",
+  "base": {
+    "src/total.ts": "export function total(xs: number[]): number {\n  let a = 0;\n  for (const x of xs) a += x;\n  return a;\n}\n",
+    "src/total.test.ts": "import { expect, test } from \"bun:test\";\nimport { total } from \"./total\";\n\ntest(\"sums\", () => expect(total([1, 2, 3])).toBe(6));\n"
+  },
+  "head": {
+    "src/total.ts": "export function total(xs: number[]): number {\n  let sum = 0;\n  for (const x of xs) sum += x;\n  return sum;\n}\n"
+  },
+  "expect": "approve"
+}

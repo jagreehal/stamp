@@ -1,0 +1,7 @@
+{
+  "title": "docs: explain the retry setting",
+  "body": "Adds a README section on RETRY_LIMIT.",
+  "base": { "README.md": "# Queue\n\nA small job queue.\n", "src/queue.ts": "export const RETRY_LIMIT = 3;\n" },
+  "head": { "README.md": "# Queue\n\nA small job queue.\n\n## Retries\n\nA failed job runs again up to `RETRY_LIMIT` times (3).\n" },
+  "expect": "approve"
+}

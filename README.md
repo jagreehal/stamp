@@ -1,5 +1,7 @@
 # Stamp
 
+<p align="center"><img src="assets/stamp.jpg" alt="Stamp: a cheerful reviewer pressing a STAMPED rubber stamp onto a page" width="480"></p>
+
 Stamp reviews pull requests and posts GitHub approvals under your team's policy. It runs deterministic gates before a scoped model review. You decide when to merge.
 
 Use it when you want eligible PRs to receive an approval while protected changes, missing assurance and review findings reach a person. Each run records the policy and evidence behind its verdict.
@@ -55,5 +57,7 @@ A model cannot override a failed gate. Stamp reads policy from the default branc
 bun install
 bun run check
 ```
+
+`bun run eval` reviews and scores the [review benchmark](evals/README.md); judge a guidance, prompt or model change by its scores.
 
 For the docs site, run `bun install --cwd docs --frozen-lockfile`, then `bun run docs:dev`. Run `bun run docs:build` to validate and build it. Read [documentation maintenance](docs/src/content/docs/contributing/docs.md), [contributor contracts](AGENTS.md) and [third-party credits](THIRD_PARTY_NOTICES.md).
