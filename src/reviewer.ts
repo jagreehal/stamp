@@ -5,7 +5,8 @@ import { CLI_CONTROL, CLI_OUTPUT, CLI_ROOT, isolatedCli, type EgressDecisions } 
 import type { PR } from "./github.ts";
 import { formatFamiliarity, type AuthorFamiliarity } from "./familiarity.ts";
 import type { Gate, Ownership, ScrutinyFlag } from "./policy.ts";
-import { reviewWithTools, type RunRecord } from "./llm.ts";
+import { formatLeads, type Leads } from "./leads.ts";
+import { missingLines, reviewWithTools, type RunRecord, type Unread } from "./llm.ts";
 import { formatSignals, type Signals } from "./signals.ts";
 import { formatStoryReport, formatStoryStatus, type StoryEvidence } from "./stories.ts";
 
@@ -74,9 +75,23 @@ export function sanitize(s: string | null | undefined, max: number): string {
 
   return s
     .replace(/[^\P{C}\n\t]/gu, "")
-    .replace(/---\s*(BEGIN|END) UNTRUSTED CONTENT\s*---/gi, "[sentinel removed]")
+    // Any whitespace but a line break (Unicode spaces included): a match never spans lines, so the text keeps its
+    // lines one for one and every line number counted on the raw diff (`DiffCut.shown`, read_diff offsets) holds.
+    .replace(/---[^\S\r\n]*(BEGIN|END)[^\S\r\n]+UNTRUSTED[^\S\r\n]+CONTENT[^\S\r\n]*---/giu, "[sentinel removed]")
     .slice(0, max);
 }
+
+/**
+ * Untrusted Markdown made inert for a page that renders Markdown and HTML (a posted review, the Actions step summary).
+ * A zero-width space goes after every `<` that could open a tag and between `!` and `[`: HTML needs a letter, `/`,
+ * `!` or `?` straight after `<`, and an image needs `![`, so nothing on the page fetches a URL (an auto-fetched image
+ * is an exfil channel: its URL can carry what the model read). No parsing decides what is code, so no escaped backtick
+ * or unclosed span can make the renderer and this function disagree, and code still reads `Map<K, V>`.
+ */
+export const inert = (s: string) => s.replace(/<(?=[A-Za-z/!?])/g, "<\u200B").replace(/!\[/g, "!\u200B[");
+
+/** A Markdown fence longer than any backtick run in `text`, so the text cannot close it early. */
+export const fenceFor = (text: string) => "`".repeat(Math.max(5, ...[...text.matchAll(/`+/g)].map((m) => m[0].length + 1)));
 
 /** Untrusted text that must stay on one line: file names can hold newlines, which would forge lines of their own. */
 export const oneLine = (s: string | null | undefined, max: number) => sanitize(s, max).replace(/[\n\t\r]+/g, " ");
@@ -97,13 +112,154 @@ const TRAILER_RE = /^(Shepherd(?:-Lens)?):\s*(\S+)\s*$/gm;
 
 const DIFF_MAX = 400_000;
 
-/** When the diff is cut, the first file the prompt does not show whole, and how many follow it. */
-export function diffCut(diff: string): { first: string; more: number } | null {
-  if (diff.length <= DIFF_MAX) return null;
-  const headers = [...diff.matchAll(/^diff --git a\/(.+?) b\//gm)];
-  const shown = headers.filter((h) => (h.index ?? 0) < DIFF_MAX).length;
+/** `shown`: the complete lines of `first`'s section the prompt carries, which count as read. */
+export type DiffCut = { first: string; more: number; omitted: Map<string, string>; shown: number };
 
-  return { first: headers[shown - 1]?.[1] ?? "(unknown)", more: headers.length - shown };
+/** A C-quoted git path (`"a/t\\tb"`, octal UTF-8 bytes) and what follows it, or null when it is not one. */
+function unquote(s: string): { path: string; rest: string } | null {
+  if (!s.startsWith('"')) return null;
+  const bytes: number[] = [];
+  const named = new Map([["a", 7], ["b", 8], ["t", 9], ["n", 10], ["v", 11], ["f", 12], ["r", 13], ['"', 34], ["\\", 92]]);
+
+  for (let i = 1; i < s.length; i++) {
+    const c = s[i]!;
+
+    if (c === '"') return { path: new TextDecoder().decode(new Uint8Array(bytes)), rest: s.slice(i + 1) };
+
+    if (c !== "\\") {
+      bytes.push(...new TextEncoder().encode(c));
+      continue;
+    }
+
+    const octal = /^[0-7]{3}/.exec(s.slice(i + 1));
+
+    if (octal) {
+      bytes.push(parseInt(octal[0], 8));
+      i += 3;
+    } else {
+      const e = named.get(s[i + 1] ?? "");
+
+      if (e === undefined) return null;
+      bytes.push(e);
+      i += 1;
+    }
+  }
+
+  return null;
+}
+
+/** A path as git writes it on a line of its own: C-quoted or bare, with one trailing tab git may add dropped. */
+const linePath = (v: string, prefix: string) => {
+  const p = unquote(v)?.path ?? v.replace(/\t$/, "");
+
+  return p.startsWith(prefix) ? p.slice(prefix.length) : p;
+};
+
+/**
+ * The path a file's diff section names. Lines that hold one path each come first (`rename from`, `copy from`,
+ * `--- a/`, `+++ b/`), since a header holds two and a path may contain " b/". The header is read only when it
+ * cannot be split two ways: quoted, or two equal halves. Otherwise null: the caller keys the section by its raw
+ * header, so an ambiguous file is still tracked.
+ */
+export function diffSectionPath(section: string): string | null {
+  const [header = "", ...lines] = section.split("\n");
+  // Only the lines before the first hunk: inside one, a deleted "-- a/x" reads as "--- a/x".
+  const end = lines.findIndex((l) => l.startsWith("@@"));
+  const meta = end < 0 ? lines : lines.slice(0, end);
+
+  for (const [lead, prefix] of [["rename from ", ""], ["copy from ", ""], ["--- ", "a/"], ["+++ ", "b/"]] as const) {
+    const v = meta.find((l) => l.startsWith(lead))?.slice(lead.length);
+
+    if (v !== undefined && v !== "/dev/null") return linePath(v, prefix);
+  }
+
+  const rest = header.slice("diff --git ".length);
+  const quoted = unquote(rest);
+
+  if (quoted) return quoted.path.replace(/^a\//, "");
+  const n = (rest.length - 5) / 2;
+
+  return Number.isInteger(n) && rest.startsWith("a/") && rest.slice(2, 2 + n) === rest.slice(5 + n) && rest.slice(2 + n, 5 + n) === " b/" ? rest.slice(2, 2 + n) : null;
+}
+
+/**
+ * When the diff is cut, the first file the prompt does not show whole, how many follow it, and the diff of each
+ * of those files (`omitted`), which read_diff serves and an approval must have read. Keyed by path in a Map, so no
+ * path (`__proto__`) collides with an object's own keys; a section whose path is ambiguous is keyed by its header,
+ * and a key already taken gets a ` (#n)` suffix, so no section overwrites another.
+ */
+export function diffCut(diff: string): DiffCut | null {
+  if (diff.length <= DIFF_MAX) return null;
+  const headers = [...diff.matchAll(/^diff --git .*$/gm)];
+  const shown = headers.filter((h) => (h.index ?? 0) < DIFF_MAX).length;
+  const omitted = new Map<string, string>();
+
+  headers.forEach((h, i) => {
+    if (i < shown - 1 || shown === 0) return;
+    const section = diff.slice(h.index, headers[i + 1]?.index ?? diff.length);
+    const name = diffSectionPath(section) ?? h[0];
+    let key = name;
+
+    for (let n = 2; omitted.has(key); n++) key = `${name} (#${n})`;
+    omitted.set(key, section);
+  });
+
+  // The prompt shows the cut file's section up to DIFF_MAX: every line ending before it reached the reviewer whole.
+  const cutAt = headers[shown - 1]?.index ?? DIFF_MAX;
+
+  return { first: omitted.keys().next().value ?? "(unknown)", more: headers.length - shown, omitted, shown: diff.slice(cutAt, DIFF_MAX).split("\n").length - 1 };
+}
+
+/**
+ * The omitted sections as read_diff serves them, sanitized as the in-prompt diff is: control characters out and a
+ * forged untrusted-content sentinel neutralized. Newlines and tabs stay, so line offsets and `shown` still hold.
+ */
+export function readableSections(cut: DiffCut): Map<string, string> {
+  return new Map(
+    [...cut.omitted].map(([p, d]) => {
+      const clean = sanitize(d, Infinity);
+
+      // Fail closed: a section whose lines moved would credit reads of lines the reviewer never received.
+      if (clean.split("\n").length !== d.split("\n").length) throw new Error(`sanitizing the diff of ${JSON.stringify(p)} changed its line count`);
+
+      return [p, clean];
+    }),
+  );
+}
+
+/** One line per omitted section, largest first: its path, diff line count, and the lines it adds and removes. */
+export function diffIndex(cut: DiffCut): string[] {
+  return [...cut.omitted]
+    .map(([path, d]) => {
+      const lines = d.split("\n");
+      // Hunk lines only: before the first @@, "+++ b/x" is the file header; after it, "+++ x" is an added "++ x".
+      const body = lines.slice(Math.max(0, lines.findIndex((l) => l.startsWith("@@"))));
+      const count = (c: string) => body.filter((l) => l.startsWith(c)).length;
+
+      return { path, n: lines.length, text: `${oneLine(path, 300)}: ${lines.length} diff lines, +${count("+")} -${count("-")}` };
+    })
+    .sort((a, b) => b.n - a.n)
+    .map((e) => e.text);
+}
+
+/**
+ * An approval over a cut diff stands only when every reviewer that approved read each omitted file's diff whole.
+ * A CLI backend reports no reads, so it cannot show that: it escalates too. Never loosens a verdict.
+ */
+export function readAll(outcome: Combined, cut: DiffCut | null, approvers: Reviewed[]): Combined {
+  if (outcome.verdict !== "APPROVE" || !cut) return outcome;
+  // A cut diff whose omitted files could not be found: nothing shows the reviewer saw the rest, so it fails closed.
+  const whole = (): Unread[] => [...cut.omitted].map(([path, d]) => ({ path, lines: missingLines(new Set(path === cut.first ? Array.from({ length: cut.shown }, (_, i) => i) : []), d.split("\n").length) }));
+  const found = cut.omitted.size ? approvers.flatMap((r) => r.unread ?? whole()) : [{ path: "(the omitted part of the diff, which names no file stamp could find)", lines: "all" }];
+  const unread = [...new Map(found.map((u) => [JSON.stringify(u), u])).values()];
+
+  if (!unread.length) return outcome;
+  const { llm } = outcome;
+
+  return {
+    verdict: "ESCALATE",
+    llm: { ...llm, reasoning: `Approved without reading the diff the prompt left out: ${unread.map((u) => `\`${oneLine(u.path, 300).replaceAll("`", "'")}\` (diff lines ${u.lines})`).join(", ")}. ${llm.reasoning}`, next_steps: llm.next_steps || "A human reviews the files the reviewer did not read." },
+  };
 }
 
 export type ReviewInput = {
@@ -118,6 +274,7 @@ export type ReviewInput = {
   signals?: Signals | null;
   familiarity?: AuthorFamiliarity | null;
   stories?: StoryEvidence | null;
+  leads?: Leads | null;
 };
 
 // Review agents that post through the PR author's own account (shepherd's swarm, for one) open
@@ -206,7 +363,7 @@ export function buildPrompt(input: ReviewInput): string {
 
   if (cut)
     constraints.push(
-      `Diff truncated: the prompt shows the diff up to ${oneLine(cut.first, 300)}, which is cut, and omits ${cut.more} file(s) after it. Read those with the tools before you APPROVE, or ESCALATE.`,
+      `Diff truncated: the prompt shows the diff up to ${oneLine(cut.first, 300)}, which is cut, and omits ${cut.more} file(s) after it. Read each of those files' diff whole with read_diff (where offered) before you APPROVE: an approval over unread diff escalates.`,
     );
 
   if (pr.baseRef !== pr.defaultBranch)
@@ -260,6 +417,10 @@ export function buildPrompt(input: ReviewInput): string {
     ...reactions,
     "",
     ...(input.stories?.status === "ok" ? [...formatStoryReport(input.stories.report, oneLine), ""] : []),
+    ...(input.leads && formatLeads(input.leads, (n) => oneLine(n, 200)).length
+      ? ["Impact leads (stamp grepped the checkout for these; they say where to look and never replace reading the diff):", ...formatLeads(input.leads, (n) => oneLine(n, 200)).map((l) => line(l)), ""]
+      : []),
+    ...(cut ? ["Diff sections the prompt leaves out, for read_diff (each line count is its last offset):", ...diffIndex(cut).map((l) => line(l)), ""] : []),
     "Diff:",
     "```diff",
     sanitize(pr.diff, DIFF_MAX),
@@ -269,7 +430,7 @@ export function buildPrompt(input: ReviewInput): string {
 }
 
 /** A verdict, with the run record when the api backend produced it. */
-export type Reviewed = LLMVerdict & { run?: RunRecord; egress?: EgressDecisions };
+export type Reviewed = LLMVerdict & { run?: RunRecord; egress?: EgressDecisions; unread?: Unread[] };
 
 export type Opinion = Reviewed & { backend: Backend };
 
@@ -483,6 +644,8 @@ function viaCodex(system: string, prompt: string, repoRoot: string, verbose: boo
 }
 
 async function viaModel(modelId: string, system: string, prompt: string, repoRoot: string, input: ReviewInput, verbose: boolean): Promise<Reviewed> {
+  const cut = diffCut(input.pr.diff);
+
   const result = await reviewWithTools({
     modelId,
     schema: VerdictSchema,
@@ -491,9 +654,12 @@ async function viaModel(modelId: string, system: string, prompt: string, repoRoo
     repoRoot,
     session: `stamp-${input.pr.number}-${input.pr.headSha}`,
     verbose,
+    mustRead: cut ? readableSections(cut) : undefined,
+    preread: cut ? new Map([[cut.first, cut.shown]]) : undefined,
+    approves: (v) => v.verdict === "APPROVE",
   });
 
-  if (result.refused) return { verdict: "ESCALATE", reasoning: "Model declined to review.", risk: "high", issues: [], notes: [], next_steps: "Human review.", change_summary: "", safe_because: null, run: result.run };
+  if (result.refused) return { verdict: "ESCALATE", reasoning: "Model declined to review.", risk: "high", issues: [], notes: [], next_steps: "Human review.", change_summary: "", safe_because: null, run: result.run, unread: result.unread };
 
-  return { ...(result.output ?? parseVerdict(result.text)), run: result.run };
+  return { ...(result.output ?? parseVerdict(result.text)), run: result.run, unread: result.unread };
 }

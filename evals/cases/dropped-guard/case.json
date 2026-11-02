@@ -1,0 +1,13 @@
+{
+  "title": "refactor: simplify greeting",
+  "body": "Removes an early return.",
+  "base": {
+    "src/greet.ts": "export type User = { name: string } | null;\n\nexport function greet(user: User): string {\n  if (!user) return \"Hello, guest\";\n  return `Hello, ${user.name}`;\n}\n",
+    "src/app.ts": "import { greet } from \"./greet\";\n\nexport const banner = (session: { user: { name: string } | null }) => greet(session.user);\n"
+  },
+  "head": {
+    "src/greet.ts": "export type User = { name: string } | null;\n\nexport function greet(user: User): string {\n  return `Hello, ${user!.name}`;\n}\n"
+  },
+  "expect": "block",
+  "bugs": [{ "id": "null-user", "file": "src/greet.ts", "match": ["null", "guest", "undefined", "TypeError", "logged.out", "non-null"] }]
+}

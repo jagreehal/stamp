@@ -2,6 +2,9 @@
 title: "Stamp documentation"
 ---
 
+<img src="/stamp/stamp.jpg" alt="Stamp: a cheerful reviewer pressing a STAMPED rubber stamp onto a page" width="420">
+
+
 Use Stamp to review pull requests and post GitHub approvals under your team's policy. Stamp runs deterministic gates before a model reviews the code. You decide when to merge.
 
 Start with [your first review](/stamp/start/quickstart/). You can try the gates from your terminal before you install the approval workflow.

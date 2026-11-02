@@ -9,7 +9,7 @@
 // The verdict is the output; --post puts it on GitHub as a real approval or a comment.
 import "./env.ts"; // first: drops blank provider variables before any provider SDK module loads
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs, type ParseArgsConfig } from "node:util";
@@ -50,10 +50,11 @@ import {
   type ScopeBudget,
 } from "./policy.ts";
 import { tryRetainApproval, type RetentionResult } from "./retention.ts";
+import { leadsAt } from "./leads.ts";
 import { beginReviewSpan, endReviewSpan, inReviewSpan, keyEnvFor, keySource, reviewMeasurements, summarizeRun, type ReviewAttributes } from "./llm.ts";
 import { configSummary, effectiveConfig, setting, useSettings, type Settings } from "./config.ts";
 import { egressRefusals } from "./isolated-cli.ts";
-import { advisable, assured, type Backend, combine, type Combined, review, reviewers, secondOpinionNeeded, withAdvice, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
+import { advisable, assured, type Backend, combine, diffCut, fenceFor, inert, oneLine, readAll, type Combined, review, reviewers, secondOpinionNeeded, withAdvice, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
 import { approvedOn, stackedParent, wrongBase, type StackDeps, type WrongBase } from "./stack.ts";
 import { CARD_MARKER, ticked } from "./actions.ts";
@@ -317,6 +318,8 @@ if (opts.post) {
       };
 
       if (opts.json) writeFileSync(opts.json, scrubJson(evidence));
+
+      if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### stamp: APPROVED on #${retention.pr.number}, kept\n\nApproval #${retention.approval.reviewId} kept: the PR diff is unchanged.\n`);
       await beginReviewSpan(STARTED); // retention kept only after trustedPolicy loaded the policy's settings
       await endReviewSpan(reviewAttributes(retention.pr, "APPROVED", { "stamp.retention": "kept" }), false);
       process.exit(0);
@@ -494,6 +497,9 @@ if (gateVerdict === "PASSED" && policy.familiarity) {
   }
 }
 
+// Impact leads: changed exports, the files outside the PR naming them, and each changed source's tests. Judgment only.
+const leads = gateVerdict === "PASSED" ? leadsAt(exploreRoot, pr.diff, pr.files.flatMap((f) => [f.filename, ...(f.previousFilename ? [f.previousFilename] : [])])) : null;
+
 // Test evidence from CI: judgment only, read when the policy names the workflow that uploads it.
 let stories: StoryEvidence | null = null;
 
@@ -560,6 +566,7 @@ const input = {
   signals,
   familiarity,
   stories,
+  leads,
 } as const;
 
 if (opts["dry-run"]) {
@@ -602,7 +609,7 @@ if (opts["dry-run"]) {
     }
 
     // Checked on the combined verdict: a disagreement has already escalated, and only an approval can be held back.
-    outcome = assured(outcome);
+    outcome = readAll(assured(outcome), diffCut(pr.diff), opinion ? [llm, opinion] : [llm]);
     verdict = VERDICT_OF[outcome.verdict];
     llm = { ...llm, ...outcome.llm };
     body = llm.reasoning;
@@ -659,6 +666,7 @@ const evidence = {
   signalFlags,
   familiarity: familiarityEvidence(familiarity),
   stories: storyEvidenceRecord(stories),
+  leads,
   size_overrides: [...folderGrants("max_files", sizeBudgets.file_scopes), ...folderGrants("max_lines", sizeBudgets.line_scopes)],
   retention: { status: "dismissed" as const, reason: retention.reason },
   backends,
@@ -670,6 +678,16 @@ const evidence = {
 };
 
 if (opts.json) writeFileSync(opts.json, scrubJson(evidence));
+
+// The Actions run page: the verdict and what each reviewer run cost, without opening the log.
+if (process.env.GITHUB_STEP_SUMMARY) {
+  const runs = [["reviewer", llm?.run], ["second opinion", opinion?.run], ["advisory", advisory?.run]] as const;
+
+  appendFileSync(
+    process.env.GITHUB_STEP_SUMMARY,
+    scrub(`### stamp: ${verdict} on #${pr.number} \`${pr.headSha.slice(0, 7)}\`\n\n${inert(oneLine(scrub(body), 1000))}\n\n${runs.flatMap(([role, r]) => (r ? [`- ${role}: ${summarizeRun(r)}`] : [])).join("\n")}\n`),
+  );
+}
 
 if (opts.post) {
   const post = { cwd: repoRoot, botLogin: me, started: STARTED, triggerLabel: opts.label };
@@ -817,10 +835,13 @@ function checkoutAtHead(sha: string): string {
  * because an agent told only "make the reviewer happy" will reach for the test file first.
  */
 function agentPrompt(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdict): string[] {
+  // The model's text sits inside the fence, raw for the agent; a fence longer than any backtick run in it holds.
+  const fence = fenceFor([reasoning, llm.next_steps, ...llm.issues].join("\n"));
+
   return [
     `<details><summary>${branded.fix} <strong>Fix with a coding agent</strong></summary>`,
     "",
-    "`````markdown",
+    `${fence}markdown`,
     `Address this review of PR #${pr.number}, on head ${pr.headSha.slice(0, 7)}.`,
     "",
     `Verdict: ${verdict} — ${reasoning}`,
@@ -833,7 +854,7 @@ function agentPrompt(pr: PR, verdict: Verdict, reasoning: string, llm: LLMVerdic
     "Fix the cause, not the symptom. Do not skip or weaken a test, loosen a lint rule, widen an",
     "ignore pattern or relax a type check to get past this review: that is itself a refusal.",
     "Push to the PR branch when done and stamp reviews the new head.",
-    "`````",
+    fence,
     "",
     "</details>",
   ];
@@ -845,20 +866,21 @@ function section(title: string, body: string[], open = false): string[] {
 }
 
 function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed | null, opinion: Opinion | null, gates: Gate[]): string {
-  const parts = [`${branded.heading(verdict)} <sub>· head \`${pr.headSha.slice(0, 7)}\`</sub>`, "", reasoning];
+  // Model-written text goes through inert one field at a time: stamp's own <sub>, <strong> and <details> stay markup.
+  const parts = [`${branded.heading(verdict)} <sub>· head \`${pr.headSha.slice(0, 7)}\`</sub>`, "", inert(reasoning)];
 
   // Risk sits under the verdict: a reader triages by it.
   if (llm && verdict !== "ERROR") parts.push("", `**Merge risk:** ${{ low: "🟢", medium: "🟡", high: "🔴" }[llm.risk]} ${llm.risk}`);
 
-  if (llm?.next_steps) parts.push("", `**Next:** ${llm.next_steps}`);
+  if (llm?.next_steps) parts.push("", `**Next:** ${inert(llm.next_steps)}`);
 
-  if (llm?.change_summary) parts.push("", `**What changed:** ${llm.change_summary}`);
+  if (llm?.change_summary) parts.push("", `**What changed:** ${inert(llm.change_summary)}`);
 
-  if (verdict === "APPROVED" && llm?.safe_because) parts.push("", `**Safe because:** ${llm.safe_because.fact} (${llm.safe_because.evidence})`);
+  if (verdict === "APPROVED" && llm?.safe_because) parts.push("", `**Safe because:** ${inert(llm.safe_because.fact)} (${llm.safe_because.evidence})`);
 
-  if (llm?.issues.length) parts.push(...section(`<strong>Issues:</strong> ${llm.issues.length}`, llm.issues.map((i, n) => `${n + 1}. ${i}`), true)); // numbered, so a reply can name "issue 2"
+  if (llm?.issues.length) parts.push(...section(`<strong>Issues:</strong> ${llm.issues.length}`, llm.issues.map((i, n) => `${n + 1}. ${inert(i)}`), true)); // numbered, so a reply can name "issue 2"
 
-  if (llm?.notes.length) parts.push(...section(`<strong>Notes:</strong> ${llm.notes.length} not blocking`, llm.notes.map((i) => `- ${i}`)));
+  if (llm?.notes.length) parts.push(...section(`<strong>Notes:</strong> ${llm.notes.length} not blocking`, llm.notes.map((i) => `- ${inert(i)}`)));
 
   if (verdict !== "APPROVED" && llm?.issues.length) parts.push("", ...agentPrompt(pr, verdict, reasoning, llm));
 
@@ -870,7 +892,7 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed |
   if (policy.stories) parts.push(...section(`<strong>Test evidence:</strong> ${stories ? evidenceSummary(stories) : "not read"}`, [`From the \`${policy.stories.artifact}\` artifact of \`${policy.stories.workflow}\`.`]));
 
   parts.push(
-    ...section(`<strong>Gates:</strong> ${branded.pass} ${gates.length - failed}${failed ? ` · ${branded.fail} ${failed}` : ""}`, ["| gate | result |", "|---|---|", ...gates.map((g) => `| ${g.gate} | ${g.passed ? branded.pass : branded.fail} ${g.message} |`)]),
+    ...section(`<strong>Gates:</strong> ${branded.pass} ${gates.length - failed}${failed ? ` · ${branded.fail} ${failed}` : ""}`, ["| gate | result |", "|---|---|", ...gates.map((g) => `| ${g.gate} | ${g.passed ? branded.pass : branded.fail} ${inert(g.message)} |`)]),
     ...section(`<strong>Reviewer:</strong> ${run}${llm ? ` → ${llm.verdict}` : ""}${opinion ? ` · second opinion → ${opinion.verdict}` : ""}`, [
       ...(opinion ? [`Second opinion: ${opinion.run ? summarizeRun(opinion.run) : opinion.backend} → ${opinion.verdict} (${opinion.risk} risk)`, ""] : []),
       `stamp ${VERSION} · head \`${pr.headSha.slice(0, 7)}\` · base \`${pr.baseRef}@${pr.baseSha.slice(0, 7)}\`${pr.stack ? ` · stacked on #${pr.stack.parent} \`${pr.stack.parentHead.slice(0, 7)}\`` : ""} · policy \`${policySource(`origin/${pr.defaultBranch}`).policy}\` · risk ${llm?.risk ?? "n/a"}`,

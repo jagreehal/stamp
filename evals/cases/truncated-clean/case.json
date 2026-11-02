@@ -1,0 +1,14 @@
+{
+  "title": "chore: regenerate fixtures",
+  "body": "Regenerates fixture data and fixes a typo in a comment.",
+  "base": {
+    "fixtures/data.csv": "id,value\n",
+    "src/load.ts": "// Load the fixtrues.\nexport const FIXTURES = \"fixtures/data.csv\";\n"
+  },
+  "head": {
+    "fixtures/data.csv": { "repeat": "1000,row of regenerated fixture data padding the diff past the prompt limit", "times": 5600 },
+    "src/load.ts": "// Load the fixtures.\nexport const FIXTURES = \"fixtures/data.csv\";\n"
+  },
+  "expect": "approve",
+  "split": "held-out"
+}

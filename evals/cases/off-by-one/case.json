@@ -1,0 +1,13 @@
+{
+  "title": "perf: index loop in lastN",
+  "body": "Replaces slice with an index loop to avoid an allocation.",
+  "base": {
+    "src/window.ts": "export function lastN<T>(xs: T[], n: number): T[] {\n  return xs.slice(Math.max(0, xs.length - n));\n}\n",
+    "src/window.test.ts": "import { expect, test } from \"bun:test\";\nimport { lastN } from \"./window\";\n\ntest(\"last two\", () => expect(lastN([1, 2, 3], 2)).toEqual([2, 3]));\n"
+  },
+  "head": {
+    "src/window.ts": "export function lastN<T>(xs: T[], n: number): T[] {\n  const out: T[] = [];\n  for (let i = Math.max(0, xs.length - n); i <= xs.length; i++) out.push(xs[i]!);\n  return out;\n}\n"
+  },
+  "expect": "block",
+  "bugs": [{ "id": "loop-past-end", "file": "src/window.ts", "match": ["<=", "off.by.one", "out of (bounds|range)", "undefined", "past the end", "xs\\.length"] }]
+}
