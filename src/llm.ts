@@ -20,7 +20,8 @@ import path from "node:path";
 import { z } from "zod";
 import { dropBlankProviderEnv } from "./env.ts";
 import { DEFAULT_GUARD as DEFAULT_GUARD_SETTINGS, guardShorthand, setting } from "./config.ts";
-import { Pricing } from "./policy.ts";
+import { callTimeout } from "./github.ts";
+import { Effort, Pricing } from "./policy.ts";
 
 export { PROVIDER_ENV } from "./env.ts";
 
@@ -209,7 +210,7 @@ export function repoTools(root: string) {
 
   const git = (args: string[]) => {
     try {
-      return execFileSync("git", ["-C", real, ...args], { encoding: "utf8", maxBuffer: 8 << 20 });
+      return execFileSync("git", ["-C", real, ...args], { encoding: "utf8", maxBuffer: 8 << 20, timeout: callTimeout() });
     } catch (e) {
       // git grep exits 1 for "no matches", which is an answer.
       if (e instanceof Error && "status" in e && e.status === 1) return "(no matches)";
@@ -368,6 +369,16 @@ export function diffReader(sections: Map<string, string>, preread = new Map<stri
   };
 }
 
+/** The `effort` setting, as the AI SDK's provider-independent reasoning option; undefined leaves the provider's default. */
+export function reasoningEffort(raw = setting("effort")) {
+  if (!raw) return undefined;
+  const effort = Effort.safeParse(raw);
+
+  if (!effort.success) throw new Error(`effort: ${JSON.stringify(raw)} is not one of ${Effort.options.join(", ")}`);
+
+  return effort.data;
+}
+
 const SUBMIT = "submit_verdict";
 
 const MAX_STEPS = 40;
@@ -469,7 +480,7 @@ export async function reviewWithTools<T>(o: Options<T>): Promise<ToolReview<T>> 
     return {};
   };
 
-  const common = { model, instructions, tools, maxOutputTokens: maxOutputTokens(o.modelId), abortSignal, onStepFinish, prepareStep };
+  const common = { model, instructions, tools, maxOutputTokens: maxOutputTokens(o.modelId), reasoning: reasoningEffort(), abortSignal, onStepFinish, prepareStep };
 
   const guardError = () =>
     new Error(`review stopped: ${timer?.aborted && !guard.stopped ? `timed out after ${rule(limits, "timeout")?.slice("timeout:".length)}` : guard.violations.map((v) => v.message).join("; ")}`);

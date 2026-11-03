@@ -9,7 +9,7 @@ export const SECRETS = ["STAMP_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", 
 
 type Env = Record<string, string | undefined>;
 
-export type Settings = Pick<Policy, "model" | "backends" | "pricing" | "provider" | "guard" | "max_output_tokens" | "cli" | "label" | "notify" | "telemetry" | "advise_on_deny">;
+export type Settings = Pick<Policy, "model" | "backends" | "pricing" | "provider" | "guard" | "max_output_tokens" | "effort" | "cli" | "label" | "notify" | "telemetry" | "advise_on_deny">;
 
 export type GuardSettings = NonNullable<Settings["guard"]>;
 
@@ -39,6 +39,7 @@ const SETTINGS = {
   // A partial `guard:` keeps the default for every rule it leaves out; STAMP_GUARD replaces the whole set, as it always has.
   guard: { key: "guard", env: ["STAMP_GUARD"], from: (p: Settings) => p.guard && guardShorthand({ ...DEFAULT_GUARD, ...p.guard }), fallback: guardShorthand(DEFAULT_GUARD) },
   max_output_tokens: { key: "max_output_tokens", env: ["STAMP_MAX_OUTPUT_TOKENS"], from: (p: Settings) => p.max_output_tokens?.toString(), fallback: "" },
+  effort: { key: "effort", env: ["STAMP_EFFORT"], from: (p: Settings) => p.effort, fallback: "" },
   claude_model: { key: "cli.claude_model", env: ["STAMP_CLAUDE_MODEL"], from: (p: Settings) => p.cli?.claude_model, fallback: "" },
   codex_model: { key: "cli.codex_model", env: ["STAMP_CODEX_MODEL"], from: (p: Settings) => p.cli?.codex_model, fallback: "" },
   label: { key: "label", env: ["STAMP_LABEL"], from: (p: Settings) => p.label, fallback: "" },

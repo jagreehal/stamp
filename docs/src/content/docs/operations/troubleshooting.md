@@ -11,7 +11,7 @@ Start with the PR's Actions run, review comment and evidence artifact. Separate 
 | Approval does not satisfy branch rules | Actions approval setting and required code-owner reviews | Enable the Actions approval setting; obtain any required human review |
 | `REFUSED` before a model call | Failed gates in the review or dry-run output | Fix the problem or request a human review for the protected change |
 | `ESCALATE` | Reviewer reasoning and requested assurance | Ask the owning team to review the current head |
-| `ERROR` | First error in the review and Actions logs | Check provider credentials, model ID, budget and backend setup |
+| `ERROR` | First error in the review, and the fix it names for a provider failure | Follow that fix; otherwise check provider credentials, model ID, budget and backend setup in the Actions logs |
 | CLI backend fails before review | Docker, image preparation, selected backend credential | Follow the isolation setup in the backend guide; Stamp has no host fallback |
 | Model/provider error | `stamp config`: the `model` and `backends` in effect, where each came from, and whether the matching key (`STAMP_API_KEY` or the provider's own variable) is set | Use a provider/model combination from the backend table |
 | Edited policy has no effect | Policy source in the evidence | Merge the policy change; PR-head configuration does not govern the run |

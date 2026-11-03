@@ -75,6 +75,7 @@ Every non-secret setting lives in `.stamp/policy.yml`, read from the default bra
 | Anthropic base URL | `provider.anthropic_base_url` | `ANTHROPIC_BASE_URL` | Anthropic direct |
 | Review limits | `guard` (`{budget_usd, tokens, loop, max_tools, timeout}`); a rule left out keeps its default | `STAMP_GUARD` (shorthand, replaces the whole set) | `budget_usd: 2, tokens: 3m, loop: 4/12, max_tools: 80, timeout: 15m` |
 | Output-token ceiling per model call | `max_output_tokens` | `STAMP_MAX_OUTPUT_TOKENS` | 16000, or 10000 on Amazon Nova |
+| How hard the reviewer reasons: `low`, `medium` or `high`, on every backend | `effort` | `STAMP_EFFORT` | Each model's default |
 | Claude CLI model | `cli.claude_model` | `STAMP_CLAUDE_MODEL` | Claude Code's default |
 | Codex CLI model | `cli.codex_model` | `STAMP_CODEX_MODEL` | Codex's default |
 | Review only PRs with this label | `label` | `STAMP_LABEL`, or `--label` (the flag wins) | unset: every PR |

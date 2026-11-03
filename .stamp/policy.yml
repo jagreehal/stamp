@@ -16,6 +16,7 @@ version: 1
 # provider: { region: eu-west-1 }                    # also base_url (compatible:) and anthropic_base_url
 # guard: { budget_usd: 2, tokens: 3m, loop: 4/12, max_tools: 80, timeout: 15m }
 # max_output_tokens: 16000
+# effort: high                                         # how hard the reviewer reasons (low, medium, high); unset leaves each model's default
 # cli: { claude_model: claude-sonnet-5-5, codex_model: gpt-5.5 }
 # label: stamp                                        # review only PRs carrying this label
 # notify: { on: [REFUSED, ESCALATE, ERROR] }

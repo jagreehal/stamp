@@ -71,6 +71,8 @@ describe("settings", () => {
     expect(err).not.toContain("    at ");
     expect(resolve("advise_on_deny", { advise_on_deny: true }, {}).value).toBe("true");
     expect(resolve("advise_on_deny", {}, {}).value).toBe("false");
+    expect(resolve("effort", {}, {}).value).toBe("");
+    expect(resolve("effort", { effort: "high" }, { STAMP_EFFORT: "low" })).toMatchObject({ value: "low", source: "env" });
   });
 
   test("init writes the settings it was given into the policy, and refuses ones the policy would", () => {

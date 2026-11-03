@@ -22,6 +22,7 @@ Every setting below is also a key in `.stamp/policy.yml`, which is where it belo
 | `STAMP_GUARD` | `budget:$2,tokens:3m,loop:4/12,max-tools:80,timeout:15m` | API review resource limits |
 | `STAMP_PRICING` | Unset | JSON prices per million input/output tokens for unpriced models; adds to and overrides the policy's `pricing`. A run on a model with no price logs `budget guard inactive` |
 | `STAMP_MAX_OUTPUT_TOKENS` | `16000`, or `10000` on Amazon Nova | Output-token ceiling for each model call; lower it for a model with a smaller limit |
+| `STAMP_EFFORT` | Unset | Reviewer reasoning effort: `low`, `medium` or `high`; unset leaves each model's default |
 | `STAMP_CLI_IMAGE` | `stamp-reviewer:local` | Docker image for CLI review |
 | `STAMP_BUILD_CLI_IMAGE` | Unset | `1` prepares the packaged image inside the review path; generated workflow sets it |
 | `ANTHROPIC_BASE_URL` | Provider default | Alternate Anthropic-compatible API endpoint |

@@ -46,3 +46,9 @@ The `telemetry` gate holds a PR that writes a credential or a whole request into
 The reviewer reads files and searches the checkout, and does nothing else. It receives the diff, description, reviews, inline and discussion comments and reactions inside an untrusted-content fence. stamp leaves its own prior reviews out. The reviewer reads test hunks first and reports showstoppers only.
 
 When HEAD is another commit, or the tree is dirty, stamp reviews from a detached worktree at the PR head.
+
+On a re-review the reviewer also gets what changed since the head stamp last reviewed, with the base branch's movement taken out, so it starts where a fix landed. It still judges the whole diff, and it is not told the last verdict.
+
+Impact leads point past the diff: changed exports and the files that name them, the tests beside each changed source, and names the diff renamed or removed that the head still uses, an environment variable or config key included.
+
+A `REFUSED` or `ESCALATE` review pins each issue to its line as an inline comment when that line is in the diff; the review body still lists them all. When a later review runs, it resolves those threads, and any finding that still holds comes back in the new review. A thread someone replied in stays open.

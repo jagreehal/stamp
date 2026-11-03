@@ -16,7 +16,7 @@ import { parseArgs, type ParseArgsConfig } from "node:util";
 import { z } from "zod";
 import { notify, notifyOn, slackEscape } from "./notify.ts";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
-import { callTimeout, EVIDENCE_UNSEEN_MARKER, checkRuns, effectiveAssociation, permissionOf, TRUSTED_ASSOCIATIONS, withoutComments, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, foldSuperseded, postVerdict, reconcilePosted, publishCard, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
+import { callTimeout, EVIDENCE_UNSEEN_MARKER, lastReviewed, retireOwnThreads, checkRuns, effectiveAssociation, permissionOf, TRUSTED_ASSOCIATIONS, withoutComments, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, foldSuperseded, postVerdict, reconcilePosted, publishCard, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
 import {
   DEFAULTS_DIR,
   detectOwnership,
@@ -50,11 +50,14 @@ import {
   type ScopeBudget,
 } from "./policy.ts";
 import { tryRetainApproval, type RetentionResult } from "./retention.ts";
+import { incrementalDiff } from "./delta.ts";
+import { anchoredIssues } from "./inline.ts";
 import { leadsAt } from "./leads.ts";
-import { beginReviewSpan, endReviewSpan, inReviewSpan, keyEnvFor, keySource, reviewMeasurements, summarizeRun, type ReviewAttributes } from "./llm.ts";
+import { explainFailure, failureText } from "./provider-errors.ts";
+import { beginReviewSpan, endReviewSpan, inReviewSpan, keyEnvFor, keySource, parseModelId, reviewMeasurements, summarizeRun, type ReviewAttributes } from "./llm.ts";
 import { configSummary, effectiveConfig, setting, useSettings, type Settings } from "./config.ts";
 import { egressRefusals } from "./isolated-cli.ts";
-import { advisable, assured, type Backend, combine, diffCut, fenceFor, inert, oneLine, readAll, type Combined, review, reviewers, secondOpinionNeeded, withAdvice, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
+import { advisable, assured, type Backend, combine, diffCut, fenceFor, firstThatFits, inert, oneLine, readAll, type Combined, review, reviewers, secondOpinionNeeded, shortened, withAdvice, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
 import { approvedOn, stackedParent, wrongBase, type StackDeps, type WrongBase } from "./stack.ts";
 import { CARD_MARKER, ticked } from "./actions.ts";
@@ -76,6 +79,8 @@ const VERDICT_OF: Record<LLMVerdict["verdict"], Verdict> = { APPROVE: "APPROVED"
 const STALE_EYES_MS = 45 * 60_000; // a bot 👀 older than this is a crashed reviewer, not an in-flight one
 
 const REVIEWER_WAIT_MS = 5 * 60_000; // how long to hold for an in-flight reviewer bot before reviewing without it
+
+const MAX_REVIEW_BODY = 60_000; // GitHub refuses a review body past 65,536 characters
 
 const USAGE = `usage: stamp <pr-number> [--dry-run] [--post] [--label <name>] [--json <path>] [--policy-dir <dir>] [-v]
        stamp init [--model <id>] [--region <aws-region>] [--strict] [--environment <name>] [--aws-oidc] [--digest] [--upgrade]
@@ -500,6 +505,26 @@ if (gateVerdict === "PASSED" && policy.familiarity) {
 // Impact leads: changed exports, the files outside the PR naming them, and each changed source's tests. Judgment only.
 const leads = gateVerdict === "PASSED" ? leadsAt(exploreRoot, pr.diff, pr.files.flatMap((f) => [f.filename, ...(f.previousFilename ? [f.previousFilename] : [])])) : null;
 
+// What changed since stamp last reviewed this PR. Judgment only: the reviewer sees the change and the whole diff, and
+// the last verdict stays out of the prompt. The review continues without it when git cannot build it.
+let delta: { from: string; diff: string } | null = null;
+
+if (gateVerdict === "PASSED" && !opts["dry-run"]) {
+  try {
+    const before = lastReviewed(listReviews(pr.repo, pr.number, repoRoot), me, pr.headSha);
+
+    if (before) {
+      git(...GH_CREDENTIALS, "fetch", "-q", "origin", before.head, before.base);
+      const found = incrementalDiff(repoRoot, before, { head: pr.headSha, base: pr.stack?.parentHead ?? pr.baseSha });
+
+      if (found.status === "ok") delta = { from: before.head, diff: found.diff };
+      else console.log(`  no delta since ${before.head.slice(0, 7)}: ${found.status === "empty" ? "the two versions match" : found.reason}`);
+    }
+  } catch (e) {
+    console.error(`delta unavailable: ${e instanceof Error ? e.message.split("\n")[0] : e}`);
+  }
+}
+
 // Test evidence from CI: judgment only, read when the policy names the workflow that uploads it.
 let stories: StoryEvidence | null = null;
 
@@ -567,6 +592,7 @@ const input = {
   familiarity,
   stories,
   leads,
+  delta,
 } as const;
 
 if (opts["dry-run"]) {
@@ -618,7 +644,10 @@ if (opts["dry-run"]) {
     // An auth failure from the api backend reads as a bare "Forbidden": name the variable the key came from.
     const via = backends.includes("api") ? ` (${setting("model")}, ${keySource(setting("model"))})` : "";
 
-    body = `Review failed before reaching a verdict: ${String(e instanceof Error ? e.message : e).split("\n")[0]}${via}`;
+    const apiModel = backends.includes("api") ? setting("model") : backends.find((b) => b.includes(":"));
+    const fix = explainFailure(e instanceof Error ? failureText(e) : String(e), apiModel && parseModelId(apiModel).provider);
+
+    body = `Review failed before reaching a verdict: ${String(e instanceof Error ? e.message : e).split("\n")[0]}${via}${fix ? `\n\n${fix}` : ""}`;
   }
 }
 
@@ -667,6 +696,7 @@ const evidence = {
   familiarity: familiarityEvidence(familiarity),
   stories: storyEvidenceRecord(stories),
   leads,
+  delta: delta && { from: delta.from, lines: delta.diff.split("\n").length },
   size_overrides: [...folderGrants("max_files", sizeBudgets.file_scopes), ...folderGrants("max_lines", sizeBudgets.line_scopes)],
   retention: { status: "dismissed" as const, reason: retention.reason },
   backends,
@@ -691,7 +721,9 @@ if (process.env.GITHUB_STEP_SUMMARY) {
 
 if (opts.post) {
   const post = { cwd: repoRoot, botLogin: me, started: STARTED, triggerLabel: opts.label };
-  const posted = postVerdict(pr, verdict, renderBody(pr, verdict, body, llm, opinion, gated.gates), post);
+  // A stacked review reads the delta over its parent, and GitHub anchors comments to the PR's own diff.
+  const anchors = verdict === "APPROVED" || verdict === "ERROR" || pr.stack ? [] : anchoredIssues(llm?.issues ?? [], pr.diff).map((a) => ({ ...a, body: inert(withoutComments(a.body)) }));
+  const posted = postVerdict(pr, verdict, fitBody(pr, verdict, body, llm, opinion, gated.gates), post, anchors);
   // Terminal sweep: an older run's approval can land after this run's startup sweep. Dismiss every
   // approval of ours that is off the live head, or on it but from a run that started before this
   // one; a run that started later owns the newer verdict and its approval is kept. Then confirm the
@@ -703,8 +735,11 @@ if (opts.post) {
     // Presentation only: the verdict has posted. The card follows at exit.
     try {
       foldSuperseded(pr, posted, me, STARTED, repoRoot);
+
+      // A completed review replaces the findings before it. A gate denial or an ERROR keeps them.
+      if (llm && verdict !== "ERROR") retireOwnThreads(pr, me, STARTED, repoRoot);
     } catch (e) {
-      console.error(`could not fold older reviews: ${e instanceof Error ? e.message : String(e)}`);
+      console.error(`could not tidy older reviews: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     const url = `${process.env.GITHUB_SERVER_URL || "https://github.com"}/${pr.repo}/pull/${pr.number}`;
@@ -865,7 +900,27 @@ function section(title: string, body: string[], open = false): string[] {
   return ["", `<details${open ? " open" : ""}><summary>${title}</summary>`, "", ...body, "", "</details>"];
 }
 
-function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed | null, opinion: Opinion | null, gates: Gate[]): string {
+/** The review body, within the length GitHub accepts. */
+function fitBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed | null, opinion: Opinion | null, gates: Gate[]): string {
+  // The last holds a heading, 2,000 characters of reasoning and the markers, so its length has a fixed ceiling.
+  return firstThatFits(MAX_REVIEW_BODY, [
+    () => renderBody(pr, verdict, reasoning, llm, opinion, gates),
+    () => renderBody(pr, verdict, reasoning.slice(0, 4000), llm && shortened(llm, 30_000), opinion, gates, false),
+    () => [branded.heading(verdict), "", inert(withoutComments(reasoning.slice(0, 2000))), "", "This review ran past GitHub's length limit. The run's evidence holds it whole.", ...markers(pr, verdict)].join("\n"),
+  ]);
+}
+
+/** What every body ends with, written after the model's text. Retention and the sweeps read these. */
+function markers(pr: PR, verdict: Verdict): string[] {
+  return [
+    runMarker(STARTED),
+    // A delta review records the parent's head as its base, so retention never keeps it on the whole PR's diff.
+    reviewedMarker(pr.headSha, pr.stack?.parentHead ?? pr.baseSha),
+    ...(verdict === "APPROVED" && policy.stories && stories?.status !== "ok" ? [EVIDENCE_UNSEEN_MARKER] : []),
+  ];
+}
+
+function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed | null, opinion: Opinion | null, gates: Gate[], withAgentPrompt = true): string {
   // Model-written text goes through inert one field at a time: stamp's own <sub>, <strong> and <details> stay markup.
   const parts = [`${branded.heading(verdict)} <sub>· head \`${pr.headSha.slice(0, 7)}\`</sub>`, "", inert(reasoning)];
 
@@ -882,7 +937,7 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed |
 
   if (llm?.notes.length) parts.push(...section(`<strong>Notes:</strong> ${llm.notes.length} not blocking`, llm.notes.map((i) => `- ${inert(i)}`)));
 
-  if (verdict !== "APPROVED" && llm?.issues.length) parts.push("", ...agentPrompt(pr, verdict, reasoning, llm));
+  if (withAgentPrompt && verdict !== "APPROVED" && llm?.issues.length) parts.push("", ...agentPrompt(pr, verdict, reasoning, llm));
 
   // Everything above is model-written. With no HTML comment in it, nothing there can pass for the markers below.
   for (let i = 0; i < parts.length; i++) parts[i] = withoutComments(parts[i]!);
@@ -897,10 +952,7 @@ function renderBody(pr: PR, verdict: Verdict, reasoning: string, llm: Reviewed |
       ...(opinion ? [`Second opinion: ${opinion.run ? summarizeRun(opinion.run) : opinion.backend} → ${opinion.verdict} (${opinion.risk} risk)`, ""] : []),
       `stamp ${VERSION} · head \`${pr.headSha.slice(0, 7)}\` · base \`${pr.baseRef}@${pr.baseSha.slice(0, 7)}\`${pr.stack ? ` · stacked on #${pr.stack.parent} \`${pr.stack.parentHead.slice(0, 7)}\`` : ""} · policy \`${policySource(`origin/${pr.defaultBranch}`).policy}\` · risk ${llm?.risk ?? "n/a"}`,
     ]),
-    runMarker(STARTED),
-    // A delta review records the parent's head as its base, so retention never keeps it on the whole PR's diff.
-    reviewedMarker(pr.headSha, pr.stack?.parentHead ?? pr.baseSha),
-    ...(verdict === "APPROVED" && policy.stories && stories?.status !== "ok" ? [EVIDENCE_UNSEEN_MARKER] : []),
+    ...markers(pr, verdict),
   );
 
   return parts.join("\n").replace(/!\[([^\]]*)\]\(/g, "[image: $1]("); // no auto-fetched images: a markdown image is an exfil channel

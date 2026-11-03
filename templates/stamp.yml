@@ -117,6 +117,7 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}        # provider.anthropic_base_url
           STAMP_GUARD: ${{ vars.STAMP_GUARD }}                      # guard (shorthand: budget:$2,tokens:3m,...)
           STAMP_MAX_OUTPUT_TOKENS: ${{ vars.STAMP_MAX_OUTPUT_TOKENS }} # max_output_tokens
+          STAMP_EFFORT: ${{ vars.STAMP_EFFORT }} # effort
           STAMP_CLAUDE_MODEL: ${{ vars.STAMP_CLAUDE_MODEL }}        # cli.claude_model
           STAMP_CODEX_MODEL: ${{ vars.STAMP_CODEX_MODEL }}          # cli.codex_model
           STAMP_LABEL: ${{ vars.STAMP_LABEL }}                      # label

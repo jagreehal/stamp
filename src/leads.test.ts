@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { changedSymbols, formatLeads, leadsAt, relatedTests } from "./leads.ts";
+import { changedNames, changedSymbols, formatLeads, impactLeads, leadsAt, nameLeads, relatedTests } from "./leads.ts";
 
 const dir = mkdtempSync(path.join(tmpdir(), "stamp-leads-"));
 
@@ -80,4 +80,59 @@ test("over a checkout: callers outside the PR, the source's tests, and a file wi
 
   // Not a git checkout: no leads, never an error.
   expect(leadsAt(path.join(dir, "missing"), diff, [])).toBeNull();
+});
+
+test("names: a rename's old name stays a lead where the head still uses it, the PR's own new lines do not count", () => {
+  const renamed = [
+    "diff --git a/src/config.ts b/src/config.ts",
+    "--- a/src/config.ts",
+    "+++ b/src/config.ts",
+    "@@ -1,2 +1,2 @@",
+    '-const key = process.env.OLD_API_URL;',
+    '+const key = process.env.NEW_API_URL;',
+    " const other = 1;",
+    "diff --git a/bun.lock b/bun.lock",
+    "--- a/bun.lock",
+    "+++ b/bun.lock",
+    "@@ -1 +1,2 @@",
+    " keep",
+    "+LOCKFILE_ONLY_NAME",
+    "",
+  ].join("\n");
+
+  const { candidates, addedLines } = changedNames(renamed);
+
+  expect(candidates.map((c) => c.name).sort()).toEqual(["NEW_API_URL", "OLD_API_URL"]);
+  expect(candidates.find((c) => c.name === "OLD_API_URL")?.removed).toEqual([{ file: "src/config.ts", line: 1 }]);
+
+  const grep = ["src/config.ts\x001\x00const key = process.env.NEW_API_URL;", "deploy/env.sh\x004\x00export OLD_API_URL=x", "OLD_API_URLS.md\x002\x00see OLD_API_URLS", ""].join("\n");
+  const names = nameLeads(candidates, addedLines, grep);
+
+  expect(names).toEqual([{ name: "OLD_API_URL", added: null, removed: { file: "src/config.ts", line: 1 }, count: 1, refs: [{ file: "deploy/env.sh", line: 4, text: "export OLD_API_URL=x" }] }]);
+
+  const out = formatLeads({ symbols: [], sources: [], names }, (s) => s);
+
+  expect(out).toEqual(['OLD_API_URL: removed at src/config.ts:1; 1 line(s) in the head use it: deploy/env.sh:4 "export OLD_API_URL=x"']);
+});
+
+test("names: a name on both sides is churn, however uneven, and an added line reading `+++ x` stays in its hunk", () => {
+  const moved = ["diff --git a/a.ts b/a.ts", "--- a/a.ts", "+++ b/a.ts", "@@ -1 +1,3 @@", "-MOVED_NAME", "+MOVED_NAME", "+MOVED_NAME", "+++ ADDED_NAME", ""].join("\n");
+
+  expect(changedNames(moved).candidates.map((c) => c.name)).toEqual(["ADDED_NAME"]);
+});
+
+test("names through git: found in the checkout, and a failing grep loses only them", () => {
+  const repo = path.join(dir, "names");
+
+  mkdirSync(repo);
+  const run = (...a: string[]) => execFileSync("git", ["-C", repo, ...a], { stdio: "ignore" });
+
+  run("init", "-q");
+  writeFileSync(path.join(repo, "deploy.sh"), "echo $RETIRED_FLAG\n");
+  run("add", ".");
+
+  const gone = ["diff --git a/a.ts b/a.ts", "--- a/a.ts", "+++ b/a.ts", "@@ -1 +0,0 @@", "-RETIRED_FLAG", ""].join("\n");
+
+  expect(leadsAt(repo, gone, ["a.ts"])?.names.map((n) => [n.name, n.refs[0]?.file])).toEqual([["RETIRED_FLAG", "deploy.sh"]]);
+  expect(impactLeads(gone, ["a.ts"], { tracked: () => [], naming: () => [], lines: () => "" }).names).toEqual([]);
 });
