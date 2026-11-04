@@ -28,6 +28,18 @@ function clientHello(name: string, recordSize = 16384): Buffer {
   return Buffer.concat(records);
 }
 
+// A port the kernel just handed out. A random pick can land on one in use, and the proxy then exits before saying ready.
+const freePort = () =>
+  new Promise<number>((resolve) => {
+    const server = createServer();
+
+    server.listen(0, "0.0.0.0", () => {
+      const { port } = z.object({ port: z.number() }).parse(server.address());
+
+      server.close(() => resolve(port));
+    });
+  });
+
 describe("CLI isolation", () => {
   test("launcher cannot share host processes, writable checkout, home or sockets", () => {
     const args = containerArgs("probe", CLI_IMAGE, "/repo", "/control", "/output", "OPENAI_API_KEY");
@@ -149,7 +161,7 @@ describe("CLI isolation", () => {
     await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
     const { port: upstreamPort } = z.object({ port: z.number() }).parse(upstream.address());
     const allowed = `127.0.0.1:${upstreamPort}`;
-    const port = 20_000 + Math.floor(Math.random() * 20_000);
+    const port = await freePort();
     const proxy = spawn("node", ["-e", EGRESS_PROXY], { env: { ...process.env, STAMP_EGRESS_ALLOW: allowed, STAMP_EGRESS_PORT: String(port), STAMP_EGRESS_FROM: "127.0.0.0/8" } });
     let logs = "";
 
@@ -192,7 +204,7 @@ describe("CLI isolation", () => {
     }
 
     // A client outside the review's subnet is refused before it can ask for anything.
-    const strictPort = port + 1;
+    const strictPort = await freePort();
     const strict = spawn("node", ["-e", EGRESS_PROXY], { env: { ...process.env, STAMP_EGRESS_ALLOW: allowed, STAMP_EGRESS_PORT: String(strictPort), STAMP_EGRESS_FROM: "10.99.0.0/16" } });
 
     await new Promise<void>((resolve) => strict.stdout.on("data", (d) => String(d).includes("ready") && resolve()));
