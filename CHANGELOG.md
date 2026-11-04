@@ -1,5 +1,11 @@
 # @jagreehal/stamp
 
+## 0.12.0
+
+### Minor Changes
+
+- ff51dfc: After three refused heads, a fourth refusal escalates to a person, and each run records its round count. Public reviews give a security issue's risk, location and fix without exploit detail. The `secrets` gate also reads the PR title and description.
+
 ## 0.11.0
 
 ### Minor Changes
