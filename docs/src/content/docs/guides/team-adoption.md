@@ -21,6 +21,8 @@ List your other reviewer bots under `reviewer_bots` in `policy.yml` so stamp wai
 
 The `github-actions[bot]` approval counts toward required approving reviews once the Actions setting above is on. It does not satisfy "require review from Code Owners", and it should not: that rule exists so a person on the owning team looks, and stamp escalates to that person.
 
+Decide where a stamp approval may stand in for a person. Put auth, billing, CI and release paths under `CODEOWNERS` with "require review from Code Owners", and a person signs off on those; on other paths, stamp's approval can clear the required review.
+
 Copy `.agents/skills/` (`writing-pr-descriptions`, `merging-prs`, `pr`) into repositories where agents open PRs, or install them with `npx skills add jagreehal/stamp`. `pr` is [Matt Pocock's skill](https://github.com/mattpocock/skills), copied unchanged; `writing-pr-descriptions` uses its Merge Danger section and visuals.
 
 When a PR closes issues in its own repository, stamp passes their title and body to the reviewer inside the untrusted fence. It skips issues in other repositories, which can be private while the PR is public. The reviewer checks the diff does what they ask: a change that does the opposite of its issue is a showstopper, and a vague issue never refuses a PR on its own.

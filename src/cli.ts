@@ -16,7 +16,7 @@ import { parseArgs, type ParseArgsConfig } from "node:util";
 import { z } from "zod";
 import { notify, notifyOn, slackEscape } from "./notify.ts";
 import { computeFamiliarity, ensureFullHistory, familiarityEvidence, type AuthorFamiliarity } from "./familiarity.ts";
-import { callTimeout, EVIDENCE_UNSEEN_MARKER, lastReviewed, retireOwnThreads, checkRuns, effectiveAssociation, permissionOf, TRUSTED_ASSOCIATIONS, withoutComments, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, foldSuperseded, postVerdict, reconcilePosted, publishCard, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
+import { callTimeout, EVIDENCE_UNSEEN_MARKER, lastReviewed, refusedRounds, retireOwnThreads, checkRuns, effectiveAssociation, permissionOf, TRUSTED_ASSOCIATIONS, withoutComments, compareDelta, dismissOwnApprovals, GH_CREDENTIALS, fetchPR, openPRsInto, isOurs, listReviews, mergedPRs, foldSuperseded, postVerdict, reconcilePosted, publishCard, repoSlug, reviewedMarker, runMarker, scrub, scrubJson, withBudget, type PR, type Verdict } from "./github.ts";
 import {
   DEFAULTS_DIR,
   detectOwnership,
@@ -57,7 +57,7 @@ import { explainFailure, failureText } from "./provider-errors.ts";
 import { beginReviewSpan, endReviewSpan, inReviewSpan, keyEnvFor, keySource, parseModelId, reviewMeasurements, summarizeRun, type ReviewAttributes } from "./llm.ts";
 import { configSummary, effectiveConfig, setting, useSettings, type Settings } from "./config.ts";
 import { egressRefusals } from "./isolated-cli.ts";
-import { advisable, assured, type Backend, combine, diffCut, fenceFor, firstThatFits, inert, oneLine, readAll, type Combined, review, reviewers, secondOpinionNeeded, shortened, withAdvice, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
+import { advisable, assured, type Backend, combine, converged, diffCut, fenceFor, firstThatFits, inert, oneLine, readAll, type Combined, review, reviewers, secondOpinionNeeded, shortened, withAdvice, type LLMVerdict, type Opinion, type Reviewed } from "./reviewer.ts";
 import { flagged, riskSignals, type Signals } from "./signals.ts";
 import { approvedOn, stackedParent, wrongBase, type StackDeps, type WrongBase } from "./stack.ts";
 import { CARD_MARKER, ticked } from "./actions.ts";
@@ -509,9 +509,14 @@ const leads = gateVerdict === "PASSED" ? leadsAt(exploreRoot, pr.diff, pr.files.
 // the last verdict stays out of the prompt. The review continues without it when git cannot build it.
 let delta: { from: string; diff: string } | null = null;
 
+let rounds = 0;
+
 if (gateVerdict === "PASSED" && !opts["dry-run"]) {
   try {
-    const before = lastReviewed(listReviews(pr.repo, pr.number, repoRoot), me, pr.headSha);
+    const reviews = listReviews(pr.repo, pr.number, repoRoot);
+    const before = lastReviewed(reviews, me, pr.headSha);
+
+    rounds = refusedRounds(reviews, me, pr.headSha);
 
     if (before) {
       git(...GH_CREDENTIALS, "fetch", "-q", "origin", before.head, before.base);
@@ -651,6 +656,9 @@ if (opts["dry-run"]) {
   }
 }
 
+// Only a model's refusal counts toward the cap.
+if (llm) ({ verdict, body } = converged({ verdict, body }, rounds));
+
 const weakened = weakenedCount(stories);
 
 if (verdict === "APPROVED" && weakened > 0) {
@@ -697,6 +705,7 @@ const evidence = {
   stories: storyEvidenceRecord(stories),
   leads,
   delta: delta && { from: delta.from, lines: delta.diff.split("\n").length },
+  refused_rounds: rounds,
   size_overrides: [...folderGrants("max_files", sizeBudgets.file_scopes), ...folderGrants("max_lines", sizeBudgets.line_scopes)],
   retention: { status: "dismissed" as const, reason: retention.reason },
   backends,
@@ -762,6 +771,7 @@ await endReviewSpan(
     "stamp.familiarity": familiarity?.band,
     "stamp.stories": stories?.status,
     "stamp.risk": llm?.risk,
+    "stamp.refused_rounds": rounds,
     "stamp.second_opinion": opinion?.verdict,
     ...measurements,
     "stamp.egress.denied_host": [llm, opinion].reduce((n, r) => n + (r?.egress?.deniedHost ?? 0), 0),

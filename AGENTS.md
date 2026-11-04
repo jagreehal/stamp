@@ -45,6 +45,7 @@ The nearest thing stamp has is the size exemption, and it changes only how much 
 - Fork heads and authors below COLLABORATOR fail the prerequisites gate. Only people who could merge anyway get auto-approved. `author_association` reads write access through a team, and a private org member, as CONTRIBUTOR, so `fetchPR` asks the permission API when the association is not trusted (`effectiveAssociation`): `admin`, `maintain` or `write` counts as COLLABORATOR, and a failed lookup keeps GitHub's answer. A `/stamp` comment gets the same check in `cli.ts` before anything else runs; the workflow `if` cannot call an API, so it runs on any `/stamp`, and only a known collaborator's comment joins the review's concurrency group.
 - The PR's reactions come from the issues API (`issues: read`). Without it the run warns and waits for no reviewer bot; it never fails on that.
 - Bot authors (dependabot, renovate, anything `[bot]`) are refused. There is no carve-out.
+- A credential shape in the PR's title or description denies it too (`describedSecrets`): that text reaches the provider and every reader. A run reads it; an edit to the description alone starts no run.
 - A credential shape on an added diff line denies the PR before the model runs. Added lines are found by hunk, not by prefix: inside a hunk, a line reading `+++…` is added content that starts with `++`, not a file header. Only unambiguous shapes are listed: a generic high-entropy matcher would make a gate that denies outright into a noise generator. Deleted and context lines are ignored — a key already in the tree is a rotation problem, not this PR's.
 - A rename is checked on both paths. Moving a file out of `auth/` is a change to `auth/`.
 
@@ -56,6 +57,7 @@ The nearest thing stamp has is the size exemption, and it changes only how much 
 - The reviewer reads the reviewed head, in isolation. If the checkout is not exactly the PR head, or is dirty, the review runs from a detached worktree at that commit.
 - PR content — title, body, diff, file names, comments, reactions, commit messages — is untrusted input everywhere. It sits inside an untrusted-content fence in the prompt, control characters are stripped, and a forged end-of-untrusted sentinel is neutralized before the prompt is built. The sentinel match never spans a line break, so sanitizing keeps every line where it was: line numbers counted on the raw diff hold in the prompt and in `read_diff`, and `readableSections` fails closed if a section's line count changes. File names and gate messages are held to one line (`oneLine`) wherever they appear, trusted context included: git allows a newline in a file name, and a new line would read as a trusted fact.
 - Review threads come from GraphQL with their resolution, open threads first and newest first; the trusted context counts unresolved threads. shepherd's review-changes section is read out of the body on its own, so a long description never cuts the disclosure. Commit subjects and `Shepherd:` trailers are untrusted claims, never assurance.
+- On a public repository the trusted context tells the reviewer to leave working exploit detail out of a security issue (`pr.isPublic`). It is an instruction to the model, and nothing checks the output; the evidence artifact is public there too, so the detail stays out of it as well.
 - A diff past the prompt's cap is named in the trusted context (the file where it is cut, how many follow), so the reviewer reads the rest or escalates.
 - The evidence records `policy_source`: the trusted ref, its commit, and the blob of the policy, guidance and steering that ran, or `bundled` / `absent`. The mechanics footer shows the policy blob.
 - A provider key loses surrounding whitespace at startup, and one with a break inside it is dropped with the reason (`dropBlankProviderEnv`, which covers the CLI credentials too).
@@ -85,6 +87,10 @@ The checkout is PR-authored content, so on every backend nothing in it becomes r
 `assured` also escalates an approval that is a probe (`isPlaceholder`: under 4 words across reasoning, summary and fact, or under 8 with a word like `test`). A weak model that cannot get a call through tries the tool with placeholder text, and here that could be an approval. It reads every field together so a terse real one stands, and it never touches a non-approval.
 
 An ERROR's body names the fix when its text is a provider's (`explainFailure`, patterns in `provider-errors.ts`, billing before status codes). Stamp's own errors quote the model, so they never match. It is advice and never changes a verdict.
+
+## Convergence
+
+A model's refusal after `MAX_REFUSED_ROUNDS` refused heads becomes an ESCALATE (`converged`, `refusedRounds`): an agent author and a reviewer can loop indefinitely, and an escalation stops an automated fix loop. Gate refusals, ERRORs and reruns on one head add no round. Evidence and the `stamp.refused_rounds` attribute record the count, so rounds to pass can be tracked beside recall.
 
 ## Second opinion
 
