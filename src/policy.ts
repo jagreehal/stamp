@@ -936,6 +936,9 @@ function addedLines(diff: string): [file: string, line: string][] {
   return out;
 }
 
+/** Credentials in the PR's title or description, which reach the model and every reader of the PR. */
+export const describedSecrets = (text: string) => CREDENTIAL_PATTERNS.flatMap(([what, re]) => (re.test(text) ? [`the PR title or description: ${what}`] : []));
+
 /**
  * Credentials added by the diff, as "path: what it looks like". Added lines only: a key being
  * deleted is a key being removed, and context lines are already in the base.
@@ -1137,6 +1140,7 @@ export function incidentFlags(issues: LinkedIssue[]): ScrutinyFlag[] {
 
 export type PRMeta = {
   title: string;
+  body?: string;
   diff?: string;
   author: string;
   authorAssociation: string;
@@ -1198,7 +1202,7 @@ export function runGates(policy: Policy, pr: PRMeta): GateRun {
   // A committed credential is never auto-approvable, whatever tier the change is: this runs before
   // the model and denies on its own. It reads the diff, not the checkout, so a key that was already
   // in the tree is someone else's problem to rotate, not this PR's gate.
-  const secrets = pr.diff ? addedSecrets(pr.diff) : [];
+  const secrets = [...(pr.diff ? addedSecrets(pr.diff) : []), ...describedSecrets(`${pr.title}\n${pr.body ?? ""}`)];
 
   gates.push({ gate: "secrets", passed: secrets.length === 0, message: secrets.length ? `credential added in ${secrets.join("; ")}` : "no credentials in the diff" });
 

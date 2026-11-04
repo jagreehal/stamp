@@ -16,6 +16,8 @@ Give the reviewer the intent and evidence alongside the diff.
 ## Shape
 
 ```
+<who did what: "Written by an agent for @you, following your spec. @you has not reviewed it yet.">
+
 <one line: the effect a person sees, present tense>
 
 ## Why
@@ -27,6 +29,7 @@ Give the reviewer the intent and evidence alongside the diff.
 
 ## Evidence
 - tests: <command run> → <pass/fail counts, pasted, not paraphrased>
+- proof: <the evidence that fits the change, from the table below>
 - review: <`/codex:review` or `/codex:adversarial-review` findings, and what you did with each; or "not run">
 - manual: <what you actually exercised, or "none">
 
@@ -43,9 +46,24 @@ picture makes the change clearer than bullets, add the smallest one its
 Mermaid diagram) under "What changed". This skill's shape and rules win where
 the two differ.
 
+## Evidence that fits the change
+
+| Change | Show |
+| --- | --- |
+| Something you can see | The same page before and after, at one size and crop; a short video when it moves |
+| A bug | The same input on both sides, and each output |
+| Faster or cheaper | The same workload measured on both sides, more than once |
+| A command or build | Its real output before and after |
+| A new API | The code someone would write to use it |
+
+Take "before" from production, the base branch or the last deploy, never a stashed copy. Look at each capture and confirm it shows the change. Use demo data: no users, tokens or private messages. Stamp denies a credential in the description, and it cannot open images, so give it text too.
+
+For a security fix on a public repository, keep the description short and hold exploit detail until the fix ships.
+
 ## Rules
 
-- **Lead with the effect.** The first line is what a user or maintainer observes, not what the code does. "Exports no longer time out on large cohorts", not "Add pagination to export query".
+- **Say who did what.** The first line names the agent, the person directing it, how much of the design was theirs, and whether they have read the diff. Update it when they do. A reviewer reads "has not reviewed it yet" as "you are the first to look".
+- **Lead with the effect.** The line under it is what a user or maintainer observes, not what the code does. "Exports no longer time out on large cohorts", not "Add pagination to export query".
 - **Describe behavior changes.** Name the user-visible effect of auth, billing, migrations, dependencies, CI, data writes and prompt changes. Stamp compares those details with the diff.
 - **Get a second model's review before a human's.** If the Codex plugin is installed, run `/codex:review` (or `/codex:adversarial-review` for anything touching auth, billing, migrations, deps, CI, or data writes) before opening the PR, fix what it finds, and list the findings and their resolution under Evidence. A PR that arrives pre-reviewed by a different model is cheaper to review and is what lets stamp count "independent assurance" in risky territory.
 - **CLI review setup.** For `claude` or `codex`, use `STAMP_BUILD_CLI_IMAGE=1` and the backend credential. Record the Linux isolation probe result alongside review evidence.
@@ -58,4 +76,4 @@ the two differ.
 
 ## Check before posting
 
-Read only the title, the first line, and the first bullet of each section. A reviewer who stops there must know why the PR exists and what it does. If they would not, reorder; do not add.
+Read only the title, the first two lines, and the first bullet of each section. A reviewer who stops there must know why the PR exists and what it does. If they would not, reorder; do not add.

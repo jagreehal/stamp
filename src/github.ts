@@ -117,7 +117,7 @@ const Pull = z.object({
   mergeable_state: z.string(),
   labels: z.array(z.object({ name: z.string() })),
   head: z.object({ ref: z.string().default(""), sha: z.string(), repo: z.object({ full_name: z.string() }).nullable() }),
-  base: z.object({ ref: z.string(), sha: z.string(), repo: z.object({ full_name: z.string() }) }),
+  base: z.object({ ref: z.string(), sha: z.string(), repo: z.object({ full_name: z.string(), private: z.boolean().optional() }) }),
 });
 
 const File = z.object({ filename: z.string(), previous_filename: z.string().optional(), additions: z.number(), deletions: z.number(), status: z.string() });
@@ -198,6 +198,8 @@ export type PR = {
   author: string;
   authorAssociation: string;
   isFork: boolean;
+  /** Set when anyone can read what stamp posts here, so its reviews leave out exploit detail. */
+  isPublic?: boolean;
   isDraft: boolean;
   mergeable: string;
   baseRef: string;
@@ -279,6 +281,7 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
     author: view.user.login,
     authorAssociation: effectiveAssociation(view.author_association, () => permissionOf(repo.nameWithOwner, view.user.login, cwd)),
     isFork: view.head.repo?.full_name !== view.base.repo.full_name,
+    isPublic: view.base.repo.private === false,
     isDraft: view.draft,
     mergeable: view.mergeable_state === "dirty" ? "CONFLICTING" : "MERGEABLE",
     baseRef: view.base.ref,
@@ -400,14 +403,33 @@ export function reviewedShas(r: ReviewRecord): { head: string; base: string } | 
   return m ? { head: m[1]!, base: m[2]! } : null;
 }
 
-// An ERROR or a gate denial posts a review without a model reading the head.
-const UNREAD_REVIEW = /^## .*: ERROR\b|^(Gates denied|Not reviewed): /m;
+/** The heading and first paragraph stamp wrote on a review, folded or not. The model's text below them stays out. */
+function opening(body: string) {
+  const [heading = "", , first = ""] = (body.startsWith(SUPERSEDED) ? body.slice(body.indexOf("\n\n") + 2) : body).split("\n");
+
+  return { heading, first };
+}
+
+/** An ERROR or a gate denial, which posts without a model reading the head. */
+const unread = (body: string) => {
+  const { heading, first } = opening(body);
+
+  return /: ERROR\b/.test(heading) || /^(Gates denied|Not reviewed): /.test(first);
+};
 
 /** The head and base our newest completed review covered, or null when it covered `head`. */
 export function lastReviewed(reviews: ReviewRecord[], botLogin: string, head: string) {
-  const last = reviews.filter((r) => isOurs(r, botLogin) && !UNREAD_REVIEW.test(r.body)).flatMap((r) => reviewedShas(r) ?? []).at(-1);
+  const last = reviews.filter((r) => isOurs(r, botLogin) && !unread(r.body)).flatMap((r) => reviewedShas(r) ?? []).at(-1);
 
   return last && last.head !== head ? last : null;
+}
+
+/** How many earlier heads of this PR a model refused, a refusal the cap escalated included. A rerun on `head` adds none. */
+export function refusedRounds(reviews: ReviewRecord[], botLogin: string, head: string): number {
+  const wasRefused = (body: string) => /: REFUSED\b/.test(opening(body).heading) || /^Round \d+ on this PR/.test(opening(body).first);
+  const refused = reviews.filter((r) => isOurs(r, botLogin) && wasRefused(r.body) && !unread(r.body));
+
+  return new Set(refused.flatMap((r) => reviewedShas(r)?.head ?? []).filter((h) => h !== head)).size;
 }
 
 // Which head one of our reviews covered. GitHub moves a standing approval's `commit_id` forward when

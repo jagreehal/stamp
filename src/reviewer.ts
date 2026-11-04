@@ -2,7 +2,7 @@
 import { z } from "zod";
 import { setting } from "./config.ts";
 import { CLI_CONTROL, CLI_OUTPUT, CLI_ROOT, isolatedCli, type EgressDecisions } from "./isolated-cli.ts";
-import type { PR } from "./github.ts";
+import type { PR, Verdict } from "./github.ts";
 import { formatFamiliarity, type AuthorFamiliarity } from "./familiarity.ts";
 import type { Gate, Ownership, ScrutinyFlag } from "./policy.ts";
 import { formatLeads, type Leads } from "./leads.ts";
@@ -357,6 +357,8 @@ export function buildPrompt(input: ReviewInput): string {
 
   if (pr.stack) constraints.push(`Stacked PR: the diff, files and commits are this PR's change over #${pr.stack.parent} (head ${pr.stack.parentHead.slice(0, 7)}), the open PR it is stacked on. #${pr.stack.parent}'s change is reviewed in #${pr.stack.parent}. Judge this change; read the parent's code in the checkout for context.`);
 
+  if (pr.isPublic) constraints.push("Public repository: anyone can read this review. For a security issue give the risk, the file:line and the fix, and leave out any working input, payload or exploit steps.");
+
   if (input.tier.startsWith("T0")) constraints.push("T0: docs/tests/config only. Confirm or flag concerns.");
 
   if (input.titleFlags.length)
@@ -457,6 +459,18 @@ export function isPlaceholder(llm: Pick<LLMVerdict, "reasoning" | "change_summar
   const words = `${llm.reasoning} ${llm.change_summary} ${llm.safe_because?.fact ?? ""}`.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
 
   return words.length < MIN_REVIEW_WORDS || (words.length < PROBE_SCAN_WORDS && words.some((w) => PROBE_WORDS.has(w)));
+}
+
+export type Reached = { verdict: Verdict; body: string };
+
+/** Refused heads a PR may reach before its next refusal goes to a person. */
+export const MAX_REFUSED_ROUNDS = 3;
+
+/** Past the cap a refusal becomes an escalation, which ends an automated fix loop and asks someone to reconsider the approach. */
+export function converged(result: Reached, rounds: number): Reached {
+  if (result.verdict !== "REFUSED" || rounds < MAX_REFUSED_ROUNDS) return result;
+
+  return { verdict: "ESCALATE", body: `Round ${rounds + 1} on this PR, after ${rounds} refusals: a person should reconsider the approach. ${result.body}` };
 }
 
 /**

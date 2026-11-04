@@ -51,4 +51,6 @@ On a re-review the reviewer also gets what changed since the head stamp last rev
 
 Impact leads point past the diff: changed exports and the files that name them, the tests beside each changed source, and names the diff renamed or removed that the head still uses, an environment variable or config key included.
 
+On a public repository the reviewer gives a security issue's risk, location and fix, and leaves out working exploit detail.
+
 A `REFUSED` or `ESCALATE` review pins each issue to its line as an inline comment when that line is in the diff; the review body still lists them all. When a later review runs, it resolves those threads, and any finding that still holds comes back in the new review. A thread someone replied in stays open.

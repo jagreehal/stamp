@@ -26,7 +26,7 @@ stateDiagram-v2
     Approved --> [*]: you merge
 ```
 
-A `REFUSED` or `ESCALATE` review pins each issue to its line when that line is in the diff. An `ERROR` review names the fix when the provider caused it.
+After three refused heads, a fourth refusal posts as `ESCALATE`, so a person reconsiders the approach and any automated fix loop stops. A `REFUSED` or `ESCALATE` review pins each issue to its line when that line is in the diff. An `ERROR` review names the fix when the provider caused it.
 
 "Gated" means a deterministic gate, such as the deny-list or the size ceiling, denied the PR before any review. The engine reports it as `REFUSED` and removes the trigger label, because a person has to take it from there.
 
