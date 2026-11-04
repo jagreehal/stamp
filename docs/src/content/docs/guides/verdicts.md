@@ -26,6 +26,8 @@ stateDiagram-v2
     Approved --> [*]: you merge
 ```
 
+A `REFUSED` or `ESCALATE` review pins each issue to its line when that line is in the diff. An `ERROR` review names the fix when the provider caused it.
+
 "Gated" means a deterministic gate, such as the deny-list or the size ceiling, denied the PR before any review. The engine reports it as `REFUSED` and removes the trigger label, because a person has to take it from there.
 
 stamp posts an approval as a real review, once, pinned to the reviewed commit, carrying the review body, so it counts toward branch protection. It posts every other verdict once per run as a comment review on the same surface. The bot never requests changes.

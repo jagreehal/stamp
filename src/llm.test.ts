@@ -4,7 +4,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import { anthropicBaseURL, apiKeyFor, keySource, languageModel, maxOutputTokens, missingLines, DEFAULT_GUARD, guardRules, parseModelId, reviewWithTools, summarizeRun, timeoutMs } from "./llm.ts";
+import { dropBlankProviderEnv } from "./env.ts";
+import { anthropicBaseURL, apiKeyFor, keySource, languageModel, maxOutputTokens, missingLines, DEFAULT_GUARD, guardRules, parseModelId, reasoningEffort, reviewWithTools, summarizeRun, timeoutMs } from "./llm.ts";
 
 const Verdict = z.object({ verdict: z.enum(["APPROVE", "REFUSE", "ESCALATE"]), reasoning: z.string() });
 
@@ -268,5 +269,34 @@ test("openai: is the OpenAI API, and compatible: reaches any OpenAI-compatible e
   } finally {
     if (saved === undefined) delete process.env.STAMP_BASE_URL;
     else process.env.STAMP_BASE_URL = saved;
+  }
+});
+
+test("effort: the setting reaches the model call as the SDK's reasoning option, and a bad value fails the review", () => {
+  expect(reasoningEffort("")).toBeUndefined();
+  expect(reasoningEffort("high")).toBe("high");
+  expect(() => reasoningEffort("extreme")).toThrow('effort: "extreme" is not one of low, medium, high');
+});
+
+test("keys: surrounding whitespace goes, a break inside a key drops it, and a blank variable goes", () => {
+  const saved = { a: process.env.ANTHROPIC_API_KEY, o: process.env.OPENAI_API_KEY, g: process.env.GROQ_API_KEY, b: process.env.AWS_BEARER_TOKEN_BEDROCK, c: process.env.CODEX_API_KEY };
+
+  try {
+    process.env.ANTHROPIC_API_KEY = "  sk-whole\n";
+    process.env.OPENAI_API_KEY = "sk-half\nsk-rest";
+    process.env.GROQ_API_KEY = "   ";
+    process.env.AWS_BEARER_TOKEN_BEDROCK = "ab\ncd";
+    process.env.CODEX_API_KEY = "k\n";
+    dropBlankProviderEnv();
+    expect(process.env.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
+    expect(process.env.CODEX_API_KEY).toBe("k");
+    expect(process.env.ANTHROPIC_API_KEY).toBe("sk-whole");
+    expect(process.env.OPENAI_API_KEY).toBeUndefined();
+    expect(process.env.GROQ_API_KEY).toBeUndefined();
+  } finally {
+    for (const [k, v] of [["ANTHROPIC_API_KEY", saved.a], ["OPENAI_API_KEY", saved.o], ["GROQ_API_KEY", saved.g], ["AWS_BEARER_TOKEN_BEDROCK", saved.b], ["CODEX_API_KEY", saved.c]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
   }
 });

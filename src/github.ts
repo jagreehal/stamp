@@ -4,6 +4,7 @@
 import { execFileSync } from "node:child_process";
 import { z } from "zod";
 import { CARD_MARKER, renderCard } from "./actions.ts";
+import type { Anchored } from "./inline.ts";
 import type { PRFile } from "./policy.ts";
 
 // A hung call must fail rather than wait for the job to be killed: a killed run skips every catch,
@@ -36,9 +37,36 @@ export function withBudget<T>(ms: number, fn: () => T): T {
   }
 }
 
-const gh = (args: string[], cwd: string) => execFileSync("gh", args, { cwd, encoding: "utf8", maxBuffer: 64 << 20, timeout: callTimeout() });
+/** Runs `fn`, and again after each delay while the error is `transient`. The last error propagates. */
+export function retrying<T>(delays: number[], transient: (e: Error) => boolean, fn: () => T, wait: (ms: number) => void = Bun.sleepSync): T {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return fn();
+    } catch (e) {
+      const delay = delays[attempt];
 
-const call = <T>(schema: z.ZodType<T>, args: string[], cwd: string): T => schema.parse(JSON.parse(gh(args, cwd)));
+      if (delay === undefined || !(e instanceof Error) || !transient(e)) throw e;
+      console.error(`retrying in ${delay}ms: ${e.message.split("\n").at(-2) ?? e.message}`);
+      wait(delay);
+    }
+  }
+}
+
+/** A GitHub 5xx or a dropped connection. A 4xx is an answer, and a call killed by its timeout has used its time. */
+export const transientGh = (e: Error) => /HTTP 5\d\d|ECONNRESET|connection reset|i\/o timeout|TLS handshake timeout|unexpected EOF/i.test(e.message);
+
+// GitHub's generic 422 on `POST .../reviews`: it names no field, and the same request goes through on a retry.
+export const transientReviewError = (e: Error) => /internal error occurred, please try again/i.test(e.message);
+
+const READ_DELAYS_MS = [500, 2000];
+
+const REVIEW_DELAYS_MS = [1000, 3000];
+
+// A POST may already have landed, so it runs once. The other calls repeat safely.
+const gh = (args: string[], cwd: string, input?: string) =>
+  retrying(args.includes("POST") ? [] : READ_DELAYS_MS, transientGh, () => execFileSync("gh", args, { cwd, encoding: "utf8", maxBuffer: 64 << 20, timeout: callTimeout(), input }));
+
+const call = <T>(schema: z.ZodType<T>, args: string[], cwd: string, input?: string): T => schema.parse(JSON.parse(gh(args, cwd, input)));
 
 const paginated = <T>(schema: z.ZodType<T>, endpoint: string, cwd: string): T[] =>
   z
@@ -103,10 +131,11 @@ const ThreadPage = z.object({
         reviewThreads: z.object({
           nodes: z.array(
             z.object({
+              id: z.string(),
               isResolved: z.boolean(),
               isOutdated: z.boolean(),
               path: z.string(),
-              comments: z.object({ nodes: z.array(z.object({ author: z.object({ login: z.string(), __typename: z.string() }).nullable(), body: z.string(), createdAt: z.string() })) }),
+              comments: z.object({ totalCount: z.number(), nodes: z.array(z.object({ author: z.object({ login: z.string(), __typename: z.string() }).nullable(), body: z.string(), createdAt: z.string() })) }),
             }),
           ),
         }),
@@ -116,7 +145,7 @@ const ThreadPage = z.object({
 });
 
 // REST lists inline comments without their thread's resolution, so threads come from GraphQL.
-const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{isResolved isOutdated path comments(first:50){nodes{author{login __typename} body createdAt}}}}}}}`;
+const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated path comments(first:50){totalCount nodes{author{login __typename} body createdAt}}}}}}}`;
 
 const IssueNode = z.object({
   number: z.number(),
@@ -137,6 +166,21 @@ const CommitRow = z.object({ sha: z.string(), commit: z.object({ message: z.stri
 const CommentRow = z.object({ user: Login, body: z.string(), created_at: z.string(), reactions: z.record(z.string(), z.union([z.number(), z.string()])).optional() });
 
 const ReactionRow = z.object({ user: Login, content: z.string(), created_at: z.string() });
+
+type Thread = z.infer<typeof ThreadPage>["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][number];
+
+/** Every review thread of a PR, from every page. */
+function reviewThreads(repo: string, number: number, cwd: string): Thread[] {
+  const [owner = "", name = ""] = repo.split("/");
+
+  return z
+    .array(ThreadPage)
+    .parse(JSON.parse(gh(["api", "graphql", "--paginate", "--slurp", "-f", `query=${THREADS_QUERY}`, "-F", `owner=${owner}`, "-F", `name=${name}`, "-F", `number=${number}`], cwd)))
+    .flatMap((p) => p.data.repository.pullRequest.reviewThreads.nodes);
+}
+
+// GraphQL names a bot account without the `[bot]` suffix REST uses; restore it so logins match everywhere.
+const threadLogin = (c: Thread["comments"]["nodes"][number]) => (c.author ? `${c.author.login}${c.author.__typename === "Bot" ? "[bot]" : ""}` : "ghost");
 
 export type Review = { user: string; state: string; body: string; commit: string; isCurrentHead: boolean };
 
@@ -225,11 +269,7 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
   const headSha = view.head.sha;
   const notOurs = <T extends { user: { login: string } }>(rows: T[]) => rows.filter((r) => !exclude.includes(r.user.login));
   const [owner = "", name = ""] = repo.nameWithOwner.split("/");
-
-  const threads = z
-    .array(ThreadPage)
-    .parse(JSON.parse(gh(["api", "graphql", "--paginate", "--slurp", "-f", `query=${THREADS_QUERY}`, "-F", `owner=${owner}`, "-F", `name=${name}`, "-F", `number=${number}`], cwd)))
-    .flatMap((p) => p.data.repository.pullRequest.reviewThreads.nodes);
+  const threads = reviewThreads(repo.nameWithOwner, number, cwd);
 
   return {
     repo: repo.nameWithOwner,
@@ -264,9 +304,9 @@ export function fetchPR(number: number, cwd: string, exclude: string[] = []): PR
     })),
     inline: threads.flatMap((t, thread) =>
       t.comments.nodes
-        // GraphQL names a bot account without the `[bot]` suffix REST uses; restore it so logins match everywhere.
-        .map((c) => ({ user: c.author ? `${c.author.login}${c.author.__typename === "Bot" ? "[bot]" : ""}` : "ghost", path: t.path, body: c.body, outdated: t.isOutdated, resolved: t.isResolved, thread, created: c.createdAt }))
-        .filter((c) => !exclude.includes(c.user)),
+        .map((c) => ({ user: threadLogin(c), path: t.path, body: c.body, outdated: t.isOutdated, resolved: t.isResolved, thread, created: c.createdAt }))
+        // Our own findings, whatever login posted them, as for reviews below: an App token's login is not `exclude`.
+        .filter((c) => !exclude.includes(c.user) && !isOwnBot(c.user, c.body)),
     ),
     discussion: notOurs(paginated(CommentRow, `${base}/issues/${number}/comments`, cwd)).filter((c) => !c.body.includes(CARD_MARKER)).map((c) => ({
       user: c.user.login,
@@ -360,6 +400,16 @@ export function reviewedShas(r: ReviewRecord): { head: string; base: string } | 
   return m ? { head: m[1]!, base: m[2]! } : null;
 }
 
+// An ERROR or a gate denial posts a review without a model reading the head.
+const UNREAD_REVIEW = /^## .*: ERROR\b|^(Gates denied|Not reviewed): /m;
+
+/** The head and base our newest completed review covered, or null when it covered `head`. */
+export function lastReviewed(reviews: ReviewRecord[], botLogin: string, head: string) {
+  const last = reviews.filter((r) => isOurs(r, botLogin) && !UNREAD_REVIEW.test(r.body)).flatMap((r) => reviewedShas(r) ?? []).at(-1);
+
+  return last && last.head !== head ? last : null;
+}
+
 // Which head one of our reviews covered. GitHub moves a standing approval's `commit_id` forward when
 // the branch is updated from its base, so `commit_id` can name a head the review never saw. Our own
 // marker is the record; `commit_id` is the fallback only for reviews posted before the marker existed.
@@ -370,7 +420,9 @@ const reviewedHead = (r: ReviewRecord) => reviewedShas(r)?.head ?? r.commit_id;
  * marker. A GitHub App token posts as `<app>[bot]` while `gh api user` fails, so the login alone can miss
  * our own approvals; the marker keeps them in every sweep.
  */
-export const isOurs = (r: ReviewRecord, botLogin: string) => r.user.login === botLogin || (r.user.login.endsWith("[bot]") && RUN_MARKER.test(r.body));
+export const isOurs = (r: ReviewRecord, botLogin: string) => r.user.login === botLogin || isOwnBot(r.user.login, r.body);
+
+const isOwnBot = (login: string, body: string) => login.endsWith("[bot]") && RUN_MARKER.test(body);
 
 /** Whether the run that posted `r` started after `iso`: the later-started run owns the newer verdict. */
 const startedAfter = (r: { body: string }, iso: string) => {
@@ -514,8 +566,21 @@ export function publishCard(prNumber: number, botLogin: string, shepherd: boolea
   }
 }
 
-/** Approvals are real reviews (count toward branch protection); everything else is a comment. Never request-changes. */
-export function postVerdict(pr: PR, verdict: Verdict, body: string, opts: PostOptions): number | null {
+/** The JSON stamp posts for a review: pinned to the reviewed commit, credentials redacted, each anchored finding carrying the run marker. */
+export function reviewPayload(headSha: string, verdict: Verdict, body: string, comments: Anchored[], started: string) {
+  return {
+    commit_id: headSha,
+    event: verdict === "APPROVED" ? "APPROVE" : "COMMENT",
+    body: scrub(body),
+    comments: comments.map((c) => ({ path: c.path, line: c.line, side: "RIGHT", body: `${scrub(c.body)}\n\n${runMarker(started)}` })),
+  };
+}
+
+/**
+ * Approvals are real reviews (count toward branch protection); everything else is a comment. Never request-changes.
+ * `comments` anchor findings to lines. On a 422 the review goes again without them: the body holds every finding.
+ */
+export function postVerdict(pr: PR, verdict: Verdict, body: string, opts: PostOptions, comments: Anchored[] = []): number | null {
   // The diff can change under a finished review two ways: a push moves the head, a retarget moves the
   // base without touching the head. Refuse to post over either; the next run reviews what is live.
   // A newer run may also have already ruled on this exact head; its verdict governs, not this one.
@@ -523,11 +588,20 @@ export function postVerdict(pr: PR, verdict: Verdict, body: string, opts: PostOp
 
   // The review is pinned to the reviewed commit, so a push that lands between the check above and
   // this call cannot inherit the approval: GitHub records it against pr.headSha, not the live head.
-  const posted = call(
-    z.object({ id: z.number() }),
-    ["api", "-X", "POST", `repos/${pr.repo}/pulls/${pr.number}/reviews`, "-f", `commit_id=${pr.headSha}`, "-f", `event=${verdict === "APPROVED" ? "APPROVE" : "COMMENT"}`, "-f", `body=${scrub(body)}`],
-    opts.cwd,
-  );
+  const submit = (anchored: Anchored[]) =>
+    retrying(REVIEW_DELAYS_MS, transientReviewError, () =>
+      call(z.object({ id: z.number() }), ["api", "-X", "POST", `repos/${pr.repo}/pulls/${pr.number}/reviews`, "--input", "-"], opts.cwd, JSON.stringify(reviewPayload(pr.headSha, verdict, body, anchored, opts.started))),
+    );
+
+  let posted: { id: number };
+
+  try {
+    posted = submit(comments);
+  } catch (e) {
+    if (!comments.length || !(e instanceof Error) || !e.message.includes("HTTP 422")) throw e;
+    console.error(`GitHub refused the review's ${comments.length} inline comment(s); posting without them`);
+    posted = submit([]);
+  }
 
   // Substantive non-approvals strip the trigger label so a human takes over; ERROR keeps it so the next push retries.
   if (opts.triggerLabel && (verdict === "REFUSED" || verdict === "ESCALATE") && pr.labels.includes(opts.triggerLabel)) {
@@ -535,6 +609,33 @@ export function postVerdict(pr: PR, verdict: Verdict, body: string, opts: PostOp
   }
 
   return posted.id;
+}
+
+/** Open threads of our earlier findings nobody else has joined, by id: the verdict of the run that started at `started` replaces them. */
+export function retiredThreads(threads: Thread[], botLogin: string, started: string): string[] {
+  const ours = (c: Thread["comments"]["nodes"][number]) => threadLogin(c) === botLogin || isOwnBot(threadLogin(c), c.body);
+
+  const earlier = (body: string) => {
+    const at = [...body.matchAll(new RegExp(RUN_MARKER, "g"))].at(-1)?.[1];
+
+    return at !== undefined && at < started;
+  };
+
+  // The query fetches the first 50 comments, so a longer thread stays open: a later reply could be someone else's.
+  const whole = (t: Thread) => t.comments.totalCount === t.comments.nodes.length;
+
+  return threads.flatMap((t) => (!t.isResolved && whole(t) && t.comments.nodes.every(ours) && t.comments.nodes.some((c) => earlier(c.body)) ? [t.id] : []));
+}
+
+/**
+ * Resolves the threads a new verdict replaces. Each run reviews from scratch, so a finding that still holds comes back
+ * in this run's review, and repositories that require resolved conversations can merge. A thread with anyone else's
+ * reply stays open. Best effort, like folding.
+ */
+export function retireOwnThreads(pr: PR, botLogin: string, started: string, cwd: string): void {
+  for (const id of retiredThreads(reviewThreads(pr.repo, pr.number, cwd), botLogin, started)) {
+    gh(["api", "graphql", "-f", "query=mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}", "-f", `id=${id}`], cwd);
+  }
 }
 
 /** Deterministic redaction of anything that could be a credential before it reaches GitHub. */

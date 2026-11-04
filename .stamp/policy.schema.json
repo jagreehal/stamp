@@ -568,6 +568,15 @@
       "exclusiveMinimum": 0,
       "maximum": 9007199254740991
     },
+    "effort": {
+      "description": "How hard the reviewer reasons, on every backend. Unset leaves each model's default. Overridden by STAMP_EFFORT.",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
     "cli": {
       "type": "object",
       "properties": {

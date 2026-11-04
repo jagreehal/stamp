@@ -76,6 +76,8 @@ export function brand(b: z.infer<typeof Branding> | undefined) {
 /** Prices per million tokens for models autotel's tables leave out: `{"kimi-k3":{"inputPer1M":3,"outputPer1M":15}}`. */
 export const Pricing = z.record(z.string(), z.object({ inputPer1M: z.number(), outputPer1M: z.number(), cachedInputPer1M: z.number().optional() }).strict());
 
+export const Effort = z.enum(["low", "medium", "high"]);
+
 export const PolicySchema = z
   .object({
     version: z.literal(1),
@@ -123,6 +125,7 @@ export const PolicySchema = z
       .optional()
       .describe("Bounds on one review's cost, tokens, repeated calls, tool calls and time. Overridden by STAMP_GUARD."),
     max_output_tokens: z.number().int().positive().optional(),
+    effort: Effort.optional().describe("How hard the reviewer reasons, on every backend. Unset leaves each model's default. Overridden by STAMP_EFFORT."),
     cli: z.object({ claude_model: z.string().min(1).optional(), codex_model: z.string().min(1).optional() }).strict().optional(),
     label: z.string().min(1).optional().describe("When set, a PR needs this label before stamp reviews it. Overridden by STAMP_LABEL."),
     notify: z.object({ on: z.array(z.enum(["APPROVED", "REFUSED", "ESCALATE", "ERROR"])).min(1).optional() }).strict().optional(),
@@ -278,7 +281,7 @@ const SIZE_EXEMPT_RE = /\.(md|mdx|txt|rst|snap|ambr|lock|png|jpe?g|gif|svg|webp|
 
 const MANIFEST_RE = /(^|\/)(package\.json|pyproject\.toml|Cargo\.toml|go\.mod|Gemfile|tsconfig[^/]*\.json)$/i;
 
-const LOCKFILE_RE = /(^|\/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lock|uv\.lock|poetry\.lock|Cargo\.lock|go\.sum|Gemfile\.lock)$/i;
+export const LOCKFILE_RE = /(^|\/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lock|uv\.lock|poetry\.lock|Cargo\.lock|go\.sum|Gemfile\.lock)$/i;
 
 export const isTest = (p: string) => TEST_RE.test(p);
 
